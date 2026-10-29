@@ -1,4 +1,5 @@
 import type { EvalReport } from './report.ts'
+import type { OperatorSpec } from './spec.ts'
 
 export interface PolicyConfig {
   maxIterations: number
@@ -9,7 +10,7 @@ export interface PolicyConfig {
 
 export interface TaskState {
   generationId: string | null
-  spec: null
+  spec: OperatorSpec | null
   validIterations: number
   compileRetries: number
   timeouts: number
