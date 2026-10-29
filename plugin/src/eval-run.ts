@@ -1,4 +1,4 @@
-import { malformedReport, parseReport, timeoutReport, type EvalReport } from './report.js'
+import { malformedReport, parseReport, stoppedReport, timeoutReport, type EvalReport } from './report.js'
 import { applyReport, stopReason, type PolicyConfig, type TaskState } from './policy.js'
 import { waitForRemoteFile, type RemoteFiles } from './remote.js'
 
@@ -18,23 +18,12 @@ export interface RunInput {
 
 export async function runEvaluation(input: RunInput): Promise<{ report: EvalReport; state: TaskState }> {
   const reason = stopReason(input.state, input.config)
-  if (reason) {
-    return {
-      report: {
-        generationId: input.generationId,
-        status: 'error',
-        compile: { ok: false, log: '' },
-        correctness: { ok: false, maxRelativeError: null },
-        performance: { kernelTimeUs: null, targetUs: null },
-        analysis: null,
-        summary: `stopped: ${reason}`,
-      },
-      state: input.state,
-    }
-  }
+  if (reason) return { report: stoppedReport(input.generationId, reason), state: input.state }
   const remoteDir = `${input.inbox}/${input.generationId}`
   const resultPath = `${input.outbox}/${input.generationId}/results.json`
   await input.files.uploadDir(input.localPackageDir, remoteDir)
+  // watch.py will not replace an existing results.json, so drop the previous one before polling.
+  await input.files.removeFile(resultPath)
   try {
     const body = await waitForRemoteFile(input.files, resultPath, {
       timeoutMs: input.timeoutMs,

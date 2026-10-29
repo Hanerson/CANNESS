@@ -37,8 +37,8 @@ export function apply(ctx: Context, config: Config): void {
     const decision = await next()
     if (decision.kind !== 'enter') return decision
     const state = loadState(path)
+    if (!shouldSteer(state, config)) return decision
     const text = enhancementBlock(state)
-    if (!text || state.lastReport == null || state.lastReport.status === 'pass') return decision
     const already = decision.messages.some(message =>
       message.content.some(block => block.type === 'text' && block.text === text),
     )

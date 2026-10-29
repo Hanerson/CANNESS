@@ -84,3 +84,44 @@ test('refuses to upload when already stopped', async () => {
   expect(remote.files.size).toBe(0)
   expect(report.status).toBe('error')
 })
+
+test('a later read of the same generation ignores a seeded results.json', async () => {
+  const remote = new MemoryRemote()
+  const generationId = 'gen-0123abcd'
+  const resultPath = `/out/${generationId}/results.json`
+  remote.files.set(resultPath, Buffer.from(JSON.stringify({
+    generationId,
+    status: 'compile_fail',
+    compile: { ok: false, log: 'old' },
+    correctness: { ok: false, maxRelativeError: null },
+    performance: { kernelTimeUs: null, targetUs: 150 },
+    summary: 'old failure',
+  })))
+  // onRead 2: the first poll still returns the seeded body unless removeFile ran first.
+  remote.appearOnRead(resultPath, Buffer.from(JSON.stringify({
+    generationId,
+    status: 'accuracy_fail',
+    compile: { ok: true, log: '' },
+    correctness: { ok: false, maxRelativeError: 0.2 },
+    performance: { kernelTimeUs: null, targetUs: 150 },
+    summary: 'fresh accuracy',
+  })), 2)
+  let t = 0
+  let slept = 0
+  const { report } = await runEvaluation({
+    files: remote,
+    localPackageDir: pack(),
+    generationId,
+    inbox: '/in',
+    outbox: '/out',
+    timeoutMs: 10_000,
+    intervalMs: 1000,
+    state: { ...emptyState(), generationId },
+    config,
+    now: () => t,
+    sleep: async (ms) => { slept += 1; t += ms },
+  })
+  expect(report.status).toBe('accuracy_fail')
+  expect(report.summary).toBe('fresh accuracy')
+  expect(slept).toBe(1)
+})

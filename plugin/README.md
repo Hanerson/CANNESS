@@ -15,7 +15,7 @@ dsh plugin --profile canness add ./plugin
 dsh --profile canness --dump-config
 ```
 
-期望输出含 `# == dsh-canness`。把 profile 的 `canness-eval` 整段 `config` 重写成自己的 `host`、`username`、`privateKeyPath`。patch 替换整份 `config`，不能只加一个键。
+期望输出含 `# == dsh-canness`。保留 dump 里的每一个键，只填写 `canness-eval` 的 `host`、`username` 和 `privateKeyPath`。不要把整段 `config` 改成只剩这三个字段。patch 替换整份 `config`，不能只加一个键。
 
 ## 3. 远端
 

@@ -30,6 +30,18 @@ export function malformedReport(generationId: string, detail: string): EvalRepor
   }
 }
 
+export function stoppedReport(generationId: string, reason: string): EvalReport {
+  return {
+    generationId,
+    status: 'error',
+    compile: { ok: false, log: '' },
+    correctness: { ok: false, maxRelativeError: null },
+    performance: { kernelTimeUs: null, targetUs: null },
+    analysis: null,
+    summary: `stopped: ${reason}`,
+  }
+}
+
 export function timeoutReport(generationId: string, timeoutSec: number): EvalReport {
   return {
     generationId,

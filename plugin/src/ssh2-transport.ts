@@ -1,12 +1,14 @@
 import { readdirSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
-import { Client } from 'ssh2'
+import { Client, type SFTPWrapper } from 'ssh2'
 import type { RemoteFiles } from './remote.js'
 
 export interface SftpLike {
   mkdir(path: string): Promise<void>
   fastPut(local: string, remote: string): Promise<void>
   readFile(remote: string): Promise<Buffer | null>
+  unlink(remote: string): Promise<void>
+  end(): Promise<void>
 }
 
 export interface SftpOptions {
@@ -47,6 +49,8 @@ export function remoteFromSftp(sftp: SftpLike): RemoteFiles {
       await walk(localDir)
     },
     readFile: remote => sftp.readFile(remote),
+    removeFile: remote => sftp.unlink(remote),
+    close: () => sftp.end(),
   }
 }
 
@@ -60,23 +64,45 @@ export function isMissingSftpError(err: unknown): boolean {
   return code === 2 || code === 'ENOENT'
 }
 
-function defaultDial(opts: SftpOptions): Promise<SftpLike> {
-  const client = new Client()
+interface DialClient {
+  on(event: 'ready', listener: () => void): this
+  on(event: 'error', listener: (err: Error) => void): this
+  connect(config: { host: string; port: number; username: string; privateKey: string }): this
+  sftp(callback: (err: Error | undefined, sftp: SFTPWrapper) => void): this
+  end(): void
+}
+
+function sftpLike(sftp: SFTPWrapper, end: () => void): SftpLike {
+  return {
+    mkdir: path => new Promise((res, rej) => sftp.mkdir(path, err => err ? rej(err) : res())),
+    fastPut: (local, remote) => new Promise((res, rej) => sftp.fastPut(local, remote, err => err ? rej(err) : res())),
+    readFile: remote => new Promise((res, rej) => {
+      sftp.readFile(remote, (err, data) => {
+        if (err && isMissingSftpError(err)) res(null)
+        else if (err) rej(err)
+        else res(data)
+      })
+    }),
+    unlink: remote => new Promise((res, rej) => {
+      sftp.unlink(remote, err => {
+        if (err && !isMissingSftpError(err)) rej(err)
+        else res()
+      })
+    }),
+    end: async () => { end() },
+  }
+}
+
+export function openSftp(client: DialClient, opts: SftpOptions): Promise<SftpLike> {
   return new Promise((resolve, reject) => {
     client.on('ready', () => {
       client.sftp((error, sftp) => {
-        if (error) { reject(error); return }
-        resolve({
-          mkdir: path => new Promise((res, rej) => sftp.mkdir(path, err => err ? rej(err) : res())),
-          fastPut: (local, remote) => new Promise((res, rej) => sftp.fastPut(local, remote, err => err ? rej(err) : res())),
-          readFile: remote => new Promise((res, rej) => {
-            sftp.readFile(remote, (err, data) => {
-              if (err && isMissingSftpError(err)) res(null)
-              else if (err) rej(err)
-              else res(data)
-            })
-          }),
-        })
+        if (error) {
+          client.end()
+          reject(error)
+          return
+        }
+        resolve(sftpLike(sftp, () => { client.end() }))
       })
     }).on('error', reject).connect({
       host: opts.host,
@@ -85,4 +111,9 @@ function defaultDial(opts: SftpOptions): Promise<SftpLike> {
       privateKey: opts.privateKey,
     })
   })
+}
+
+function defaultDial(opts: SftpOptions): Promise<SftpLike> {
+  // Client's event overloads are wider than the ready/error/sftp subset this session uses.
+  return openSftp(new Client() as DialClient, opts)
 }

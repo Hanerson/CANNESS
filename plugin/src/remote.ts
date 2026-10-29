@@ -4,6 +4,8 @@ import { join, relative, posix } from 'node:path'
 export interface RemoteFiles {
   uploadDir(localDir: string, remoteDir: string): Promise<void>
   readFile(remotePath: string): Promise<Uint8Array | null>
+  removeFile(remotePath: string): Promise<void>
+  close(): Promise<void>
 }
 
 export interface WaitOptions {
@@ -44,6 +46,12 @@ export class MemoryRemote implements RemoteFiles {
     }
     return this.files.get(remotePath) ?? null
   }
+
+  async removeFile(remotePath: string): Promise<void> {
+    this.files.delete(remotePath)
+  }
+
+  async close(): Promise<void> {}
 }
 
 export async function waitForRemoteFile(files: RemoteFiles, remotePath: string, opts: WaitOptions): Promise<Uint8Array> {

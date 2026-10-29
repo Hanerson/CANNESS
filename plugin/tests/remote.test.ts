@@ -14,6 +14,15 @@ test('uploadDir then readFile round-trips bytes', async () => {
   expect(await remote.readFile('/inbox/gen-1/missing.json')).toBeNull()
 })
 
+test('removeFile drops a stored file and a missing path resolves', async () => {
+  const remote = new MemoryRemote()
+  remote.files.set('/out/gen-1/results.json', Buffer.from('old'))
+  await remote.removeFile('/out/gen-1/results.json')
+  await remote.removeFile('/out/gen-1/results.json')
+  expect(await remote.readFile('/out/gen-1/results.json')).toBeNull()
+  await remote.close()
+})
+
 test('waitForRemoteFile returns bytes that appear on a later read', async () => {
   const remote = new MemoryRemote()
   remote.appearOnRead('/out/gen-1/results.json', Buffer.from('{"ok":true}'), 2)

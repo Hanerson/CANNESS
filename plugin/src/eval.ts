@@ -5,9 +5,10 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { runEvaluation } from './eval-run.js'
 import { loadState, saveState } from './state-file.js'
-import { connectSftp } from './ssh2-transport.js'
-import type { EvalReport } from './report.js'
-import type { PolicyConfig } from './policy.js'
+import { connectSftp, type SftpOptions } from './ssh2-transport.js'
+import type { RemoteFiles } from './remote.js'
+import { stoppedReport, type EvalReport } from './report.js'
+import { stopReason, type PolicyConfig } from './policy.js'
 
 export const name = 'canness-eval'
 export const inject = ['tools']
@@ -52,7 +53,11 @@ function emptyHostReport(generationId: string | null): EvalReport {
   }
 }
 
-export function apply(ctx: Context, config: Config): void {
+export function apply(
+  ctx: Context,
+  config: Config,
+  connect: (opts: SftpOptions) => Promise<RemoteFiles> = connectSftp,
+): void {
   const path = join(config.workspace, '.canness', 'state.json')
   const policy: PolicyConfig = {
     maxIterations: config.maxIterations,
@@ -151,25 +156,31 @@ export function apply(ctx: Context, config: Config): void {
       if (state.generationId == null) throw new Error('submit_spec first')
       const localPackageDir = join(config.workspace, 'packages', state.generationId)
       if (!existsSync(localPackageDir)) throw new Error('build_test_package first')
-      const files = await connectSftp({
+      const reason = stopReason(state, policy)
+      if (reason) return stoppedReport(state.generationId, reason)
+      const files = await connect({
         host: config.host,
         port: config.port,
         username: config.username,
         privateKey: readFileSync(config.privateKeyPath, 'utf8'),
       })
-      const { report, state: next } = await runEvaluation({
-        files,
-        localPackageDir,
-        generationId: state.generationId,
-        inbox: config.inbox,
-        outbox: config.outbox,
-        timeoutMs: config.timeoutSec * 1000,
-        intervalMs: config.pollIntervalMs,
-        state,
-        config: policy,
-      })
-      saveState(path, next)
-      return report
+      try {
+        const { report, state: next } = await runEvaluation({
+          files,
+          localPackageDir,
+          generationId: state.generationId,
+          inbox: config.inbox,
+          outbox: config.outbox,
+          timeoutMs: config.timeoutSec * 1000,
+          intervalMs: config.pollIntervalMs,
+          state,
+          config: policy,
+        })
+        saveState(path, next)
+        return report
+      } finally {
+        await files.close()
+      }
     },
   }))
 }
