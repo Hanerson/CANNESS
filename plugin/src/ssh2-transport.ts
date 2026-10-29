@@ -54,6 +54,12 @@ export async function connectSftp(opts: SftpOptions, dial: Dial = defaultDial): 
   return remoteFromSftp(await dial(opts))
 }
 
+export function isMissingSftpError(err: unknown): boolean {
+  // ssh2 SFTP sets code to numeric 2 (NO_SUCH_FILE), not the string ENOENT.
+  const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined
+  return code === 2 || code === 'ENOENT'
+}
+
 function defaultDial(opts: SftpOptions): Promise<SftpLike> {
   const client = new Client()
   return new Promise((resolve, reject) => {
@@ -65,7 +71,7 @@ function defaultDial(opts: SftpOptions): Promise<SftpLike> {
           fastPut: (local, remote) => new Promise((res, rej) => sftp.fastPut(local, remote, err => err ? rej(err) : res())),
           readFile: remote => new Promise((res, rej) => {
             sftp.readFile(remote, (err, data) => {
-              if (err && (err as NodeJS.ErrnoException).code === 'ENOENT') res(null)
+              if (err && isMissingSftpError(err)) res(null)
               else if (err) rej(err)
               else res(data)
             })
