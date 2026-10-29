@@ -1,6 +1,6 @@
-import { malformedReport, parseReport, timeoutReport, type EvalReport } from './report.ts'
-import { applyReport, stopReason, type PolicyConfig, type TaskState } from './policy.ts'
-import { waitForRemoteFile, type RemoteFiles } from './remote.ts'
+import { malformedReport, parseReport, timeoutReport, type EvalReport } from './report.js'
+import { applyReport, stopReason, type PolicyConfig, type TaskState } from './policy.js'
+import { waitForRemoteFile, type RemoteFiles } from './remote.js'
 
 export interface RunInput {
   files: RemoteFiles

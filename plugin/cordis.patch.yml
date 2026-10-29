@@ -1,0 +1,33 @@
+- insert:
+    - id: canness-knowledge
+      name: dsh-canness/knowledge
+      config:
+        kbRoot: ./plugin/knowledge_base
+    - id: canness-generator
+      name: dsh-canness/generator
+      config:
+        workspace: ./canness-workspace
+    - id: canness-eval
+      name: dsh-canness/eval
+      config:
+        workspace: ./canness-workspace
+        host: ""
+        port: 22
+        username: ""
+        privateKeyPath: ""
+        inbox: /tmp/canness/inbox
+        outbox: /tmp/canness/outbox
+        timeoutSec: 1800
+        pollIntervalMs: 2000
+        maxIterations: 10
+        maxCompileRetries: 3
+        negativeStreakLimit: 3
+        convergenceThreshold: 0.05
+    - id: canness-loop
+      name: dsh-canness/loop
+      config:
+        workspace: ./canness-workspace
+        maxIterations: 10
+        maxCompileRetries: 3
+        negativeStreakLimit: 3
+        convergenceThreshold: 0.05

@@ -1,5 +1,5 @@
-import type { EvalReport } from './report.ts'
-import type { OperatorSpec } from './spec.ts'
+import type { EvalReport } from './report.js'
+import type { OperatorSpec } from './spec.js'
 
 export interface PolicyConfig {
   maxIterations: number

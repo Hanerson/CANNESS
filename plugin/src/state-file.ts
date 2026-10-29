@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { emptyState, type TaskState } from './policy.ts'
+import { emptyState, type TaskState } from './policy.js'
 
 export function loadState(path: string): TaskState {
   try {

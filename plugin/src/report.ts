@@ -1,4 +1,4 @@
-import { parseAnalysis, type PerformanceAnalysis } from './analysis.ts'
+import { parseAnalysis, type PerformanceAnalysis } from './analysis.js'
 
 export type ResultStatus = 'pass' | 'compile_fail' | 'accuracy_fail' | 'perf_fail' | 'timeout' | 'error'
 

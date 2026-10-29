@@ -1,7 +1,7 @@
 import { readdirSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { Client } from 'ssh2'
-import type { RemoteFiles } from './remote.ts'
+import type { RemoteFiles } from './remote.js'
 
 export interface SftpLike {
   mkdir(path: string): Promise<void>

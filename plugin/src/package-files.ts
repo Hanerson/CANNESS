@@ -1,6 +1,6 @@
 import { cpSync, mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import type { OperatorSpec } from './spec.ts'
+import type { OperatorSpec } from './spec.js'
 
 export const LAYER_FILES = {
   kernel: 'op_kernel/kernel.cpp',
