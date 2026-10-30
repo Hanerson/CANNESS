@@ -1,4 +1,6 @@
 - insert:
+    - id: canness
+      name: dsh-canness
     - id: canness-knowledge
       name: dsh-canness/knowledge
       config:
