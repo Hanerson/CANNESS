@@ -15,7 +15,8 @@ export interface SftpOptions {
   host: string
   port: number
   username: string
-  privateKey: string
+  privateKey?: string
+  password?: string
 }
 
 export type Dial = (opts: SftpOptions) => Promise<SftpLike>
@@ -67,7 +68,7 @@ export function isMissingSftpError(err: unknown): boolean {
 interface DialClient {
   on(event: 'ready', listener: () => void): this
   on(event: 'error', listener: (err: Error) => void): this
-  connect(config: { host: string; port: number; username: string; privateKey: string }): this
+  connect(config: { host: string; port: number; username: string; privateKey?: string; password?: string }): this
   sftp(callback: (err: Error | undefined, sftp: SFTPWrapper) => void): this
   end(): void
 }
@@ -108,7 +109,8 @@ export function openSftp(client: DialClient, opts: SftpOptions): Promise<SftpLik
       host: opts.host,
       port: opts.port,
       username: opts.username,
-      privateKey: opts.privateKey,
+      ...(opts.privateKey !== undefined ? { privateKey: opts.privateKey } : {}),
+      ...(opts.password !== undefined ? { password: opts.password } : {}),
     })
   })
 }

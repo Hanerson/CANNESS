@@ -37,11 +37,13 @@ function fakeClient(start: (cb: (err: Error | undefined, sftp: { unlink: (path: 
   const handlers = new Map<string, Function>()
   const client = {
     ends: 0,
+    connectConfig: undefined as { host?: string; port?: number; username?: string; privateKey?: string; password?: string } | undefined,
     on(event: string, fn: Function) {
       handlers.set(event, fn)
       return client
     },
-    connect() {
+    connect(config: object) {
+      client.connectConfig = config as typeof client.connectConfig
       handlers.get('ready')?.()
       return client
     },
@@ -78,4 +80,25 @@ test('a failed sftp() ends the client', async () => {
   const client = fakeClient(cb => { cb(new Error('sftp failed'), undefined as never) })
   await expect(openSftp(client, dialOpts)).rejects.toThrow('sftp failed')
   expect(client.ends).toBe(1)
+})
+
+test('openSftp passes password auth through and omits the key', async () => {
+  const client = fakeClient(cb => {
+    cb(undefined, { unlink(_path, done) { done(null) } })
+  })
+  const files = remoteFromSftp(await openSftp(client, {
+    host: 'npu', port: 22, username: 'canness', password: 'pw',
+  }))
+  expect(client.connectConfig).toMatchObject({ host: 'npu', port: 22, username: 'canness', password: 'pw' })
+  expect(client.connectConfig).not.toHaveProperty('privateKey')
+  await files.close()
+})
+
+test('openSftp keeps passing the private key when present', async () => {
+  const client = fakeClient(cb => {
+    cb(undefined, { unlink(_path, done) { done(null) } })
+  })
+  await openSftp(client, { host: 'npu', port: 22, username: 'canness', privateKey: 'KEY' })
+  expect(client.connectConfig).toMatchObject({ privateKey: 'KEY' })
+  expect(client.connectConfig).not.toHaveProperty('password')
 })
