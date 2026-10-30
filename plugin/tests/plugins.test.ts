@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, test } from 'vitest'
+import type { Volatile } from '@deepseek-ai/cordis'
 import * as knowledge from '../src/knowledge.ts'
 import * as generator from '../src/generator.ts'
 import * as evalPlugin from '../src/eval.ts'
@@ -11,12 +12,26 @@ import { MemoryRemote, type RemoteFiles } from '../src/remote.ts'
 import type { EvalReport } from '../src/report.ts'
 import { saveState } from '../src/state-file.ts'
 
-function fakeCtx() {
+const vol = <T,>(value: T): Volatile<T> => ({ get: () => value })
+
+function evalConfig(workspace: string, overrides: Record<string, unknown> = {}) {
+  return {
+    workspace,
+    host: vol('npu'), port: vol(22), username: vol('canness'),
+    privateKeyPath: vol(''), passwordEnv: vol('CANNNESS_SSH_PASSWORD'),
+    inbox: vol('/in'), outbox: vol('/out'), timeoutSec: vol(0), pollIntervalMs: vol(1),
+    maxIterations: vol(10), maxCompileRetries: vol(3), negativeStreakLimit: vol(3), convergenceThreshold: vol(0.05),
+    ...overrides,
+  }
+}
+
+function fakeCtx(credentials?: { resolve: (ref: string) => Promise<{ value: string } | undefined> }) {
   const tools: { name: string; execute: (args: Record<string, unknown>) => Promise<unknown> }[] = []
   const listeners: { event: string; fn: Function }[] = []
   return {
     tools: { register(tool: { name: string; execute: (args: Record<string, unknown>) => Promise<unknown> }) { tools.push(tool) } },
     on(event: string, fn: Function) { listeners.push({ event, fn }) },
+    get(name: string) { return name === 'credentials' ? credentials : undefined },
     toolsRegistered: tools,
     listeners,
   }
@@ -29,11 +44,7 @@ test('registers the five tools and two loop listeners', () => {
   const gen = fakeCtx()
   generator.apply(gen as never, { workspace })
   const ev = fakeCtx()
-  evalPlugin.apply(ev as never, {
-    workspace, host: '', port: 22, username: '', privateKeyPath: '',
-    inbox: '/tmp/canness/inbox', outbox: '/tmp/canness/outbox', timeoutSec: 1800, pollIntervalMs: 2000,
-    maxIterations: 10, maxCompileRetries: 3, negativeStreakLimit: 3, convergenceThreshold: 0.05,
-  })
+  evalPlugin.apply(ev as never, evalConfig(workspace, { host: vol(''), inbox: vol('/tmp/canness/inbox'), outbox: vol('/tmp/canness/outbox'), timeoutSec: vol(1800), pollIntervalMs: vol(2000) }))
   const lp = fakeCtx()
   loop.apply(lp as never, {
     workspace, maxIterations: 10, maxCompileRetries: 3, negativeStreakLimit: 3, convergenceThreshold: 0.05,
@@ -57,11 +68,8 @@ test('run_evaluation with an empty host does not throw and reports ssh host is e
   const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
   const ev = fakeCtx()
   let connected = false
-  evalPlugin.apply(ev as never, {
-    workspace, host: '', port: 22, username: '', privateKeyPath: '',
-    inbox: '/in', outbox: '/out', timeoutSec: 1, pollIntervalMs: 1,
-    maxIterations: 10, maxCompileRetries: 3, negativeStreakLimit: 3, convergenceThreshold: 0.05,
-  }, async () => { connected = true; throw new Error('connected') })
+  evalPlugin.apply(ev as never, evalConfig(workspace, { host: vol(''), timeoutSec: vol(1) }),
+    async () => { connected = true; throw new Error('connected') })
   const tool = ev.toolsRegistered[0]!
   const value = await tool.execute({})
   expect(value).toMatchObject({ status: 'error', summary: 'ssh host is empty' })
@@ -134,12 +142,8 @@ test('run_evaluation closes after a finished attempt and after an upload failure
     summary: 'failed compile',
   })), 1)
   const finishedCtx = fakeCtx()
-  evalPlugin.apply(finishedCtx as never, {
-    workspace: finished.workspace, host: 'npu', port: 22, username: 'canness',
-    privateKeyPath: join(finished.workspace, 'id_key'),
-    inbox: '/in', outbox: '/out', timeoutSec: 0, pollIntervalMs: 1,
-    ...policy,
-  }, async () => finishedRemote.files)
+  evalPlugin.apply(finishedCtx as never, evalConfig(finished.workspace, { privateKeyPath: vol(join(finished.workspace, 'id_key')) }),
+    async () => finishedRemote.files)
   const finishedValue = await finishedCtx.toolsRegistered[0]!.execute({})
   expect(finishedValue).toMatchObject({ status: 'compile_fail', summary: 'failed compile' })
   expect(finishedEvents).toEqual(['upload', 'remove', 'read', 'close'])
@@ -148,12 +152,8 @@ test('run_evaluation closes after a finished attempt and after an upload failure
   const failed = readyPackage()
   const failedRemote = trackedRemote(failedEvents, async () => { throw new Error('upload failed') })
   const failedCtx = fakeCtx()
-  evalPlugin.apply(failedCtx as never, {
-    workspace: failed.workspace, host: 'npu', port: 22, username: 'canness',
-    privateKeyPath: join(failed.workspace, 'id_key'),
-    inbox: '/in', outbox: '/out', timeoutSec: 0, pollIntervalMs: 1,
-    ...policy,
-  }, async () => failedRemote.files)
+  evalPlugin.apply(failedCtx as never, evalConfig(failed.workspace, { privateKeyPath: vol(join(failed.workspace, 'id_key')) }),
+    async () => failedRemote.files)
   await expect(failedCtx.toolsRegistered[0]!.execute({})).rejects.toThrow('upload failed')
   expect(failedEvents).toEqual(['upload', 'close'])
 })
@@ -163,12 +163,8 @@ test('run_evaluation closes after a poll timeout and does not connect when alrea
   const timed = readyPackage()
   const timedRemote = trackedRemote(timeoutEvents)
   const timeoutCtx = fakeCtx()
-  evalPlugin.apply(timeoutCtx as never, {
-    workspace: timed.workspace, host: 'npu', port: 22, username: 'canness',
-    privateKeyPath: join(timed.workspace, 'id_key'),
-    inbox: '/in', outbox: '/out', timeoutSec: 0, pollIntervalMs: 1,
-    ...policy,
-  }, async () => timedRemote.files)
+  evalPlugin.apply(timeoutCtx as never, evalConfig(timed.workspace, { privateKeyPath: vol(join(timed.workspace, 'id_key')) }),
+    async () => timedRemote.files)
   const timedOut = await timeoutCtx.toolsRegistered[0]!.execute({})
   expect(timedOut).toMatchObject({ status: 'timeout' })
   expect(timeoutEvents).toEqual(['upload', 'remove', 'read', 'close'])
@@ -179,15 +175,80 @@ test('run_evaluation closes after a poll timeout and does not connect when alrea
     ...emptyState(), generationId: stopped.generationId, timeouts: 2,
   })
   const stoppedCtx = fakeCtx()
-  evalPlugin.apply(stoppedCtx as never, {
-    workspace: stopped.workspace, host: 'npu', port: 22, username: 'canness',
-    privateKeyPath: join(stopped.workspace, 'id_key'),
-    inbox: '/in', outbox: '/out', timeoutSec: 0, pollIntervalMs: 1,
-    ...policy,
-  }, async () => { stoppedEvents.push('connect'); throw new Error('connected') })
+  evalPlugin.apply(stoppedCtx as never, evalConfig(stopped.workspace, { privateKeyPath: vol(join(stopped.workspace, 'id_key')) }),
+    async () => { stoppedEvents.push('connect'); throw new Error('connected') })
   const stoppedValue = await stoppedCtx.toolsRegistered[0]!.execute({})
   expect(stoppedValue).toMatchObject({ status: 'error', summary: 'stopped: timeouts' })
   expect(stoppedEvents).toEqual([])
+})
+
+function keyFile(workspace: string): string {
+  writeFileSync(join(workspace, 'id_key'), 'KEY')
+  return join(workspace, 'id_key')
+}
+
+test('the private key wins over a stored password', async () => {
+  const pkg = readyPackage()
+  const connected: unknown[] = []
+  const ctx = fakeCtx({ resolve: async () => ({ value: 'pw' }) })
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
+    async opts => { connected.push(opts); return trackedRemote([]).files })
+  await ctx.toolsRegistered[0]!.execute({})
+  expect(connected[0]).toMatchObject({ privateKey: 'KEY' })
+  expect((connected[0] as Record<string, unknown>).password).toBeUndefined()
+})
+
+test('a stored password is used when no key path is configured', async () => {
+  const pkg = readyPackage()
+  const refs: string[] = []
+  const connected: unknown[] = []
+  const ctx = fakeCtx({ resolve: async ref => { refs.push(String(ref)); return { value: 'pw' } } })
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol('') }),
+    async opts => { connected.push(opts); return trackedRemote([]).files })
+  await ctx.toolsRegistered[0]!.execute({})
+  expect(refs).toEqual(['CANNNESS_SSH_PASSWORD'])
+  expect(connected[0]).toMatchObject({ password: 'pw' })
+  expect((connected[0] as Record<string, unknown>).privateKey).toBeUndefined()
+})
+
+test('both credentials missing reports ssh credentials missing without connecting', async () => {
+  const pkg = readyPackage()
+  let connected = false
+  const ctx = fakeCtx({ resolve: async () => undefined })
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol('') }),
+    async () => { connected = true; throw new Error('connected') })
+  const value = await ctx.toolsRegistered[0]!.execute({})
+  expect(value).toMatchObject({ status: 'error', summary: 'ssh credentials missing' })
+  expect(connected).toBe(false)
+})
+
+test('an absent credentials service degrades to the missing-credentials report', async () => {
+  const pkg = readyPackage()
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol('') }),
+    async () => { throw new Error('connected') })
+  const value = await ctx.toolsRegistered[0]!.execute({})
+  expect(value).toMatchObject({ status: 'error', summary: 'ssh credentials missing' })
+})
+
+test('a connect failure becomes an error report carrying the reason', async () => {
+  const pkg = readyPackage()
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
+    async () => { throw new Error('All configured authentication methods failed') })
+  const value = await ctx.toolsRegistered[0]!.execute({})
+  expect(value).toMatchObject({ status: 'error' })
+  expect((value as { summary: string }).summary).toContain('All configured authentication methods failed')
+})
+
+test('passwordEnv names the resolved reference', async () => {
+  const pkg = readyPackage()
+  const refs: string[] = []
+  const ctx = fakeCtx({ resolve: async ref => { refs.push(String(ref)); return { value: 'pw' } } })
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(''), passwordEnv: vol('CUSTOM_SSH_REF') }),
+    async () => trackedRemote([]).files)
+  await ctx.toolsRegistered[0]!.execute({})
+  expect(refs).toEqual(['CUSTOM_SSH_REF'])
 })
 
 test('pre-step appends a retry only when shouldSteer is true', async () => {
