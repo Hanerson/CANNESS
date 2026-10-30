@@ -21,6 +21,7 @@
 - 编译失败和传输超时不增加 `validIterations`。超时累计到 2 次即停。
 - 每个插件导出 Schemastery `Config`：`z.object`，字段 `.required()`，不用 `.default()`。预算四字段在 `canness-eval` 和 `canness-loop` 各写一份，两处数字必须相同。
 - 知识库检索返回正文上限 8000 字符。
+- 性能分析是独立模块 `analysis.ts`。插件只解析下面的规范化 JSON，不读 msprof 的 CSV。mock 和将来的真实采集器都产出这一结构。`policy` 不引用 CSV 列名。
 - 本计划不实现 Dashboard、向量库、tiling 搜索、算子融合、容器沙箱，也不生成真实可编译的 AscendC。
 - 每个任务末尾的提交只包含该任务的文件。不要把 `.idea/`、`.venv/`、`docs/past/` 里无关的暂存内容加进去。
 
@@ -32,7 +33,7 @@
 
 写代码和单测不缺材料。下面两项只挡住最后的手工验收，不挡住 Task 1–11：
 
-- 一台能 SSH 的 Linux 主机，以及本机 OpenSSH 私钥。没有 CANN 也能跑 `watch.py` 的 echo 模式。
+- 一台能 SSH 的 Linux 主机，以及本机 OpenSSH 私钥。没有 CANN 时跑 `watch.py`，它直接写评测结果和 msprof 形状的性能分析。
 - 已安装的 `dsh` CLI，和一个配好模型密钥的 profile。插件不读密钥。
 
 ## 文件地图
@@ -45,7 +46,8 @@
 | `plugin/cordis.patch.yml` | 四行插件及默认配置 |
 | `plugin/src/spec.ts` | 规格书解析 |
 | `plugin/src/report.ts` | 结果 JSON 解析；本地合成的 timeout / malformed |
-| `plugin/src/policy.ts` | 计数、停机、续轮、增强文本 |
+| `plugin/src/analysis.ts` | 性能分析的类型和解析。不认识传输，也不认识停机策略 |
+| `plugin/src/policy.ts` | 计数、停机、续轮、增强文本。只读取 `analysis.summary` |
 | `plugin/src/state-file.ts` | 读写状态文件 |
 | `plugin/src/remote.ts` | `RemoteFiles`、内存实现、轮询 |
 | `plugin/src/ssh2-transport.ts` | SFTP 实现 |
@@ -55,7 +57,7 @@
 | `plugin/src/eval.ts` | `run_evaluation` |
 | `plugin/src/loop.ts` | `agent/pre-step` 与 `agent/turn-stopping` |
 | `plugin/knowledge_base/Add.md` | 一条检索夹具 |
-| `plugin/remote/watch.py` | 远端 echo：看到 manifest 就写 pass 结果 |
+| `plugin/remote/watch.py` | 远端 mock：看到 manifest 就写评测结果和 msprof 形状的性能分析。不调用 msprof |
 | `plugin/tests/*.test.ts` | 与上面源文件一一对应 |
 
 ## 细节约定
@@ -85,12 +87,34 @@
   "status": "pass",
   "compile": { "ok": true, "log": "" },
   "correctness": { "ok": true, "maxRelativeError": 0 },
-  "performance": { "kernelTimeUs": 120, "targetUs": 150 },
-  "summary": "echo pass"
+  "performance": { "kernelTimeUs": 150, "targetUs": 150 },
+  "analysis": {
+    "source": "msprof-mock",
+    "bottleneck": "memory",
+    "summary": "Task Duration 150us；aic_mte2_ratio 0.71，内存搬运为主，cube_utilization 18.4%。",
+    "op": {
+      "opName": "Add",
+      "opType": "Add",
+      "taskType": "AI_CORE",
+      "taskDurationUs": 150,
+      "taskWaitTimeUs": 2,
+      "blockDim": 8,
+      "aicoreTimeUs": 140,
+      "aicMacRatio": 0.12,
+      "aicMte2Ratio": 0.71,
+      "aicScalarRatio": 0.09,
+      "cubeUtilizationPct": 18.4
+    }
+  },
+  "summary": "mock pass"
 }
 ```
 
 `status` 只允许 `pass`、`compile_fail`、`accuracy_fail`、`perf_fail`、`timeout`、`error`。其它值或非法 JSON：本地改写成 `status: "error"`，`summary` 为 `malformed result: <原因>`，不抛到工具外。轮询超时：本地合成 `status: "timeout"`，不要求远端写这个状态。
+
+`analysis` 可以缺省，缺省解析为 `null`。给出了但 `source` 不是 `msprof-mock` 或 `msprof`、或 `bottleneck` 不在 `cube | memory | scalar | unknown` 中，也解析为 `null`，不把整份报告改成 error。`performance.kernelTimeUs` 对应官方列 `Task Duration(us)`。比率对应 `aic_mac_ratio`、`aic_mte2_ratio`、`aic_scalar_ratio`；`cubeUtilizationPct` 对应 `cube_utilization(%)`。这些列是否出现取决于 CANN 版本和 `--aic-metrics`，所以规范化字段允许为 `null`。前几版远端不跑 msprof，由 mock 填同一结构；以后换真实采集器时，插件解析和停机策略不动。
+
+`bottleneck` 由远端填写：三个比率里最大的一项，`aic_mac_ratio` → `cube`，`aic_mte2_ratio` → `memory`，`aic_scalar_ratio` → `scalar`，都没有则 `unknown`。插件不重算。
 
 ### 迭代
 
@@ -444,6 +468,7 @@ git commit -m "feat: parse operator spec json"
 ### Task 3: 结果解析与迭代策略
 
 **Files:**
+- Create: `plugin/src/analysis.ts`
 - Create: `plugin/src/report.ts`
 - Create: `plugin/src/policy.ts`
 - Create: `plugin/tests/policy.test.ts`
@@ -451,7 +476,7 @@ git commit -m "feat: parse operator spec json"
 
 **Interfaces:**
 - Consumes: 无（报告类型不引用 `OperatorSpec`）
-- Produces: `parseReport`、`timeoutReport`、`malformedReport`、`emptyState`、`applyReport`、`stopReason`、`shouldSteer`、`enhancementBlock`、`TaskState`、`PolicyConfig`、`EvalReport`
+- Produces: `parseAnalysis`、`parseReport`、`timeoutReport`、`malformedReport`、`emptyState`、`applyReport`、`stopReason`、`shouldSteer`、`enhancementBlock`、`TaskState`、`PolicyConfig`、`EvalReport`、`PerformanceAnalysis`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -476,6 +501,7 @@ function report(over: Partial<EvalReport>): EvalReport {
     compile: { ok: true, log: '' },
     correctness: { ok: true, maxRelativeError: 0 },
     performance: { kernelTimeUs: 100, targetUs: 150 },
+    analysis: null,
     summary: 'ok',
     ...over,
   }
@@ -540,11 +566,51 @@ test('malformed remote json becomes an error report', () => {
   expect(malformedReport('gen-1', 'no').status).toBe('error')
 })
 
+test('keeps an msprof-shaped analysis and drops a bad one', () => {
+  const parsed = parseReport({
+    generationId: 'gen-1',
+    status: 'pass',
+    analysis: {
+      source: 'msprof-mock',
+      bottleneck: 'memory',
+      summary: 'aic_mte2_ratio 0.71',
+      op: {
+        opName: 'Add',
+        opType: 'Add',
+        taskType: 'AI_CORE',
+        taskDurationUs: 150,
+        taskWaitTimeUs: 2,
+        blockDim: 8,
+        aicoreTimeUs: 140,
+        aicMacRatio: 0.12,
+        aicMte2Ratio: 0.71,
+        aicScalarRatio: 0.09,
+        cubeUtilizationPct: 18.4,
+      },
+    },
+  })
+  expect(parsed.analysis?.bottleneck).toBe('memory')
+  expect(parsed.analysis?.op?.aicMte2Ratio).toBe(0.71)
+  expect(parseReport({ status: 'pass', analysis: { source: 'nope' } }).analysis).toBeNull()
+})
+
 test('enhancement names the status and does not steer before any report', () => {
   expect(shouldSteer(emptyState(), config)).toBe(false)
   const state = applyReport(emptyState(), report({ status: 'accuracy_fail', summary: 'err 0.2' }))
   expect(enhancementBlock(state)).toContain('accuracy_fail')
   expect(enhancementBlock(state)).toContain('err 0.2')
+  expect(enhancementBlock(state)).toContain('性能分析：无')
+  const analyzed = applyReport(emptyState(), report({
+    status: 'perf_fail',
+    analysis: {
+      source: 'msprof-mock',
+      bottleneck: 'memory',
+      summary: 'aic_mte2_ratio 0.71',
+      op: null,
+    },
+  }))
+  expect(enhancementBlock(analyzed)).toContain('aic_mte2_ratio 0.71')
+  expect(enhancementBlock(analyzed)).not.toContain('Task Duration')
 })
 ```
 
@@ -556,11 +622,84 @@ cd plugin && pnpm exec vitest run tests/policy.test.ts
 
 Expected: FAIL，找不到模块
 
-- [ ] **Step 3: 实现 report.ts 与 policy.ts**
+- [ ] **Step 3: 实现 analysis.ts、report.ts 与 policy.ts**
+
+`plugin/src/analysis.ts`：
+
+```ts
+export interface MsprofOp {
+  opName: string
+  opType: string
+  taskType: string
+  taskDurationUs: number
+  taskWaitTimeUs: number | null
+  blockDim: number | null
+  aicoreTimeUs: number | null
+  aicMacRatio: number | null
+  aicMte2Ratio: number | null
+  aicScalarRatio: number | null
+  cubeUtilizationPct: number | null
+}
+
+export interface PerformanceAnalysis {
+  source: 'msprof-mock' | 'msprof'
+  bottleneck: 'cube' | 'memory' | 'scalar' | 'unknown'
+  summary: string
+  op: MsprofOp | null
+}
+
+const SOURCES = ['msprof-mock', 'msprof'] as const
+const BOTTLENECKS = ['cube', 'memory', 'scalar', 'unknown'] as const
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function numOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function text(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+function parseOp(raw: unknown): MsprofOp | null {
+  if (!isRecord(raw)) return null
+  const taskDurationUs = numOrNull(raw.taskDurationUs)
+  if (taskDurationUs == null) return null
+  return {
+    opName: text(raw.opName),
+    opType: text(raw.opType),
+    taskType: text(raw.taskType),
+    taskDurationUs,
+    taskWaitTimeUs: numOrNull(raw.taskWaitTimeUs),
+    blockDim: numOrNull(raw.blockDim),
+    aicoreTimeUs: numOrNull(raw.aicoreTimeUs),
+    aicMacRatio: numOrNull(raw.aicMacRatio),
+    aicMte2Ratio: numOrNull(raw.aicMte2Ratio),
+    aicScalarRatio: numOrNull(raw.aicScalarRatio),
+    cubeUtilizationPct: numOrNull(raw.cubeUtilizationPct),
+  }
+}
+
+export function parseAnalysis(raw: unknown): PerformanceAnalysis | null {
+  if (!isRecord(raw)) return null
+  if (typeof raw.source !== 'string' || !(SOURCES as readonly string[]).includes(raw.source)) return null
+  if (typeof raw.bottleneck !== 'string' || !(BOTTLENECKS as readonly string[]).includes(raw.bottleneck)) return null
+  return {
+    source: raw.source as PerformanceAnalysis['source'],
+    bottleneck: raw.bottleneck as PerformanceAnalysis['bottleneck'],
+    summary: text(raw.summary),
+    op: parseOp(raw.op),
+  }
+}
+```
 
 `plugin/src/report.ts`：
 
 ```ts
+import { parseAnalysis, type PerformanceAnalysis } from './analysis.ts'
+
 export type ResultStatus = 'pass' | 'compile_fail' | 'accuracy_fail' | 'perf_fail' | 'timeout' | 'error'
 
 export interface EvalReport {
@@ -569,6 +708,7 @@ export interface EvalReport {
   compile: { ok: boolean; log: string }
   correctness: { ok: boolean; maxRelativeError: number | null }
   performance: { kernelTimeUs: number | null; targetUs: number | null }
+  analysis: PerformanceAnalysis | null
   summary: string
 }
 
@@ -585,6 +725,7 @@ export function malformedReport(generationId: string, detail: string): EvalRepor
     compile: { ok: false, log: '' },
     correctness: { ok: false, maxRelativeError: null },
     performance: { kernelTimeUs: null, targetUs: null },
+    analysis: null,
     summary: `malformed result: ${detail}`,
   }
 }
@@ -596,6 +737,7 @@ export function timeoutReport(generationId: string, timeoutSec: number): EvalRep
     compile: { ok: false, log: '' },
     correctness: { ok: false, maxRelativeError: null },
     performance: { kernelTimeUs: null, targetUs: null },
+    analysis: null,
     summary: `timed out after ${timeoutSec}s`,
   }
 }
@@ -619,6 +761,7 @@ export function parseReport(raw: unknown): EvalReport {
     compile: { ok: compile.ok === true, log: typeof compile.log === 'string' ? compile.log : '' },
     correctness: { ok: correctness.ok === true, maxRelativeError: numOrNull(correctness.maxRelativeError) },
     performance: { kernelTimeUs: numOrNull(performance.kernelTimeUs), targetUs: numOrNull(performance.targetUs) },
+    analysis: parseAnalysis(raw.analysis),
     summary: typeof raw.summary === 'string' ? raw.summary : '',
   }
 }
@@ -729,6 +872,7 @@ export function enhancementBlock(state: TaskState): string {
     `编译日志：${report.compile.log.slice(0, 2000)}`,
     `maxRelativeError：${String(report.correctness.maxRelativeError)}`,
     `kernel_time_us：${String(report.performance.kernelTimeUs)}，目标 ${String(report.performance.targetUs)}`,
+    `性能分析：${report.analysis?.summary ?? '无'}`,
     `有效迭代 ${state.validIterations}，编译重试 ${state.compileRetries}，超时 ${state.timeouts}，变差连续 ${state.negativeStreak}。`,
     '请修改四层代码后再次调用 build_test_package 和 run_evaluation。',
   ].join('\n')
@@ -1036,6 +1180,7 @@ export async function runEvaluation(input: RunInput): Promise<{ report: EvalRepo
         compile: { ok: false, log: '' },
         correctness: { ok: false, maxRelativeError: null },
         performance: { kernelTimeUs: null, targetUs: null },
+        analysis: null,
         summary: `stopped: ${reason}`,
       },
       state: input.state,
@@ -1770,6 +1915,7 @@ function emptyHostReport(generationId: string | null): EvalReport {
     compile: { ok: false, log: '' },
     correctness: { ok: false, maxRelativeError: null },
     performance: { kernelTimeUs: null, targetUs: null },
+    analysis: null,
     summary: 'ssh host is empty',
   }
 }
@@ -1823,6 +1969,44 @@ export function apply(ctx: Context, config: Config): void {
               kernelTimeUs: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
               targetUs: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
             },
+          },
+          analysis: {
+            required: true,
+            oneOf: [
+              { type: 'null' },
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  source: { type: 'string', required: true, enum: ['msprof-mock', 'msprof'] },
+                  bottleneck: { type: 'string', required: true, enum: ['cube', 'memory', 'scalar', 'unknown'] },
+                  summary: { type: 'string', required: true },
+                  op: {
+                    required: true,
+                    oneOf: [
+                      { type: 'null' },
+                      {
+                        type: 'object',
+                        additionalProperties: false,
+                        properties: {
+                          opName: { type: 'string', required: true },
+                          opType: { type: 'string', required: true },
+                          taskType: { type: 'string', required: true },
+                          taskDurationUs: { type: 'number', required: true },
+                          taskWaitTimeUs: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
+                          blockDim: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
+                          aicoreTimeUs: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
+                          aicMacRatio: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
+                          aicMte2Ratio: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
+                          aicScalarRatio: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
+                          cubeUtilizationPct: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            ],
           },
           summary: { type: 'string', required: true },
         },
@@ -1974,7 +2158,7 @@ git add plugin/src/knowledge.ts plugin/src/generator.ts plugin/src/eval.ts plugi
 git commit -m "feat: register the four canness plugins"
 ```
 
-### Task 10: 远端 echo 脚本
+### Task 10: 远端 mock 脚本
 
 **Files:**
 - Create: `plugin/remote/watch.py`
@@ -1983,7 +2167,7 @@ git commit -m "feat: register the four canness plugins"
 
 **Interfaces:**
 - Consumes: 结果 JSON 约定
-- Produces: `python plugin/remote/watch.py --inbox <dir> --outbox <dir> --once`。看到 `manifest.json` 就写 pass 结果，`kernelTimeUs` 等于 `performanceTargetUs`。
+- Produces: `python plugin/remote/watch.py --inbox <dir> --outbox <dir> --once`。看到 `manifest.json` 就写 pass 结果：`kernelTimeUs` 等于 `performanceTargetUs`，并附上 `source: "msprof-mock"` 的性能分析。不调用 msprof。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2013,8 +2197,22 @@ test('watch.py writes a pass result from the manifest', () => {
     generationId: 'gen-01234567',
     status: 'pass',
     performance: { kernelTimeUs: 150, targetUs: 150 },
-    summary: 'echo pass',
+    summary: 'mock pass',
+    analysis: {
+      source: 'msprof-mock',
+      bottleneck: 'memory',
+      op: {
+        taskDurationUs: 150,
+        aicMacRatio: 0.12,
+        aicMte2Ratio: 0.71,
+        aicScalarRatio: 0.09,
+        cubeUtilizationPct: 18.4,
+      },
+    },
   })
+  expect(result.analysis.summary).toContain('Task Duration')
+  expect(result.analysis.summary).toContain('aic_mte2_ratio')
+  expect(result.analysis.summary).toContain('cube_utilization')
 })
 ```
 
@@ -2030,7 +2228,7 @@ Expected: FAIL，`watch.py` 不存在或退出码非 0
 
 ```python
 #!/usr/bin/env python3
-"""Host-side echo runner. Upload a package, this writes results.json. Not a cloud API."""
+"""Host-side mock runner. Writes an eval report plus an msprof-shaped analysis. Does not call msprof."""
 
 import argparse
 import json
@@ -2054,6 +2252,7 @@ def main() -> None:
             continue
         data = json.loads(manifest.read_text(encoding='utf-8'))
         target = data.get('performanceTargetUs')
+        name = data.get('operatorName') if isinstance(data.get('operatorName'), str) else generation
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(json.dumps({
             'generationId': data.get('generationId', generation),
@@ -2061,7 +2260,25 @@ def main() -> None:
             'compile': {'ok': True, 'log': ''},
             'correctness': {'ok': True, 'maxRelativeError': 0},
             'performance': {'kernelTimeUs': target, 'targetUs': target},
-            'summary': 'echo pass',
+            'analysis': {
+                'source': 'msprof-mock',
+                'bottleneck': 'memory',
+                'summary': f'Task Duration {target}us；aic_mte2_ratio 0.71，内存搬运为主，cube_utilization 18.4%。',
+                'op': {
+                    'opName': name,
+                    'opType': name,
+                    'taskType': 'AI_CORE',
+                    'taskDurationUs': target,
+                    'taskWaitTimeUs': 2,
+                    'blockDim': 8,
+                    'aicoreTimeUs': target,
+                    'aicMacRatio': 0.12,
+                    'aicMte2Ratio': 0.71,
+                    'aicScalarRatio': 0.09,
+                    'cubeUtilizationPct': 18.4,
+                },
+            },
+            'summary': 'mock pass',
         }), encoding='utf-8')
 
 
@@ -2083,7 +2300,7 @@ Expected: PASS。本机需要 `python` 在 PATH 上。
 
 ```bash
 git add plugin/remote/watch.py plugin/tests/watch.test.ts
-git commit -m "feat: add the remote echo result writer"
+git commit -m "feat: add the remote msprof mock result writer"
 ```
 
 ### Task 11: 全量单测与类型检查
@@ -2125,7 +2342,7 @@ git commit -m "fix: make the canness plugin tests pass together"
 
 **Interfaces:**
 - Consumes: `cordis.patch.yml`、`watch.py`、`connectSftp`
-- Produces: 一份把 profile 安装和 echo 闭环写清楚的 README
+- Produces: 一份把 profile 安装和 mock 闭环写清楚的 README
 
 - [ ] **Step 1: 写 README**
 
@@ -2133,7 +2350,7 @@ git commit -m "fix: make the canness plugin tests pass together"
 
 1. `cd plugin && pnpm test && pnpm build`
 2. 有 `dsh` 时：`dsh plugin --profile canness add ./plugin`，然后 `dsh --profile canness --dump-config`。期望输出含 `# == dsh-canness`。把 profile 的 `canness-eval` 行整段重写成自己的 `host`、`username`、`privateKeyPath`；patch 替换整份 `config`，不能只加一个键。
-3. 远端：`python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once` 放进 cron 或在上传后手动跑。本机没有 CANN 时这样就能等到 `echo pass`。
+3. 远端：`python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once` 放进 cron 或在上传后手动跑。本机没有 CANN 时这样就能等到 `status` 为 `pass`、`analysis.source` 为 `msprof-mock` 的 `results.json`。不调用 msprof。
 
 - [ ] **Step 2: 有 dsh 就核对 dump**
 
@@ -2159,6 +2376,6 @@ git commit -m "docs: describe the canness profile install"
 - 不用模力方舟 / dsh-ssh：Task 6 只用 `ssh2`，空 host 不连接。
 - `agent/turn-stopping` 用 `steer` 而不是 `return` 停机：Task 9 的 `loop.ts`。
 - 会话日志不另写存储：工具结果进入 dsh session，计划里没有第二份日志器。
-- 真实 AscendC 与 CANN 编译不在本计划内。远端 echo 只证明文件契约。
+- 真实 AscendC 与 CANN 编译不在本计划内。远端 mock 只证明结果 JSON 和性能分析契约，不调用 msprof。
 - 不监听 `tools/result`。失败分类在 `runEvaluation` → `applyReport`。`pre-step` 看到本步消息里已有同一段增强文本就不再追加。
 - 四个入口都有完整源码，并导出 Schemastery `Config`。预算四字段在 eval 与 loop 的 patch 里各写一份。
