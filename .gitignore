@@ -1,4 +1,22 @@
+# Dependencies
 node_modules/
+
+# Build output (regenerate with `pnpm build` in plugin/)
 lib/
-.idea/
+*.tsbuildinfo
+*.log
+
+# Generated operator workspace: state.json, operators/, packages/
 .canness-workspace/
+canness-workspace/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local tooling state
+.claude/
+.superpowers/
+.venv/

@@ -1,11 +1,39 @@
 {
   "name": "dsh-canness",
   "version": "0.1.0",
+  "description": "Ascend CANN operator development for DeepSeek Harness: spec → four-layer operator → test package → remote evaluation loop.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "ascend",
+    "cann",
+    "ascendc",
+    "operator",
+    "agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hanerson/CANNESS.git",
+    "directory": "plugin"
+  },
+  "homepage": "https://github.com/Hanerson/CANNESS#readme",
+  "bugs": {
+    "url": "https://github.com/Hanerson/CANNESS/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=24.9.0",
     "dsh": ">=0.2.0 <0.3.0"
   },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "knowledge_base",
+    "remote"
+  ],
   "exports": {
     ".": "./lib/index.js",
     "./knowledge": "./lib/knowledge.js",
@@ -30,7 +58,8 @@
   "scripts": {
     "test": "vitest run",
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
-    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "prepack": "pnpm build"
   },
   "dependencies": {
     "ssh2": "^1.17.0"
