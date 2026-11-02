@@ -2,10 +2,10 @@
 title: CANNESS 插件化架构设计（基于 deepseek-harness）
 order: 5
 relates_to:
-  - "01-CANNESS总体设计方案.md"     # 被本篇部分取代的旧纲领
-  - "02-CANNESS详细架构设计.md"     # 被本篇重新映射的旧详细设计
-  - "03-闭环反馈系统设计指南.md"    # 反馈模式仍然适用，实现载体改为事件监听
-  - "04-可行性评估与实施建议.md"    # MVP 范围不变，技术路线（§9.3）被本篇修订
+  - "01-overall-design.md"     # 被本篇部分取代的旧纲领
+  - "02-detailed-architecture.md"     # 被本篇重新映射的旧详细设计
+  - "03-closed-loop-feedback.md"    # 反馈模式仍然适用，实现载体改为事件监听
+  - "04-feasibility-assessment.md"    # MVP 范围不变，技术路线（§9.3）被本篇修订
 ---
 
 # CANNESS 插件化架构设计（基于 deepseek-harness）
@@ -175,7 +175,7 @@ ctx.on('agent/turn-stopping', ({ agent }) => {
 
 计数规则在评测服务里：编译失败、传输超时不进 `validIterations`。模型在预算已尽时再调 `run_evaluation`，工具直接返回错误，不上传。
 
-通知策略（01 文档 §4.3）：每次评测结果随工具结果进入会话（模型可见、用户可见）。编译失败不计迭代，由 `turn-stopping` steer 再试，不在评估服务里偷偷重跑。`Ctrl+C` 中断与「输出当前最优」由 harness 会话中断 + 状态文件承接。字段级约定见 `docs/superpowers/plans/2026-10-29-dsh-canness-mvp.md`。
+通知策略（01 文档 §4.3）：每次评测结果随工具结果进入会话（模型可见、用户可见）。编译失败不计迭代，由 `turn-stopping` steer 再试，不在评估服务里偷偷重跑。`Ctrl+C` 中断与「输出当前最优」由 harness 会话中断 + 状态文件承接。字段级约定见 `docs/plans/2026-10-29-dsh-canness-mvp.md`。
 
 ### 5.3 算子测试：通用 SSH，本地只上传并等待
 

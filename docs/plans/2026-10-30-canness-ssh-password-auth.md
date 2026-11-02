@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript/ESM, schemastery volatile fields, ssh2, esbuild (client bundle), React 18 (browser half, externals from dsh's frozen module table), vitest.
 
-**Spec:** `docs/superpowers/specs/2026-10-30-canness-ssh-credentials-design.md` (approved). Deviations discovered during exploration are recorded in "Deviations from the spec" below — all are mechanism-level corrections, not scope changes.
+**Spec:** `docs/plans/2026-10-30-canness-ssh-credentials-design.md` (approved). Deviations discovered during exploration are recorded in "Deviations from the spec" below — all are mechanism-level corrections, not scope changes.
 
 ## Global Constraints
 

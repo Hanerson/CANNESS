@@ -2,9 +2,9 @@
 title: CANNESS 详细架构设计
 order: 2
 relates_to:
-  - "01-CANNESS总体设计方案.md"    # 本篇的纲领性基础
-  - "03-闭环反馈系统设计指南.md"   # 反馈机制的补充设计
-  - "04-可行性评估与实施建议.md"   # 对本文方案的可行性分析
+  - "01-overall-design.md"    # 本篇的纲领性基础
+  - "03-closed-loop-feedback.md"   # 反馈机制的补充设计
+  - "04-feasibility-assessment.md"   # 对本文方案的可行性分析
 ---
 
 # CANNESS 详细架构设计

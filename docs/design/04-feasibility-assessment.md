@@ -2,9 +2,9 @@
 title: 可行性评估与实施建议
 order: 4
 relates_to:
-  - "01-CANNESS总体设计方案.md"    # 评估对象
-  - "02-CANNESS详细架构设计.md"    # 评估对象
-  - "03-闭环反馈系统设计指南.md"   # 评估对象
+  - "01-overall-design.md"    # 评估对象
+  - "02-detailed-architecture.md"    # 评估对象
+  - "03-closed-loop-feedback.md"   # 评估对象
 ---
 
 # CANN 算子自动化生成 Harness 项目可行性评估与实施建议

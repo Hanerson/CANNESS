@@ -2,9 +2,9 @@
 title: 闭环反馈系统设计指南
 order: 3
 relates_to:
-  - "01-CANNESS总体设计方案.md"    # 整体架构背景
-  - "02-CANNESS详细架构设计.md"    # Agent 与执行器设计
-  - "04-可行性评估与实施建议.md"   # 对本文方案的可行性分析
+  - "01-overall-design.md"    # 整体架构背景
+  - "02-detailed-architecture.md"    # Agent 与执行器设计
+  - "04-feasibility-assessment.md"   # 对本文方案的可行性分析
 ---
 
 # CANN 算子自动化生成 Harness 设计指导
