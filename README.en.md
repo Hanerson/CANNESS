@@ -4,7 +4,7 @@
 
 It hands the loop — *submit a spec → generate the four operator layers → package a test bundle → upload it → wait for the evaluation → iterate within a budget* — to dsh's agent loop. CANNESS only owns the domain contract.
 
-[![version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v0.1.1-blue.svg)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A524.9-brightgreen.svg)](https://nodejs.org/)
 [![dsh](https://img.shields.io/badge/dsh-0.2.1--rc.3-purple.svg)](https://github.com/deepseek-ai/deepseek-harness)
@@ -45,7 +45,7 @@ CANNESS gives that loop to an agent, with sharp boundaries:
 | **CANNESS plugin** | Domain contract: spec, four-layer files, test package, evaluation report, knowledge base, iteration budget |
 | **Remote host** | Actually runs the compile, accuracy check, performance collection and msprof |
 
-Nothing is compiled locally, no CANN call is made locally, and no cloud API is involved. Evaluation happens on your own machine with the CANN toolchain; CANNESS only requires that it accepts SSH and that somebody consumes the inbox.
+Nothing is compiled locally, no CANN call is made locally, and no cloud API is involved. Evaluation happens on your own machine with the CANN toolchain; CANNESS only requires that it accepts SSH. The inbox consumer is bootstrapped by the first `run_evaluation` (see [9.1](#91-layout)), and a host that already has a real runner can turn that off.
 
 ## 2. Features
 
@@ -338,7 +338,7 @@ No parameters. Returns `{ packageDir }`. Copies the current generation's four la
 
 ### `run_evaluation`
 
-No parameters. Returns an evaluation report (see [9.2](#92-result-file)). These cases do **not** throw; they return a report with `status: "error"`: empty `host`, missing credentials, SSH connection failure, budget exhausted. These cases throw: no `submit_spec` (`submit_spec first`), no `build_test_package` (`build_test_package first`).
+No parameters. Returns an evaluation report (see [9.2](#92-result-file)). These cases do **not** throw; they return a report with `status: "error"`: empty `host`, missing credentials, SSH connection failure, remote bootstrap failure, budget exhausted. These cases throw: no `submit_spec` (`submit_spec first`), no `build_test_package` (`build_test_package first`).
 
 ## 8. Configuration reference
 
@@ -374,6 +374,8 @@ Configuration for the four host plugins. Except `workspace`, every `canness-eval
 | `maxCompileRetries` | number | `3` | Consecutive compile-failure limit |
 | `negativeStreakLimit` | number | `3` | Consecutive performance-regression limit |
 | `convergenceThreshold` | number | `0.05` | Two passes within this relative difference count as converged |
+| `bootstrap` | boolean | `true` | Prepare the remote before the first upload: create directories, reuse or start the inbox consumer. `false` leaves the remote untouched |
+| `bootstrapCommand` | string | `""` | When non-empty, run this POSIX command to start the consumer (must exit 0) instead of deploying the bundled mock |
 
 ### `canness-loop`
 
@@ -417,7 +419,9 @@ Configuration for the four host plugins. Except `workspace`, every `canness-eval
 
 Each round deletes the previous `results.json` before polling, so a stale result is never read.
 
-**Something must consume the inbox.** How the remote starts compiling and evaluating is entirely up to the host — directory watcher, cron, or a long-running runner. CANNESS only uploads and waits; it executes no commands over SSH.
+**The inbox consumer is bootstrapped on first use.** `run_evaluation` creates `{baseDir}` (which is `dirname(inbox)`), `inbox` and `outbox`, then reuses a consumer it finds running (a live pid in `{baseDir}/watch.pid`, or a `pgrep` hit on `watch.py`). When neither is found it uploads the bundled `remote/watch.py` (an existing file is never overwritten) and starts it with `nohup … --loop`, leaving the pid and log under `{baseDir}`. This is the only command the plugin runs over SSH; compiling and evaluating stay in the host-side runner, and a host with a real runner sets `bootstrapCommand` or `bootstrap: false` to stay untouched.
+
+When any step fails (directory permission, no python on the remote, non-zero `bootstrapCommand`, a consumer that dies right away), the tool does not poll: it returns `status: "error"` within seconds with `summary: "remote bootstrap failed: <reason>"`. Fix the configuration and retry; the failed attempt consumes no iteration budget.
 
 ### 9.2 Result file
 
@@ -462,7 +466,7 @@ An invalid result does not throw: it produces `status: "error"` with `summary: "
 
 ### 9.3 Remote mock
 
-Without a CANN environment, [`plugin/remote/watch.py`](plugin/remote/watch.py) fakes the evaluation. Copy it to the remote and run it from cron or by hand:
+Without a CANN environment, [`plugin/remote/watch.py`](plugin/remote/watch.py) fakes the evaluation. The first `run_evaluation` against a bare host deploys this script and starts it in `--loop` mode (see [9.1](#91-layout)); run it from cron or by hand when bootstrap is off or you want to restart it:
 
 ```bash
 python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
@@ -626,7 +630,7 @@ It was not built. Run `pnpm build` in `plugin/`.
 
 **Q: `run_evaluation` waits until it times out.**
 
-Nothing consumes the remote inbox, or `outbox` differs from where the consumer writes. Confirm the paths manually with `watch.py --once`.
+Check `summary` first: when it starts with `remote bootstrap failed: `, fix the reported cause (directory permission, missing python, `bootstrapCommand` exit code). Otherwise `outbox` probably differs from where the consumer writes — confirm the paths manually with `watch.py --once`.
 
 **Q: pnpm warns about unresolved peerDependencies.**
 

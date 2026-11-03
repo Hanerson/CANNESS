@@ -25,6 +25,8 @@
         maxCompileRetries: 3
         negativeStreakLimit: 3
         convergenceThreshold: 0.05
+        bootstrap: true
+        bootstrapCommand: ""
     - id: canness-loop
       name: dsh-canness/loop
       config:

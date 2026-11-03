@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-03
+
+### 新增
+
+- **远端自举**：`run_evaluation` 首次上传前自动建目录、探测或拉起 inbox 消费者（`watch.py --loop`）；自举失败立即返回 `status: "error"`（`remote bootstrap failed: <原因>`），不再空等 `timeoutSec`，也不写状态文件、不消耗迭代预算。
+- **配置**：`canness-eval` 新增 `bootstrap`（默认 `true`）与 `bootstrapCommand`（默认空，走内置 mock）。
+- **连通性检查**：设置卡新增「测试联通」，经宿主侧 `/canness-probe <host> <port>` 命令做一次 TCP 连接（不验证登录）。
+- `remote/watch.py` 新增 `--loop` / `--interval`，单轮异常不退出；`--once` 语义不变。
+
+### 变更
+
+- 设置卡重做：按「连接 / 凭据 / 远端目录」分组，认证方式改为密码或私钥单选，保存密码时清空私钥路径，并提示未就绪原因。
+- `mkdirp` 在会话内缓存已确认目录，避免高延迟链路上的重复探测；目录权限错误不再被吞掉。
+- 传输层 `close()` 幂等，`run_evaluation` 只关闭一次连接。
+
+### 验证
+
+- 单元测试 15 个文件 90 个用例全绿（`pnpm test`）；`pnpm check`、`pnpm build` 通过。
+- 真机链路（`140.207.205.182:32222`，沐曦卡，不跑算子）：两次 `run_evaluation` 均为 `status: "pass"`；远端 `/tmp/canness/{inbox,outbox,watch.py,watch.pid,watch.log}` 齐备，测试包四层文件上传成功；第二次调用复用同一消费者（仅 1 个 `watch.py` 进程）；验证后已清理。
+
 ## [0.1.0] - 2026-11-02
 
 首个公开版本，定位为**可运行的最小闭环**（MVP）。四个插件、五个工具、远端 mock 与 Web 设置卡均已实现，单元测试全部通过；真实 SSH 主机上的端到端验收尚未进行。

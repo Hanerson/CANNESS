@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, test } from 'vitest'
@@ -8,7 +8,7 @@ import * as generator from '../src/generator.ts'
 import * as evalPlugin from '../src/eval.ts'
 import * as loop from '../src/loop.ts'
 import { emptyState, type PolicyConfig } from '../src/policy.ts'
-import { MemoryRemote, type RemoteFiles } from '../src/remote.ts'
+import { MemoryRemote, type RemoteHost } from '../src/remote.ts'
 import type { EvalReport } from '../src/report.ts'
 import { saveState } from '../src/state-file.ts'
 
@@ -21,6 +21,7 @@ function evalConfig(workspace: string, overrides: Record<string, unknown> = {}) 
     privateKeyPath: vol(''), passwordEnv: vol('CANNNESS_SSH_PASSWORD'),
     inbox: vol('/in'), outbox: vol('/out'), timeoutSec: vol(0), pollIntervalMs: vol(1),
     maxIterations: vol(10), maxCompileRetries: vol(3), negativeStreakLimit: vol(3), convergenceThreshold: vol(0.05),
+    bootstrap: vol(true), bootstrapCommand: vol(''),
     ...overrides,
   }
 }
@@ -36,6 +37,36 @@ function fakeCtx(credentials?: { resolve: (ref: string) => Promise<{ value: stri
     listeners,
   }
 }
+
+test('registers a tcp probe command when the commands service is present', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
+  const dials: Array<{ host: string; port: number }> = []
+  let definition: { name: string; handler: (invocation: { rawInput: string }) => Promise<{ kind: string; text?: string }> } | undefined
+  const ctx = {
+    tools: { register() {} },
+    get(name: string) {
+      if (name !== 'commands') return undefined
+      return {
+        register(def: typeof definition) {
+          definition = def
+          return () => {}
+        },
+      }
+    },
+    effect(run: () => () => void) { run() },
+  }
+  evalPlugin.apply(ctx as never, evalConfig(workspace), async () => {
+    throw new Error('evaluation connect is not used by the probe')
+  }, async (host, port) => {
+    dials.push({ host, port })
+    if (host === 'down') throw new Error('connect ECONNREFUSED')
+  })
+  expect(definition?.name).toBe('canness-probe')
+  await expect(definition!.handler({ rawInput: ' npu 2222' })).resolves.toEqual({ kind: 'success', text: 'reachable' })
+  expect(dials).toEqual([{ host: 'npu', port: 2222 }])
+  await expect(definition!.handler({ rawInput: 'down 22' })).resolves.toMatchObject({ kind: 'error', text: 'unreachable:connect ECONNREFUSED' })
+  await expect(definition!.handler({ rawInput: '   ' })).resolves.toEqual({ kind: 'error', text: 'empty-host' })
+})
 
 test('registers the five tools and two loop listeners', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
@@ -105,9 +136,9 @@ function readyPackage(): { workspace: string; generationId: string } {
   return { workspace, generationId }
 }
 
-function trackedRemote(events: string[], upload?: () => Promise<void>): { files: RemoteFiles; remote: MemoryRemote } {
+function trackedRemote(events: string[], upload?: () => Promise<void>): { files: RemoteHost; remote: MemoryRemote } {
   const remote = new MemoryRemote()
-  const files: RemoteFiles = {
+  const files: RemoteHost = {
     async uploadDir(local, dir) {
       events.push('upload')
       if (upload) await upload()
@@ -124,6 +155,11 @@ function trackedRemote(events: string[], upload?: () => Promise<void>): { files:
     async close() {
       events.push('close')
     },
+    // Bootstrap operations stay out of `events`; `remote.execCalls` inspects them.
+    async mkdirp(dir) { await remote.mkdirp(dir) },
+    async put(local, path) { await remote.put(local, path) },
+    async stat(path) { return remote.stat(path) },
+    async exec(command) { return remote.exec(command) },
   }
   return { files, remote }
 }
@@ -186,6 +222,48 @@ function keyFile(workspace: string): string {
   writeFileSync(join(workspace, 'id_key'), 'KEY')
   return join(workspace, 'id_key')
 }
+
+test('a failed bootstrap returns an error report without uploading, polling or writing state', async () => {
+  const pkg = readyPackage()
+  const remote = new MemoryRemote()
+  remote.execHandler = command => ({ code: 1, stdout: '', stderr: command.includes('pgrep') ? '' : 'not found' })
+  const statePath = join(pkg.workspace, '.canness', 'state.json')
+  const before = readFileSync(statePath, 'utf8')
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
+    async () => remote)
+  const value = await ctx.toolsRegistered[0]!.execute({})
+  expect(value).toMatchObject({ status: 'error' })
+  expect((value as { summary: string }).summary).toMatch(/^remote bootstrap failed: /)
+  expect((value as { summary: string }).summary).toContain('python')
+  expect(readFileSync(statePath, 'utf8')).toBe(before)
+  expect(remote.reads).toBe(0)
+  expect([...remote.files.keys()].some(path => path.startsWith('/in/'))).toBe(false)
+})
+
+test('bootstrap: false keeps the upload-then-poll behaviour', async () => {
+  const pkg = readyPackage()
+  const remote = new MemoryRemote()
+  const resultPath = `/out/${pkg.generationId}/results.json`
+  remote.appearOnRead(resultPath, Buffer.from(JSON.stringify({
+    generationId: pkg.generationId,
+    status: 'pass',
+    compile: { ok: true, log: '' },
+    correctness: { ok: true, maxRelativeError: 0 },
+    performance: { kernelTimeUs: 120, targetUs: 150 },
+    summary: 'ok',
+  })), 1)
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, {
+    privateKeyPath: vol(keyFile(pkg.workspace)),
+    bootstrap: vol(false),
+  }), async () => remote)
+  const value = await ctx.toolsRegistered[0]!.execute({})
+  expect(value).toMatchObject({ status: 'pass' })
+  expect(remote.execCalls).toEqual([])
+  expect(remote.files.has(`/in/${pkg.generationId}/manifest.json`)).toBe(true)
+  expect(remote.reads).toBeGreaterThan(0)
+})
 
 test('the private key wins over a stored password', async () => {
   const pkg = readyPackage()

@@ -186,7 +186,7 @@ ctx.on('agent/turn-stopping', ({ agent }) => {
 1. **上传**。把本轮测试包写到远端约定的 inbox 目录。
 2. **等待**。轮询约定的结果路径，直到结果文件出现或超时，再拉回解析为评估报告 JSON。
 
-编译、正确性、边界、性能都在远端发生。本地不逐条执行 cmake / kernel_eval，也不调用云 API。远端靠什么开始跑（目录监听，或那台机器上原有的 runner）是主机侧约定，不是 CANNESS 要适配的平台。
+编译、正确性、边界、性能都在远端发生。本地不逐条执行 cmake / kernel_eval，也不调用云 API。远端靠什么开始跑（目录监听，或那台机器上原有的 runner）是主机侧约定，不是 CANNESS 要适配的平台。缺省情况下（远端没有现成 runner）由插件按 §5.3.1 自举一个 mock 消费者；主机侧已有 runner 时只上传、不介入。
 
 | 旧实现（02 文档 §4） | 处置 |
 |---|---|
@@ -212,6 +212,25 @@ maxCompileRetries: 3
 negativeStreakLimit: 3
 convergenceThreshold: 0.05
 ```
+
+#### 5.3.1 远端自举（2026-11-03 补充）
+
+现场问题（§8 风险 1 的现实版）：远端能 SSH 登录，但 `/tmp/canness` 不存在、没有 `watch.py`、也没有任何进程消费 inbox。上传本身会自建 `{inbox}/{generationId}/`，所以流程看起来"在跑"，实际是没人写 `results.json`——一次调用要白等 `timeoutSec`（默认 1800s）才返回 `timeout`。
+
+决定：把"远端准备"从人工前置步骤改成 `run_evaluation` 的**幂等自举**，由 agent 的一次工具调用顺带完成（确定性代码，不让模型临场拼命令；失败时模型按报错修配置）：
+
+| 步骤 | 动作 | 幂等性 |
+|---|---|---|
+| 1 | `mkdirp(inbox)`、`mkdirp(outbox)` | 已存在则跳过 |
+| 2 | 探测消费者：`${baseDir}/watch.pid` + `kill -0`，回退 `pgrep -f '[w]atch.py'` | 已在跑则复用，不重复拉起 |
+| 3 | 缺失时上传插件包中的 `remote/watch.py` 到 `${baseDir}/watch.py`，`nohup python3 … --loop` 启动，日志与 pid 落 `${baseDir}` | 现成的 `watch.py` 不覆盖，只补缺 |
+| 4 | 10s 内确认进程存活 | 不存活即判失败 |
+
+- `baseDir = dirname(inbox)`（默认 `/tmp/canness`）。
+- 新增两个 volatile 配置：`bootstrap`（默认 `true`）与 `bootstrapCommand`（默认空 = 用内置 mock；非空则执行该命令，供真实 runner 使用）。
+- 自举失败**不进入轮询、不写状态文件**：返回 `status: "error"`、`summary: "remote bootstrap failed: <原因>"`，不消耗迭代预算；模型改配置后可重试。
+- 边界：SSH exec 只用于这一次自举（建目录、起进程）；编译/评测命令仍由主机侧 runner 执行，本地不编排。已有真实 runner 的机器设 `bootstrapCommand` 或 `bootstrap: false`，插件不会启动 mock，也不会覆盖其 `watch.py`。
+- 已知限制：消费者探测是"尽力而为"（pid 文件 + 进程名），并发多会话共用同一远端目录时不做互斥；单 agent 串行使用是前提。
 
 ### 5.4 知识库 → 服务 + 检索工具 + 上下文注入
 
@@ -261,7 +280,7 @@ convergenceThreshold: 0.05
 
 | # | 问题 | 影响 | 缓解 |
 |---|------|------|------|
-| 1 | **远端结果契约**：结果路径、JSON 格式、超时，以及 inbox 无人消费时会一直等到超时 | 高，闭环的前提 | 第一周 spike：向一台 SSH 主机丢一个测试包，确认能等到结果文件 |
+| 1 | **远端结果契约**：结果路径、JSON 格式、超时，以及 inbox 无人消费时会一直等到超时 | 高，闭环的前提 | 第一周 spike：向一台 SSH 主机丢一个测试包，确认能等到结果文件；2026-11-03 起由 §5.3.1 自举承接（缺目录/缺消费者自动补齐，自举失败立即报错而不是干等） |
 | 2 | 团队 Python → TS 转型 | 中 | tutorial 7 章练手；胶水层面积已压到最小（§6） |
 | 3 | dsh 处于 Developer Preview，机制演进 | 中 | `engines.dsh` 锁版本窗；升级看 `docs/upgrade-guide/` |
 | 4 | `agent/turn-stopping` 的裁决语义与预期不完全一致（如停机时如何"输出最优"） | 中 | spike 验证；兜底方案是 `canness-loop` 自管一轮"收尾请求" |

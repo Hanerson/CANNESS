@@ -40,13 +40,18 @@ The password can be stored from the Web UI (Settings → CANNESS, written to `~/
 
 ## 4. 远端 / Remote
 
-把 [`remote/watch.py`](remote/watch.py) 放到远端即可在没有 CANN 的机器上模拟评测：
+`run_evaluation` 首次上传前会做一次**幂等自举**：建 `inbox` / `outbox`，复用已在运行的消费者（`watch.pid` 存活或 `pgrep` 命中 `watch.py`），否则把 [`remote/watch.py`](remote/watch.py) 上传到 `dirname(inbox)` 并以 `--loop` 拉起——已存在的 `watch.py` 不覆盖。没有 CANN 的机器因此不需要人工准备就能模拟评测：
 
 ```bash
+# 自举已拉起时不必手动执行；关闭自举或想补跑时用
 python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
 ```
 
-Put it in cron, or run it manually after an upload. It writes `results.json` with `status: "pass"` and `analysis.source: "msprof-mock"`; it does not call msprof.
+它写出 `status: "pass"`、`analysis.source: "msprof-mock"` 的 `results.json`，不调用 msprof，也不改已有结果文件。
+
+自举任一步失败时 `run_evaluation` 不进入轮询，直接返回 `status: "error"` 与 `remote bootstrap failed: <原因>`。主机侧已有真实 runner 时设 `bootstrapCommand`（执行你的启动命令，退出码须为 0）或 `bootstrap: false`（完全不介入远端）。
+
+The first `run_evaluation` bootstraps the remote: it creates the directories, reuses a running consumer, or deploys and starts `watch.py` in `--loop` mode. Failures return an error report instead of polling; a host with its own runner sets `bootstrapCommand` or `bootstrap: false`.
 
 ## 5. 开发 / Development
 

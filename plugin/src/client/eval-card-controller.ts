@@ -15,6 +15,7 @@ import {
   SettingsFormModel, settingsNumberField, settingsTextField,
   type SettingsFieldState, type SettingsFormActions, type SettingsFormScope, type SettingsFormShell,
 } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { ProbeOutcome, ProbeReason } from '../probe-contract.ts'
 
 /** Profile entry id the card edits; the Host plugin row id in cordis.patch.yml. */
 export const EVAL_NS = 'canness-eval'
@@ -49,6 +50,12 @@ interface CredentialState {
   writable: boolean
 }
 
+/** Ask the host whether a draft host and port accept a TCP connection. */
+export type ProbeFn = (host: string, port: number) => Promise<ProbeOutcome>
+
+/** What the reachability button last did. */
+export type ProbeStatus = 'idle' | 'running' | 'ok' | 'error'
+
 /** What the CANNESS card renders. */
 export interface EvalCardState extends SettingsFormShell {
   host: SettingsFieldState
@@ -71,6 +78,22 @@ export interface EvalCardState extends SettingsFormShell {
   passwordWritable: boolean
   /** Presentational auth mode: true shows the password field, false the key path. */
   usePassword: boolean
+  /** Saved host, user, port, and credential are enough for a later evaluation. */
+  ready: boolean
+  /** `user@host:port` from the saved section, empty until the section is ready. */
+  readyTarget: string
+  /** Which saved credential the readiness line names. */
+  readyAuth: 'password' | 'key'
+  /** Latest reachability check. */
+  probeStatus: ProbeStatus
+  /** Why the latest check failed; empty when it has not failed. */
+  probeReason: ProbeReason | ''
+  /** Dial error text, such as `timeout`, when the port did not connect. */
+  probeDetail: string
+  /** Whether the last landed save should show its short confirmation. */
+  showSaved: boolean
+  /** Increments on each landed save so the confirmation can show again. */
+  savedToken: number
 }
 
 /** The registration-side face the card's slot entry injects. */
@@ -81,6 +104,10 @@ export interface EvalCardFace extends SettingsFormActions {
   }
   /** Switch the credential field the card shows; stages nothing. */
   setUsePassword: (enabled: boolean) => void
+  /** Try a TCP connect to the draft host and port. */
+  testConnection: () => void
+  /** Hide the save confirmation after it has been shown. */
+  dismissSaved: () => void
 }
 
 /** Bridges the canness-eval settings form and the credentials domain onto the card. */
@@ -90,6 +117,12 @@ export class EvalCardController {
   private readonly unsubscribeScope: () => void
   private credential: CredentialState = { ref: '', configured: false, writable: true }
   private modeOverride: boolean | undefined
+  private probeStatus: ProbeStatus = 'idle'
+  private probeReason: ProbeReason | '' = ''
+  private probeDetail = ''
+  private probeSeq = 0
+  private showSaved = false
+  private savedToken = 0
 
   /**
    * @param ctx - the card plugin's context, whose `remote.credentials` namespace
@@ -99,6 +132,7 @@ export class EvalCardController {
   constructor(
     private readonly ctx: ClientContext,
     private readonly scope: SettingsFormScope<EvalSettings>,
+    private readonly probe: ProbeFn = async () => ({ ok: false, reason: 'unavailable' }),
   ) {
     this.form = new SettingsFormModel(scope, [
       settingsTextField('host'),
@@ -180,13 +214,51 @@ export class EvalCardController {
       password: this.form.field(PASSWORD_FIELD),
       passwordConfigured: this.credential.configured,
       passwordWritable: this.credential.writable,
-      usePassword: this.modeOverride ?? this.form.field('privateKeyPath').text.trim() === '',
+      usePassword: this.usePasswordNow(),
+      ...this.readiness(),
+      probeStatus: this.probeStatus,
+      probeReason: this.probeReason,
+      probeDetail: this.probeDetail,
+      showSaved: this.showSaved,
+      savedToken: this.savedToken,
     }
+  }
+
+  /** The switch wins over the saved key path until discard. */
+  private usePasswordNow(): boolean {
+    return this.modeOverride ?? this.form.field('privateKeyPath').text.trim() === ''
+  }
+
+  /** Readiness follows the saved section, not an unsaved draft. */
+  private readiness(): Pick<EvalCardState, 'ready' | 'readyTarget' | 'readyAuth'> {
+    const value = this.scope.getSnapshot().value
+    const host = value?.host?.trim() ?? ''
+    const username = value?.username?.trim() ?? ''
+    const port = value?.port
+    const key = value?.privateKeyPath?.trim() ?? ''
+    const portOk = typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65535
+    const readyAuth = key.length === 0 ? 'password' : 'key'
+    const authed = readyAuth === 'key' || this.credential.configured
+    const ready = host.length > 0 && username.length > 0 && portOk && authed
+    return {
+      ready,
+      readyTarget: ready ? `${username}@${host}:${port}` : '',
+      readyAuth,
+    }
+  }
+
+  /** Draft port, or undefined when it is not an integer in range. */
+  private draftPort(): number | undefined {
+    const text = this.form.field('port').text.trim()
+    if (!/^\d+$/.test(text)) return undefined
+    const port = Number(text)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined
+    return port
   }
 
   /**
    * Build the face the card's slot registration injects.
-   * @returns the card's snapshot, its form actions, and the auth-mode switch.
+   * @returns the card's snapshot, its form actions, the auth-mode switch, and the reachability check.
    */
   inject(): EvalCardFace {
     const actions = this.form.actions()
@@ -195,13 +267,78 @@ export class EvalCardController {
       ...actions,
       discard: () => {
         this.modeOverride = undefined
+        this.showSaved = false
         actions.discard()
+      },
+      save: () => {
+        // Password mode must clear a key path, or the host keeps preferring the key.
+        if (this.usePasswordNow() && this.form.field('privateKeyPath').text.trim() !== '') {
+          actions.edit('privateKeyPath', '')
+        }
+        const willWrite = this.form.shell().dirty && !this.form.shell().invalid && this.form.shell().writable
+        void this.form.save().then(() => {
+          const shell = this.form.shell()
+          if (!willWrite || shell.failed || shell.dirty || shell.saving) return
+          this.savedToken += 1
+          this.showSaved = true
+          this.store.set(this.projection())
+        })
       },
       setUsePassword: (enabled) => {
         this.modeOverride = enabled
         this.store.set(this.projection())
       },
+      dismissSaved: () => {
+        if (!this.showSaved) return
+        this.showSaved = false
+        this.store.set(this.projection())
+      },
+      testConnection: () => {
+        if (this.probeStatus === 'running') return
+        const host = this.form.field('host').text.trim()
+        const port = this.draftPort()
+        if (host.length === 0) {
+          this.applyProbe({ ok: false, reason: 'empty-host' })
+          return
+        }
+        if (port === undefined) {
+          this.applyProbe({ ok: false, reason: 'invalid-port' })
+          return
+        }
+        const seq = this.probeSeq + 1
+        this.probeSeq = seq
+        this.probeStatus = 'running'
+        this.probeReason = ''
+        this.probeDetail = ''
+        this.store.set(this.projection())
+        void this.probe(host, port).then(result => {
+          if (seq !== this.probeSeq) return
+          this.applyProbe(result)
+        }, (error: unknown) => {
+          if (seq !== this.probeSeq) return
+          const message = error instanceof Error ? error.message.replace(/\s+/g, ' ').trim() : ''
+          this.applyProbe({
+            ok: false,
+            reason: 'unavailable',
+            ...message.length > 0 ? { detail: message } : {},
+          })
+        })
+      },
     }
+  }
+
+  /** Store one finished check and publish it. */
+  private applyProbe(result: ProbeOutcome): void {
+    if (result.ok) {
+      this.probeStatus = 'ok'
+      this.probeReason = ''
+      this.probeDetail = ''
+    } else {
+      this.probeStatus = 'error'
+      this.probeReason = result.reason
+      this.probeDetail = result.detail ?? ''
+    }
+    this.store.set(this.projection())
   }
 
   /** Release the form and scope subscriptions. */

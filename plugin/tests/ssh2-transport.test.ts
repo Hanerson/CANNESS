@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, test } from 'vitest'
-import { connectSftp, isMissingSftpError, openSftp, remoteFromSftp, type SftpLike } from '../src/ssh2-transport.ts'
+import { connectSftp, isMissingSftpError, openRemote, openSftp, remoteFromSftp, remoteHostFrom, shellFromClient, type RemoteClient, type SftpLike } from '../src/ssh2-transport.ts'
 
 test('uploads a tree and reads a missing file as null', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'canness-sftp-'))
@@ -13,6 +13,7 @@ test('uploads a tree and reads a missing file as null', async () => {
     async fastPut(local, remote) { stored.set(remote, Buffer.from('{}')); expect(local).toContain('manifest.json') },
     async readFile(remote) { return stored.get(remote) ?? null },
     async unlink() {},
+    async stat() { return null },
     async end() {},
   }
   const files = await connectSftp({
@@ -101,4 +102,93 @@ test('openSftp keeps passing the private key when present', async () => {
   await openSftp(client, { host: 'npu', port: 22, username: 'canness', privateKey: 'KEY' })
   expect(client.connectConfig).toMatchObject({ privateKey: 'KEY' })
   expect(client.connectConfig).not.toHaveProperty('password')
+})
+
+function fakeChannel() {
+  const handlers = new Map<string, Function>()
+  const stderrHandlers = new Map<string, Function>()
+  const channel = {
+    on(event: string, listener: Function) {
+      handlers.set(event, listener)
+      return channel
+    },
+    stderr: {
+      on(event: string, listener: Function) {
+        stderrHandlers.set(event, listener)
+        return this
+      },
+    },
+    emit(event: string, ...args: unknown[]) { handlers.get(event)?.(...args) },
+    emitStderr(text: string) { stderrHandlers.get('data')?.(Buffer.from(text)) },
+  }
+  return channel
+}
+
+function fakeShellClient(channel: ReturnType<typeof fakeChannel>) {
+  return {
+    exec(_command: string, callback: (err: Error | undefined, stream: ReturnType<typeof fakeChannel>) => void) {
+      callback(undefined, channel)
+    },
+  }
+}
+
+test('exec collects stdout, stderr and a non-zero exit code', async () => {
+  const channel = fakeChannel()
+  const shell = shellFromClient(fakeShellClient(channel))
+  const pending = shell.exec('cmake .. && make')
+  channel.emitStderr('error: missing toolchain\n')
+  channel.emit('data', Buffer.from('building\n'))
+  channel.emit('exit', 2)
+  channel.emit('close')
+  await expect(pending).resolves.toEqual({ code: 2, stdout: 'building\n', stderr: 'error: missing toolchain\n' })
+})
+
+test('exec defaults to exit code 0 and surfaces channel errors', async () => {
+  const channel = fakeChannel()
+  const shell = shellFromClient(fakeShellClient(channel))
+  const pending = shell.exec('true')
+  channel.emit('data', Buffer.from('ok\n'))
+  channel.emit('close')
+  await expect(pending).resolves.toEqual({ code: 0, stdout: 'ok\n', stderr: '' })
+
+  const refused = shellFromClient({
+    exec(_command, callback) { callback(new Error('exec refused'), undefined as never) },
+  })
+  await expect(refused.exec('nothing')).rejects.toThrow('exec refused')
+})
+
+test('mkdirp keeps an existing directory and rethrows a permission error', async () => {
+  const calls: string[] = []
+  const sftp: SftpLike = {
+    async mkdir(path) {
+      calls.push(`mkdir ${path}`)
+      if (path === '/tmp/exists') throw Object.assign(new Error('Failure'), { code: 4 })
+      if (path === '/denied') throw Object.assign(new Error('Permission denied'), { code: 3 })
+    },
+    async fastPut() {},
+    async readFile() { return null },
+    async unlink() {},
+    async stat(path) {
+      calls.push(`stat ${path}`)
+      return path === '/tmp/exists' ? { isFile: false, isDirectory: true } : null
+    },
+    async end() {},
+  }
+  const host = remoteHostFrom(sftp, { exec: async () => ({ code: 0, stdout: '', stderr: '' }) })
+  await expect(host.mkdirp('/tmp/exists')).resolves.toBeUndefined()
+  expect(calls).toEqual(['mkdir /tmp', 'mkdir /tmp/exists', 'stat /tmp/exists'])
+  // The prefix cache keeps a repeated upload from re-probing every ancestor.
+  await expect(host.mkdirp('/tmp/exists')).resolves.toBeUndefined()
+  expect(calls).toHaveLength(3)
+  await expect(host.mkdirp('/denied')).rejects.toThrow('Permission denied')
+})
+
+test('a remote host ends the client once across repeated close calls', async () => {
+  const client = fakeClient(cb => {
+    cb(undefined, { unlink(_path, done) { done(null) } })
+  })
+  const host = await openRemote(client as unknown as RemoteClient, dialOpts)
+  await host.close()
+  await host.close()
+  expect(client.ends).toBe(1)
 })

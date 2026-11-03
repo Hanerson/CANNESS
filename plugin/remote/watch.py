@@ -3,17 +3,12 @@
 
 import argparse
 import json
+import time
+import traceback
 from pathlib import Path
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--inbox', required=True)
-    parser.add_argument('--outbox', required=True)
-    parser.add_argument('--once', action='store_true')
-    args = parser.parse_args()
-    inbox = Path(args.inbox)
-    outbox = Path(args.outbox)
+def scan(inbox: Path, outbox: Path) -> None:
     if not inbox.exists():
         return
     for manifest in inbox.glob('*/manifest.json'):
@@ -51,6 +46,28 @@ def main() -> None:
             },
             'summary': 'mock pass',
         }), encoding='utf-8')
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--inbox', required=True)
+    parser.add_argument('--outbox', required=True)
+    parser.add_argument('--once', action='store_true', help='scan once and exit (same as omitting --loop)')
+    parser.add_argument('--loop', action='store_true', help='keep scanning until killed')
+    parser.add_argument('--interval', type=int, default=2000, help='loop interval in milliseconds')
+    args = parser.parse_args()
+    inbox = Path(args.inbox)
+    outbox = Path(args.outbox)
+    interval = max(args.interval, 0) / 1000
+    while True:
+        # One bad manifest must not kill a long-running consumer.
+        try:
+            scan(inbox, outbox)
+        except Exception:
+            traceback.print_exc()
+        if args.once or not args.loop:
+            break
+        time.sleep(interval)
 
 
 if __name__ == '__main__':

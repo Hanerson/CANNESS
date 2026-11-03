@@ -9,7 +9,7 @@
 | 第一次接触本项目 | 根目录 [README](../README.md) → [`design/05-plugin-architecture.md`](design/05-plugin-architecture.md) |
 | 要改插件代码 | [`design/05-plugin-architecture.md`](design/05-plugin-architecture.md) → [`plans/2026-10-29-dsh-canness-mvp.md`](plans/2026-10-29-dsh-canness-mvp.md) |
 | 要了解为什么这样分层 | `design/01` → `design/02` → `design/03` → `design/04` → `design/05` |
-| 要接远端评测主机 | [`design/05-plugin-architecture.md`](design/05-plugin-architecture.md) §5.3 → 根目录 README 的「远端约定」 |
+| 要接远端评测主机 | [`design/05-plugin-architecture.md`](design/05-plugin-architecture.md) §5.3（含 §5.3.1 远端自举）→ 根目录 README 的「远端约定」 |
 
 ## design/ — 架构设计
 
@@ -30,6 +30,7 @@
 | [2026-10-29 dsh-canness MVP](plans/2026-10-29-dsh-canness-mvp.md) | MVP 的分任务实现计划（TDD 步骤、验收断言） |
 | [2026-10-30 SSH 凭据设计提案](plans/2026-10-30-canness-ssh-credentials-design.md) | SSH 密码认证与 Web 设置卡的设计取舍 |
 | [2026-10-30 SSH 密码认证实现计划](plans/2026-10-30-canness-ssh-password-auth.md) | 上一份提案的实现计划与偏差记录 |
+| [2026-11-03 远端自举修复提示词](plans/2026-11-03-remote-bootstrap.md) | 问题二（远端无目录 / 无 `watch.py` 消费者）的处置：契约见 design/05 §5.3.1，本文是给编码 agent 的执行提示词 |
 
 ## 约定
 

@@ -6,8 +6,10 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { credentialRef, isCredentialRefName } from '@deepseek-ai/dsh-credentials'
 import { runEvaluation } from './eval-run.js'
 import { loadState, saveState } from './state-file.js'
-import { connectSftp, type SftpOptions } from './ssh2-transport.js'
-import type { RemoteFiles } from './remote.js'
+import { registerProbeCommand, type TcpDial } from './probe.js'
+import { ensureRemoteConsumer, type BootstrapResult } from './remote-bootstrap.js'
+import { connectRemote, type SftpOptions } from './ssh2-transport.js'
+import { isRemoteHost, type RemoteHost } from './remote.js'
 import { stoppedReport, type EvalReport } from './report.js'
 import { stopReason, type PolicyConfig } from './policy.js'
 
@@ -32,6 +34,8 @@ export interface Config {
   maxCompileRetries: Volatile<number>
   negativeStreakLimit: Volatile<number>
   convergenceThreshold: Volatile<number>
+  bootstrap: Volatile<boolean>
+  bootstrapCommand: Volatile<string>
 }
 
 export const Config = z.object({
@@ -49,6 +53,9 @@ export const Config = z.object({
   maxCompileRetries: z.number().required().volatile(),
   negativeStreakLimit: z.number().required().volatile(),
   convergenceThreshold: z.number().required().volatile(),
+  // Defaults keep existing profile rows working without the two new keys.
+  bootstrap: z.boolean().default(true).volatile(),
+  bootstrapCommand: z.string().default('').volatile(),
 })
 
 function emptyHostReport(generationId: string | null): EvalReport {
@@ -87,6 +94,18 @@ function connectFailedReport(generationId: string | null, detail: string): EvalR
   }
 }
 
+function bootstrapFailedReport(generationId: string | null, detail: string): EvalReport {
+  return {
+    generationId: generationId ?? 'unknown',
+    status: 'error',
+    compile: { ok: false, log: '' },
+    correctness: { ok: false, maxRelativeError: null },
+    performance: { kernelTimeUs: null, targetUs: null },
+    analysis: null,
+    summary: `remote bootstrap failed: ${detail}`,
+  }
+}
+
 /** One consistent read of the volatile fields, captured when an operation starts. */
 function snapshot(config: Config) {
   return {
@@ -99,6 +118,26 @@ function snapshot(config: Config) {
     outbox: config.outbox.get(),
     timeoutSec: config.timeoutSec.get(),
     pollIntervalMs: config.pollIntervalMs.get(),
+    bootstrap: config.bootstrap.get(),
+    bootstrapCommand: config.bootstrapCommand.get(),
+  }
+}
+
+/**
+ * Remote preparation before the upload. A transport without mkdir/put/stat/exec
+ * keeps the old upload-and-wait behaviour instead of failing here.
+ */
+async function prepareRemote(files: RemoteHost, cfg: ReturnType<typeof snapshot>): Promise<BootstrapResult> {
+  if (!isRemoteHost(files)) return { ok: true, consumer: 'reused' }
+  try {
+    return await ensureRemoteConsumer(files, {
+      inbox: cfg.inbox,
+      outbox: cfg.outbox,
+      command: cfg.bootstrapCommand,
+      enabled: cfg.bootstrap,
+    })
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : 'unknown' }
   }
 }
 
@@ -124,8 +163,11 @@ async function resolveAuth(ctx: Context, cfg: ReturnType<typeof snapshot>): Prom
 export function apply(
   ctx: Context,
   config: Config,
-  connect: (opts: SftpOptions) => Promise<RemoteFiles> = connectSftp,
+  connect: (opts: SftpOptions) => Promise<RemoteHost> = connectRemote,
+  dial?: TcpDial,
 ): void {
+  if (dial === undefined) registerProbeCommand(ctx)
+  else registerProbeCommand(ctx, dial)
   const path = join(config.workspace, '.canness', 'state.json')
   ctx.tools.register(defineTool({
     name: 'run_evaluation',
@@ -225,13 +267,21 @@ export function apply(
       if (auth.privateKey === undefined && auth.password === undefined) {
         return missingCredentialsReport(state.generationId)
       }
-      let files: RemoteFiles
+      let files: RemoteHost
       try {
         files = await connect({ host: cfg.host, port: cfg.port, username: cfg.username, ...auth })
       } catch (error) {
         return connectFailedReport(state.generationId, error instanceof Error ? error.message : 'unknown')
       }
+      let closed = false
+      const close = async () => {
+        if (closed) return
+        closed = true
+        await files.close()
+      }
       try {
+        const bootstrap = await prepareRemote(files, cfg)
+        if (!bootstrap.ok) return bootstrapFailedReport(state.generationId, bootstrap.reason)
         const { report, state: next } = await runEvaluation({
           files,
           localPackageDir,
@@ -246,7 +296,7 @@ export function apply(
         saveState(path, next)
         return report
       } finally {
-        await files.close()
+        await close()
       }
     },
   }))

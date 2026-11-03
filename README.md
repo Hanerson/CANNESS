@@ -4,7 +4,7 @@
 
 把「提交规格书 → 生成四层算子 → 打测试包 → 上传远端 → 等待评测 → 按预算续轮」这条闭环，交给 dsh 的 agent loop 驱动；CANNESS 只负责其中的领域契约。
 
-[![version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v0.1.1-blue.svg)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A524.9-brightgreen.svg)](https://nodejs.org/)
 [![dsh](https://img.shields.io/badge/dsh-0.2.1--rc.3-purple.svg)](https://github.com/deepseek-ai/deepseek-harness)
@@ -45,7 +45,7 @@ CANNESS 把这个循环交给智能体，但把边界划得很清楚：
 | **CANNESS 插件** | 领域契约：规格书、四层文件、测试包、评估报告、知识库、迭代预算 |
 | **远端主机** | 真正跑编译、精度校验、性能采集与 msprof |
 
-本地**不编译算子、不调用 CANN、不调用任何云 API**。评测只发生在你自己那台装了 CANN 工具链的机器上，CANNESS 对它只有一个要求：能 SSH 登录，并且有人消费 inbox。
+本地**不编译算子、不调用 CANN、不调用任何云 API**。评测只发生在你自己那台装了 CANN 工具链的机器上，CANNESS 对它只有一个要求：能 SSH 登录。inbox 的消费者由 `run_evaluation` 首次自举（见 [9.1](#91-目录布局)）；主机侧已有真实 runner 时也可以关掉自举。
 
 ## 2. 特性
 
@@ -340,7 +340,7 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 
 ### `run_evaluation`
 
-无参数。返回一份评估报告（结构见 [9.2](#92-结果文件)）。以下情况**不抛异常**，而是返回 `status: "error"` 的报告：`host` 为空、凭据缺失、SSH 连接失败、预算已耗尽。以下情况抛异常：未 `submit_spec`（`submit_spec first`）、未 `build_test_package`（`build_test_package first`）。
+无参数。返回一份评估报告（结构见 [9.2](#92-结果文件)）。以下情况**不抛异常**，而是返回 `status: "error"` 的报告：`host` 为空、凭据缺失、SSH 连接失败、远端自举失败、预算已耗尽。以下情况抛异常：未 `submit_spec`（`submit_spec first`）、未 `build_test_package`（`build_test_package first`）。
 
 ## 8. 配置参考
 
@@ -376,6 +376,8 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 | `maxCompileRetries` | number | `3` | 编译失败累计上限 |
 | `negativeStreakLimit` | number | `3` | 性能连续变差上限 |
 | `convergenceThreshold` | number | `0.05` | 两次通过结果的相对差小于该值即判收敛 |
+| `bootstrap` | boolean | `true` | 首次上传前做远端自举：建目录、探测/补齐 inbox 消费者；设 `false` 则完全不介入远端 |
+| `bootstrapCommand` | string | `""` | 非空时执行该 POSIX 命令作为消费者启动方式（要求退出码 0），不再部署内置 mock |
 
 ### `canness-loop`
 
@@ -419,7 +421,9 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 
 `run_evaluation` 每轮会先删除上一次的 `results.json` 再开始轮询，避免读到陈结果。
 
-**远端必须有人消费 inbox。** 用什么启动编译与评测是主机侧的自由：目录监听、cron、常驻 runner 都行，CANNESS 只负责「上传」和「等结果」，不通过 SSH 执行任何命令。
+**inbox 的消费者在首次调用时自举。** `run_evaluation` 会先建 `{baseDir}`（= `dirname(inbox)`）、`inbox`、`outbox`，再复用已在运行的消费者（`{baseDir}/watch.pid` 里的 pid 存活，或 `pgrep` 命中 `watch.py`）；都没有时上传插件包里的 `remote/watch.py`（已存在则不覆盖）并用 `nohup … --loop` 启动，pid 与日志落在 `{baseDir}`。这是插件唯一一次通过 SSH 执行命令：编译与评测仍由主机侧 runner 负责；已有真实 runner 的机器设 `bootstrapCommand` 或 `bootstrap: false` 即可完全不介入。
+
+自举任一步失败（目录权限、远端没有 python、`bootstrapCommand` 非 0 退出、进程起不来）时不会进入轮询，而是在数秒内返回 `status: "error"`、`summary` 为 `remote bootstrap failed: <原因>`；修好配置后重试即可，这次失败不消耗迭代预算。
 
 ### 9.2 结果文件
 
@@ -464,7 +468,7 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 
 ### 9.3 远端 mock
 
-没有 CANN 环境时，用 [`plugin/remote/watch.py`](plugin/remote/watch.py) 模拟评测。把它放到远端，然后用 cron 或手动执行：
+没有 CANN 环境时，用 [`plugin/remote/watch.py`](plugin/remote/watch.py) 模拟评测。空白主机的第一次 `run_evaluation` 会自动部署该脚本并以 `--loop` 拉起（见 [9.1](#91-目录布局)）；关掉自举或想手动补跑时，用 cron 或手动执行：
 
 ```bash
 python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
@@ -628,7 +632,7 @@ bundle 默认的相对路径按 dsh 进程 cwd 解析。按 [6.3](#63-在-profil
 
 **Q：`run_evaluation` 一直等到超时？**
 
-远端 inbox 没有消费者，或者 `outbox` 路径与消费者写出的位置不一致。先用 `watch.py --once` 手动确认路径。
+先看报告 `summary`：以 `remote bootstrap failed: ` 开头时按原因修配置（目录权限、远端缺 python、`bootstrapCommand` 退出码）；其余情况多半是 `outbox` 路径与消费者写出的位置不一致，用 `watch.py --once` 手动确认路径。
 
 **Q：pnpm 警告 peerDependencies 未解析？**
 

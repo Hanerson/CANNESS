@@ -18,6 +18,7 @@ import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import { EvalCard } from './EvalCard.tsx'
 import { EvalCardController, EVAL_NS } from './eval-card-controller.ts'
 import { en, zh, type CannessSettingsLocaleKey } from './locales.ts'
+import { probeThroughCaller, type ProbeRemote } from './probe-remote.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -36,7 +37,11 @@ export const inject = ['slots', 'locale', 'remote', 'remote.credentials', 'confi
 export function apply(ctx: ClientContext): void {
   const t = ctx.locale.bind(NS)
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'canness-client: dictionaries')
-  const card = new EvalCardController(ctx, ctx.configForms.get(EVAL_NS))
+  const card = new EvalCardController(
+    ctx,
+    ctx.configForms.get(EVAL_NS),
+    (host, port) => probeThroughCaller(ctx.remote as unknown as ProbeRemote, host, port),
+  )
   ctx.effect(() => () => { card.dispose() }, 'canness-client: form subscription')
   // The credential the card reports is not part of any settings section, so
   // this is the only signal that a password written elsewhere reached the Host.

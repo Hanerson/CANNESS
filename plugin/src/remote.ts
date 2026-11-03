@@ -8,6 +8,40 @@ export interface RemoteFiles {
   close(): Promise<void>
 }
 
+export interface ExecResult {
+  code: number
+  stdout: string
+  stderr: string
+}
+
+/** Runs one command through the remote login shell (POSIX). */
+export interface RemoteShell {
+  exec(command: string): Promise<ExecResult>
+}
+
+export interface RemoteStat {
+  isFile: boolean
+  isDirectory: boolean
+}
+
+/**
+ * A transport that can also prepare the remote side. Bootstrap needs this;
+ * a plain `RemoteFiles` still supports the upload-and-wait flow.
+ */
+export interface RemoteHost extends RemoteFiles, RemoteShell {
+  mkdirp(remoteDir: string): Promise<void>
+  put(localPath: string, remotePath: string): Promise<void>
+  stat(remotePath: string): Promise<RemoteStat | null>
+}
+
+export function isRemoteHost(files: RemoteFiles): files is RemoteHost {
+  const candidate = files as Partial<RemoteHost>
+  return typeof candidate.mkdirp === 'function'
+    && typeof candidate.put === 'function'
+    && typeof candidate.stat === 'function'
+    && typeof candidate.exec === 'function'
+}
+
 export interface WaitOptions {
   timeoutMs: number
   intervalMs: number
@@ -15,8 +49,26 @@ export interface WaitOptions {
   sleep?: (ms: number) => Promise<void>
 }
 
-export class MemoryRemote implements RemoteFiles {
+/** Every prefix of a POSIX path, used to keep `stat` answerable for mkdirp. */
+function ancestors(dir: string): string[] {
+  const parts = dir.split('/').filter(Boolean)
+  const list: string[] = []
+  let acc = dir.startsWith('/') ? '' : '.'
+  for (const part of parts) {
+    acc += `/${part}`
+    list.push(acc)
+  }
+  return list
+}
+
+export type MemoryExecHandler = (command: string) => ExecResult | Promise<ExecResult>
+
+export class MemoryRemote implements RemoteHost {
   readonly files = new Map<string, Uint8Array>()
+  readonly dirs = new Set<string>()
+  readonly execCalls: string[] = []
+  readonly puts: Array<{ localPath: string; remotePath: string }> = []
+  execHandler: MemoryExecHandler = () => ({ code: 0, stdout: '', stderr: '' })
   reads = 0
   private staged: { path: string; bytes: Uint8Array; onRead: number } | null = null
 
@@ -25,6 +77,7 @@ export class MemoryRemote implements RemoteFiles {
   }
 
   async uploadDir(localDir: string, remoteDir: string): Promise<void> {
+    for (const dir of ancestors(remoteDir)) this.dirs.add(dir)
     const walk = (dir: string): void => {
       for (const name of readdirSync(dir)) {
         const full = join(dir, name)
@@ -33,7 +86,9 @@ export class MemoryRemote implements RemoteFiles {
           continue
         }
         const rel = relative(localDir, full).split('\\').join('/')
-        this.files.set(posix.join(remoteDir, rel), new Uint8Array(readFileSync(full)))
+        const remote = posix.join(remoteDir, rel)
+        this.files.set(remote, new Uint8Array(readFileSync(full)))
+        for (const parent of ancestors(posix.dirname(remote))) this.dirs.add(parent)
       }
     }
     walk(localDir)
@@ -49,6 +104,27 @@ export class MemoryRemote implements RemoteFiles {
 
   async removeFile(remotePath: string): Promise<void> {
     this.files.delete(remotePath)
+  }
+
+  async mkdirp(remoteDir: string): Promise<void> {
+    for (const dir of ancestors(remoteDir)) this.dirs.add(dir)
+  }
+
+  async put(localPath: string, remotePath: string): Promise<void> {
+    this.files.set(remotePath, new Uint8Array(readFileSync(localPath)))
+    this.puts.push({ localPath, remotePath })
+    for (const dir of ancestors(posix.dirname(remotePath))) this.dirs.add(dir)
+  }
+
+  async stat(remotePath: string): Promise<RemoteStat | null> {
+    if (this.files.has(remotePath)) return { isFile: true, isDirectory: false }
+    if (this.dirs.has(remotePath)) return { isFile: false, isDirectory: true }
+    return null
+  }
+
+  async exec(command: string): Promise<ExecResult> {
+    this.execCalls.push(command)
+    return this.execHandler(command)
   }
 
   async close(): Promise<void> {}
