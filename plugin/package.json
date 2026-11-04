@@ -1,6 +1,6 @@
 {
   "name": "dsh-canness",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Ascend CANN operator development for DeepSeek Harness: spec → four-layer operator → test package → remote evaluation loop.",
   "keywords": [
     "dsh",
@@ -40,6 +40,7 @@
     "./generator": "./lib/generator.js",
     "./eval": "./lib/eval.js",
     "./loop": "./lib/loop.js",
+    "./remote-api": "./lib/remote-api.js",
     "./client": "./lib/client.js"
   },
   "dsh": {

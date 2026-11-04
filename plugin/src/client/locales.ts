@@ -21,6 +21,11 @@ export type CannessSettingsLocaleKey =
   | 'negativeStreakLimit' | 'negativeStreakLimitHint' | 'convergenceThreshold' | 'convergenceThresholdHint'
   | 'overridden' | 'reset' | 'invalid' | 'readOnly' | 'unavailable'
   | 'save' | 'saving' | 'saveFailed'
+  | 'cannlab' | 'cannlabHint' | 'cannlabConnect' | 'cannlabConnecting' | 'cannlabDisconnect'
+  | 'cannlabSignedIn' | 'cannlabSignedOut' | 'cannlabApplied' | 'cannlabFailed' | 'cannlabOpenAuth'
+  | 'cannlabLogTitle' | 'cannlabLogEmpty'
+  | 'cannlabInstance' | 'cannlabInstancePlaceholder' | 'cannlabInstanceHint'
+  | 'badgeReady' | 'badgeNotReady' | 'probeIdle' | 'cannlabMore' | 'cannlabAbout' | 'logCount'
 
 /** Simplified Chinese copy. */
 export const zh: Record<CannessSettingsLocaleKey, string> = {
@@ -87,6 +92,27 @@ export const zh: Record<CannessSettingsLocaleKey, string> = {
   save: '保存',
   saving: '保存中…',
   saveFailed: '本部署没有接受这些值，已保留供你修改。',
+  cannlab: 'CANNLab 云端环境',
+  cannlabHint: 'CANNLab 不开放入站 SSH。点下面一步：浏览器授权 GitCode，自动找到你账号里运行中的环境，经官方端口转发 helper 建立本地隧道，然后把地址、用户名和临时私钥回填到下面的表单并保存。',
+  cannlabConnect: '连接到 CANNLab',
+  cannlabConnecting: '连接中…',
+  cannlabDisconnect: '断开隧道',
+  cannlabSignedIn: '已有 GitCode 登录状态',
+  cannlabSignedOut: '尚未登录 GitCode',
+  cannlabApplied: '当前隧道',
+  cannlabFailed: '连接失败',
+  cannlabOpenAuth: '如果没有自动打开浏览器，手动打开授权页：',
+  cannlabLogTitle: '连接日志（宿主进程逐步输出，便于排查）',
+  cannlabLogEmpty: '还没有连接记录。',
+  cannlabInstance: '环境名（可选）',
+  cannlabInstancePlaceholder: '留空则使用唯一运行中的环境',
+  cannlabInstanceHint: '账号里同时有 CPU 和 NPU 两个环境在运行时，在这里写环境名或 ID 指定要连哪一个。',
+  badgeReady: '就绪',
+  badgeNotReady: '未就绪',
+  probeIdle: '尚未测试',
+  cannlabMore: '更多选项',
+  cannlabAbout: '连接过程说明',
+  logCount: '{n} 条',
 }
 
 /** English copy. */
@@ -154,6 +180,27 @@ export const en: Record<CannessSettingsLocaleKey, string> = {
   save: 'Save',
   saving: 'Saving…',
   saveFailed: 'The deployment did not accept these values; they were left for you to correct.',
+  cannlab: 'CANNLab cloud environment',
+  cannlabHint: 'CANNLab exposes no inbound SSH. One click authorizes GitCode in your browser, finds a running environment in your account, opens a tunnel through the official port-forwarding helper, then fills in the host, user, and temporary key below and saves them.',
+  cannlabConnect: 'Connect to CANNLab',
+  cannlabConnecting: 'Connecting…',
+  cannlabDisconnect: 'Close the tunnel',
+  cannlabSignedIn: 'A GitCode session is stored',
+  cannlabSignedOut: 'Not signed in to GitCode',
+  cannlabApplied: 'Current tunnel',
+  cannlabFailed: 'Connect failed',
+  cannlabOpenAuth: 'If no browser opened, use this authorization page:',
+  cannlabLogTitle: 'Connect log (step by step from the Host process)',
+  cannlabLogEmpty: 'No connect attempt yet.',
+  cannlabInstance: 'Environment (optional)',
+  cannlabInstancePlaceholder: 'Leave blank to use the only running environment',
+  cannlabInstanceHint: 'When the account holds both a CPU and an NPU environment, name or id here picks which one to connect.',
+  badgeReady: 'Ready',
+  badgeNotReady: 'Not ready',
+  probeIdle: 'Not tested yet',
+  cannlabMore: 'More options',
+  cannlabAbout: 'How the connection works',
+  logCount: '{n} steps',
 }
 
 /**

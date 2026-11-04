@@ -16,6 +16,7 @@ import {
   type SettingsFieldState, type SettingsFormActions, type SettingsFormScope, type SettingsFormShell,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ProbeOutcome, ProbeReason } from '../probe-contract.ts'
+import type { CannlabEvent, CannlabResult, CannlabStatus, CannlabTarget } from '../cannlab/types.ts'
 
 /** Profile entry id the card edits; the Host plugin row id in cordis.patch.yml. */
 export const EVAL_NS = 'canness-eval'
@@ -56,6 +57,65 @@ export type ProbeFn = (host: string, port: number) => Promise<ProbeOutcome>
 /** What the reachability button last did. */
 export type ProbeStatus = 'idle' | 'running' | 'ok' | 'error'
 
+/** One line of the CANNLab connect log. */
+export interface CannlabLine {
+  level: 'info' | 'warn' | 'error' | 'done'
+  /** The Host's own sentence; kept verbatim so debugging never depends on the card. */
+  text: string
+  /** Machine detail: a path, a port, an HTTP status. */
+  detail: string
+  /** Epoch milliseconds of the line. */
+  at: number
+}
+
+/** What the CANNLab connect action last did. */
+export type CannlabPhase = 'idle' | 'running' | 'ok' | 'error'
+
+/** Everything the CANNLab panel renders. */
+export interface CannlabPanelState {
+  status: CannlabPhase
+  /** Log lines in arrival order, oldest first. */
+  lines: readonly CannlabLine[]
+  /** A refresh token is stored, so a reconnect needs no browser. */
+  signedIn: boolean
+  /** GitCode account name, when known. */
+  account: string
+  /** `user@host:port` of the tunnel this card last staged. */
+  applied: string
+  /** Why the last attempt stopped. */
+  reason: string
+  /** Authorization URL to offer when no browser could be launched. */
+  authorizeUrl: string
+  /**
+   * Environment to connect to, by name or id. Empty picks the only running
+   * one, which is the common case; an account may hold one CPU and one NPU
+   * environment at once, so the choice has to be expressible.
+   */
+  instance: string
+}
+
+/** The action set the CANNLab panel calls. */
+export interface CannlabActions {
+  /** Sign in, find a running environment, open the tunnel, and stage the result. */
+  connectCannlab: () => void
+  /** Close the live tunnel on the Host. */
+  disconnectCannlab: () => void
+  /** Re-read the Host's tunnel status. */
+  refreshCannlab: () => void
+  /** Name the environment to connect to, or clear it to accept the only running one. */
+  setCannlabInstance: (text: string) => void
+}
+
+/** The Host-side connect operations the card calls. */
+export interface CannlabApi {
+  /** Run the flow, reporting each stage; resolves with the staged target or a reason. */
+  connect(instance: string, onEvent: (event: CannlabEvent) => void, signal: AbortSignal): Promise<CannlabResult>
+  /** Read the Host's current tunnel state, or null when the Host half is absent. */
+  status(): Promise<CannlabStatus | null>
+  /** Close the live tunnel. */
+  disconnect(): Promise<boolean>
+}
+
 /** What the CANNESS card renders. */
 export interface EvalCardState extends SettingsFormShell {
   host: SettingsFieldState
@@ -94,10 +154,12 @@ export interface EvalCardState extends SettingsFormShell {
   showSaved: boolean
   /** Increments on each landed save so the confirmation can show again. */
   savedToken: number
+  /** The CANNLab connect panel. */
+  cannlab: CannlabPanelState
 }
 
 /** The registration-side face the card's slot entry injects. */
-export interface EvalCardFace extends SettingsFormActions {
+export interface EvalCardFace extends SettingsFormActions, CannlabActions {
   hooks: {
     /** Card snapshot bound by the renderer as useEvalCard. */
     evalCard: SnapshotStore<EvalCardState>
@@ -123,16 +185,34 @@ export class EvalCardController {
   private probeSeq = 0
   private showSaved = false
   private savedToken = 0
+  private cannlab: CannlabPanelState = {
+    status: 'idle',
+    lines: [],
+    signedIn: false,
+    account: '',
+    applied: '',
+    reason: '',
+    authorizeUrl: '',
+    instance: '',
+  }
+  private cannlabAbort: AbortController | undefined
 
   /**
    * @param ctx - the card plugin's context, whose `remote.credentials` namespace
    * answers for the password the section references.
    * @param scope - the shared configuration form for the canness-eval entry.
+   * @param probe - reachability check the Host answers.
+   * @param cannlab - connect-flow calls the Host answers.
    */
   constructor(
     private readonly ctx: ClientContext,
     private readonly scope: SettingsFormScope<EvalSettings>,
     private readonly probe: ProbeFn = async () => ({ ok: false, reason: 'unavailable' }),
+    private readonly cannlabApi: CannlabApi = {
+      connect: async () => ({ ok: false, reason: 'the connect route is unavailable' }),
+      status: async () => null,
+      disconnect: async () => false,
+    },
   ) {
     this.form = new SettingsFormModel(scope, [
       settingsTextField('host'),
@@ -221,6 +301,7 @@ export class EvalCardController {
       probeDetail: this.probeDetail,
       showSaved: this.showSaved,
       savedToken: this.savedToken,
+      cannlab: this.cannlab,
     }
   }
 
@@ -270,20 +351,7 @@ export class EvalCardController {
         this.showSaved = false
         actions.discard()
       },
-      save: () => {
-        // Password mode must clear a key path, or the host keeps preferring the key.
-        if (this.usePasswordNow() && this.form.field('privateKeyPath').text.trim() !== '') {
-          actions.edit('privateKeyPath', '')
-        }
-        const willWrite = this.form.shell().dirty && !this.form.shell().invalid && this.form.shell().writable
-        void this.form.save().then(() => {
-          const shell = this.form.shell()
-          if (!willWrite || shell.failed || shell.dirty || shell.saving) return
-          this.savedToken += 1
-          this.showSaved = true
-          this.store.set(this.projection())
-        })
-      },
+      save: () => { this.commit() },
       setUsePassword: (enabled) => {
         this.modeOverride = enabled
         this.store.set(this.projection())
@@ -324,7 +392,132 @@ export class EvalCardController {
           })
         })
       },
+      connectCannlab: () => { void this.connectCannlab(actions) },
+      disconnectCannlab: () => { void this.disconnectCannlab() },
+      refreshCannlab: () => { void this.refreshCannlab() },
+      setCannlabInstance: (text: string) => {
+        if (text === this.cannlab.instance) return
+        this.cannlab = { ...this.cannlab, instance: text }
+        this.store.set(this.projection())
+      },
     }
+  }
+
+  /**
+   * Run the Host connect flow, streaming its log into the panel, then stage the
+   * tunnel into the form and save it.
+   * @param actions - the form actions, so the staged values persist in one click.
+   */
+  private async connectCannlab(actions: SettingsFormActions): Promise<void> {
+    if (this.cannlab.status === 'running') return
+    this.cannlabAbort?.abort()
+    const controller = new AbortController()
+    this.cannlabAbort = controller
+    this.cannlab = {
+      ...this.cannlab,
+      status: 'running',
+      lines: [],
+      reason: '',
+      authorizeUrl: '',
+      applied: '',
+    }
+    this.store.set(this.projection())
+    const result = await this.cannlabApi.connect(this.cannlab.instance.trim(), (event: CannlabEvent) => {
+      const line: CannlabLine = {
+        level: event.level,
+        text: event.message,
+        detail: event.detail ?? '',
+        at: event.at,
+      }
+      const authorizeUrl = event.step === 'login-required' || event.step === 'login-awaiting'
+        ? (event.detail ?? '')
+        : ''
+      this.cannlab = {
+        ...this.cannlab,
+        lines: [...this.cannlab.lines, line],
+        ...authorizeUrl.startsWith('http') ? { authorizeUrl } : {},
+      }
+      this.store.set(this.projection())
+    }, controller.signal)
+    if (controller.signal.aborted && !result.ok) {
+      this.cannlab = { ...this.cannlab, status: 'error', reason: result.reason }
+      this.store.set(this.projection())
+      return
+    }
+    if (!result.ok) {
+      this.cannlab = { ...this.cannlab, status: 'error', reason: result.reason }
+      this.store.set(this.projection())
+      return
+    }
+    this.stageTarget(actions, result.target)
+    this.cannlab = {
+      ...this.cannlab,
+      status: 'ok',
+      signedIn: true,
+      applied: `${result.target.username}@${result.target.host}:${String(result.target.port)}`,
+      reason: '',
+    }
+    this.store.set(this.projection())
+  }
+
+  /**
+   * Put a discovered tunnel into the form and save it.
+   * A key path is staged, so the auth mode must switch to key first or the
+   * save would clear the very path that was just discovered.
+   * @param actions - the form actions.
+   * @param target - the tunnel the Host opened.
+   */
+  private stageTarget(actions: SettingsFormActions, target: CannlabTarget): void {
+    this.modeOverride = false
+    actions.edit('host', target.host)
+    actions.edit('port', String(target.port))
+    actions.edit('username', target.username)
+    actions.edit('privateKeyPath', target.privateKeyPath)
+    this.commit()
+  }
+
+  /** Save the staged form and show the confirmation when it lands. */
+  private commit(): void {
+    const actions = this.form.actions()
+    if (this.usePasswordNow() && this.form.field('privateKeyPath').text.trim() !== '') {
+      actions.edit('privateKeyPath', '')
+    }
+    const willWrite = this.form.shell().dirty && !this.form.shell().invalid && this.form.shell().writable
+    void this.form.save().then(() => {
+      const shell = this.form.shell()
+      if (!willWrite || shell.failed || shell.dirty || shell.saving) return
+      this.savedToken += 1
+      this.showSaved = true
+      this.store.set(this.projection())
+    })
+  }
+
+  /** Close the Host's tunnel and forget the staged target. */
+  private async disconnectCannlab(): Promise<void> {
+    this.cannlabAbort?.abort()
+    const ok = await this.cannlabApi.disconnect()
+    this.cannlab = {
+      ...this.cannlab,
+      status: ok ? 'idle' : 'error',
+      applied: ok ? '' : this.cannlab.applied,
+      reason: ok ? '' : 'the host did not confirm the disconnect',
+    }
+    this.store.set(this.projection())
+  }
+
+  /** Re-read whether a session is stored and whether a tunnel is open. */
+  async refreshCannlab(): Promise<void> {
+    const status = await this.cannlabApi.status()
+    if (status === null) return
+    this.cannlab = {
+      ...this.cannlab,
+      signedIn: status.signedIn,
+      account: status.account,
+      applied: status.tunnel === null
+        ? ''
+        : `${status.tunnel.username}@${status.tunnel.host}:${String(status.tunnel.port)}`,
+    }
+    this.store.set(this.projection())
   }
 
   /** Store one finished check and publish it. */
@@ -343,6 +536,9 @@ export class EvalCardController {
 
   /** Release the form and scope subscriptions. */
   dispose(): void {
+    // A panel that closes mid-flow must not leave its stream (or the Host's
+    // OAuth listener) waiting on a browser the user already walked away from.
+    this.cannlabAbort?.abort()
     this.unsubscribeScope()
     this.form.dispose()
   }

@@ -89,8 +89,9 @@ CANNESS 把这个循环交给智能体，但把边界划得很清楚：
 | `canness-generator` | `dsh-canness/generator` | `submit_spec`、`write_operator`、`build_test_package` | — |
 | `canness-eval` | `dsh-canness/eval` | `run_evaluation` | — |
 | `canness-loop` | `dsh-canness/loop` | — | `agent/pre-step`、`agent/turn-stopping` |
+| `canness-remote` | `dsh-canness/remote-api` | — | — （在 `webServer` 上提供连通检查与 CANNLab 连接的路由，见 9.4） |
 
-四个 host 插件共享 `{workspace}/.canness/state.json`；`canness` 这一行本身没有逻辑，但浏览器半区只挂在裸包名那一行上，删掉它设置卡就不会出现。
+四个 host 插件共享 `{workspace}/.canness/state.json`；`canness` 这一行本身没有逻辑，但浏览器半区只挂在裸包名那一行上，删掉它设置卡就不会出现。`canness-remote` 是唯一需要 `webServer` 服务的行，无 Web 界面的 profile 不必加载它。
 
 ### 控制权划分
 
@@ -264,7 +265,7 @@ pnpm dsh canness-web
 dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 ```
 
-应看到五行：`canness`、`canness-knowledge`、`canness-generator`、`canness-eval`、`canness-loop`。
+应看到六行：`canness`、`canness-knowledge`、`canness-generator`、`canness-eval`、`canness-loop`、`canness-remote`。
 
 启动后，**设置 → CANNESS** 应出现设置卡；对话里让模型调用 `kb_search` 等工具即可确认插件已加载。
 
@@ -385,6 +386,18 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 
 > **预算字段写两份，数字必须一致。** `canness-eval` 用它们拒绝超预算调用并判定停机，`canness-loop` 用它们决定要不要 `steer`。两处不一致会出现「工具拒绝执行但循环仍在续轮」的错位。
 
+### `canness-remote`
+
+只影响设置卡上的连通检查与 CANNLab 连接，不参与评估流程。
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `tokenRef` | string | `CANNLAB_GITCODE_TOKEN` | 存 GitCode refresh token 的凭据引用名 |
+| `cacheRoot` | string | `""` | 端口转发 helper 的下载解包目录；空 = `~/.dsh/canness/devspace-helper` |
+| `keyDir` | string | `""` | 临时 SSH 私钥的落地目录；空 = `~/.dsh/canness/cannlab` |
+| `logPath` | string | `""` | 连接轨迹文件；空 = `~/.dsh/canness/cannlab/last-connect.log` |
+| `instance` | string | `""` | 默认连接的环境名或 ID；空 = 用唯一运行中的环境 |
+
 ### 停机条件
 
 | 条件 | 触发阈值 | `lastReport.summary` |
@@ -476,6 +489,36 @@ python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
 
 它扫描 `{inbox}/*/manifest.json`，为每个 generation 写一份 `status: "pass"`、`analysis.source: "msprof-mock"` 的 `results.json`，`kernelTimeUs` 取 `manifest` 里的 `performanceTargetUs`。不调用 msprof，也不改已有结果文件。
 
+### 9.4 连接 CANNLab（免费 NPU 云环境）
+
+CANNLab 不开放入站 SSH：它只给一个签名隧道，入口是官方 AtomGit Dev Space 扩展里的端口转发 helper。CANNESS 把整条流程收进了设置卡，**不用装 VS Code，也不用手工敲命令**。
+
+设置 → CANNESS →「CANNLab 云端环境」→ 点「连接到 CANNLab」：
+
+1. 宿主进程在本机 `127.0.0.1:3000` 起一次性回调服务，并打开系统浏览器做 GitCode 授权（带 `state` 校验）；
+2. 用 access token 调 CANNLab openapi 列出账号下的环境，选出运行中的那个；
+3. 取该环境的临时私钥和签名隧道地址，下载 Dev Space 扩展包、解出官方 `port-forward-hub.js` 并启动；
+4. 把远端 `22` 映射到一个本地随机端口，**自动回填并保存 `host` / `port` / `username` / `privateKeyPath`** 到 `canness-eval`，之后的 `run_evaluation` 就走这条隧道。
+
+必须知道的几件事：
+
+| 项 | 说明 |
+|---|---|
+| 回调端口 | 固定 `3000`（官方 OAuth 客户端注册的地址，不能改）。被占用时日志会直说；关闭设置面板会立刻释放，不会堵住下一次 |
+| 选择环境 | 默认用唯一「运行中」的环境；账号里同时有 CPU 和 NPU 两个在跑时，在「环境名」里写名字或 ID |
+| 登录凭据 | 只持久化 refresh token，存进 dsh 凭据存储的 `CANNLAB_GITCODE_TOKEN`，**不写配置文件**；access token 只在内存里活一次操作 |
+| 临时私钥 | 每次连接写到 `~/.dsh/canness/cannlab/<实例 id>/id_*`，权限 `0600`；旧目录可以直接删 |
+| 首次开销 | 第一次会下载扩展包（约 2 MB）并解包到 `~/.dsh/canness/devspace-helper`；之后复用 |
+| 连接日志 | 卡片里逐条显示当前阶段；同时落盘到 `~/.dsh/canness/cannlab/last-connect.log`，刷新页面或关面板都不会丢，**失败原因也在里面** |
+| 断开 | 卡片上的「断开隧道」调 `delete-forward-hub`；helper 空闲 10 分钟也会自行退出 |
+| 计费 | 免费额度 100 卡时，实例不关就一直烧。CANNESS **不替你开关机**，用完请去 CANNLab 控制台关机 |
+
+CANNLab 环境里的路径和常见主机不同，写远端脚本时注意：
+
+- CANN 在 `/home/developer/Ascend`（不是 `/usr/local/Ascend`），编译前需 `source /home/developer/Ascend/ascend-toolkit/set_env.sh`；
+- 只有 `/mnt/workspace` 持久化，`/home/developer` 关机即丢，代码和产物要落在前者；
+- `~/.bashrc` 有非交互式 guard，`ssh host 'cmd'` 拿不到 `/etc/profile` 里的 PATH，需要编译工具链的命令要用 `bash -lc` 包一层。
+
 ## 10. 认证与凭据
 
 `run_evaluation` 的认证优先级：
@@ -490,6 +533,11 @@ python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
 - **环境变量** —— `CANNNESS_SSH_PASSWORD=... dsh --profile canness-web`。环境变量是凭据存储的回退层。
 
 > 卡片上的「使用密码认证」开关只决定显示哪个输入框，服务端优先级始终是私钥优先。两者都配置时以私钥为准。
+
+CANNLab 连接另有一套凭据，与 SSH 认证互不影响：
+
+- **GitCode 刷新令牌** —— 第一次点「连接到 CANNLab」时在浏览器完成授权，只把 refresh token 存进凭据存储的 `CANNLAB_GITCODE_TOKEN`（可用 `canness-remote` 的 `tokenRef` 改名）。access token 不落盘，一次操作后丢弃。
+- **临时 SSH 私钥** —— 由 CANNLab 按实例签发，写在 `~/.dsh/canness/cannlab/<实例 id>/` 下并自动填入 `privateKeyPath`。它和手工配置的私钥等价：`run_evaluation` 只是读该路径。
 
 ## 11. 工作区结构
 

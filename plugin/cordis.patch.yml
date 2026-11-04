@@ -35,3 +35,11 @@
         maxCompileRetries: 3
         negativeStreakLimit: 3
         convergenceThreshold: 0.05
+    - id: canness-remote
+      name: dsh-canness/remote-api
+      config:
+        tokenRef: CANNLAB_GITCODE_TOKEN
+        cacheRoot: ""
+        keyDir: ""
+        logPath: ""
+        instance: ""

@@ -38,6 +38,10 @@ Only `dsh-base + dsh-canness` (for example a profile named `canness`) has no app
 
 The password can be stored from the Web UI (Settings → CANNESS, written to `~/.dsh/.credentials.yaml`) or supplied as the `CANNNESS_SSH_PASSWORD` environment variable.
 
+CANNLab 连接的 GitCode 凭据是另一套：只持久化 refresh token，引用名 `CANNLAB_GITCODE_TOKEN`（`canness-remote` 的 `tokenRef` 可改名），access token 不落盘。
+
+The CANNLab connection uses a separate credential: only the refresh token is persisted, under `CANNLAB_GITCODE_TOKEN` (renameable via `canness-remote`'s `tokenRef`); the access token never touches disk.
+
 ## 4. 远端 / Remote
 
 `run_evaluation` 首次上传前会做一次**幂等自举**：建 `inbox` / `outbox`，复用已在运行的消费者（`watch.pid` 存活或 `pgrep` 命中 `watch.py`），否则把 [`remote/watch.py`](remote/watch.py) 上传到 `dirname(inbox)` 并以 `--loop` 拉起——已存在的 `watch.py` 不覆盖。没有 CANN 的机器因此不需要人工准备就能模拟评测：
@@ -52,6 +56,16 @@ python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
 自举任一步失败时 `run_evaluation` 不进入轮询，直接返回 `status: "error"` 与 `remote bootstrap failed: <原因>`。主机侧已有真实 runner 时设 `bootstrapCommand`（执行你的启动命令，退出码须为 0）或 `bootstrap: false`（完全不介入远端）。
 
 The first `run_evaluation` bootstraps the remote: it creates the directories, reuses a running consumer, or deploys and starts `watch.py` in `--loop` mode. Failures return an error report instead of polling; a host with its own runner sets `bootstrapCommand` or `bootstrap: false`.
+
+### 连接到 CANNLab / Connect to CANNLab
+
+CANNLab 不开放入站 SSH，只提供经由官方 Dev Space 扩展的签名隧道。设置卡上的「连接到 CANNLab」把这条路走完：浏览器 GitCode 授权 → 列出账号里运行中的环境 → 拉临时私钥与隧道地址 → 下载并启动官方端口转发 helper → 把 `host`/`port`/`username`/`privateKeyPath` 回填到 `canness-eval` 并保存。整条流程需要宿主侧的 `canness-remote` 行（`dsh-canness/remote-api`，Web profile 才有 `webServer`）。
+
+CANNLab has no inbound SSH, only a signed tunnel through the official Dev Space extension. The card's “Connect to CANNLab” runs the whole path: browser GitCode authorization → list the running environment → fetch its temporary key and tunnel URL → download and start the official forwarding helper → fill `host`/`port`/`username`/`privateKeyPath` into `canness-eval` and save. It needs the Host-side `canness-remote` row (`dsh-canness/remote-api`), which requires the `webServer` service a Web profile provides.
+
+每次尝试的完整轨迹（含失败原因）写在 `~/.dsh/canness/cannlab/last-connect.log`；refresh token 只存进凭据引用 `CANNLAB_GITCODE_TOKEN`。细节见根目录 README 的 [9.4](../README.md#94-连接-cannlab免费-npu-云环境)。
+
+Every attempt is traced, failure reason included, in `~/.dsh/canness/cannlab/last-connect.log`; the refresh token lives only in the credential reference `CANNLAB_GITCODE_TOKEN`. Details: [9.4](../README.en.md#94-connecting-to-cannlab-free-cloud-npu).
 
 ## 5. 开发 / Development
 

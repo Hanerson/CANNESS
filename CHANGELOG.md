@@ -4,6 +4,39 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-04
+
+### 新增
+
+- **CANNLab 连接**：设置卡新增「CANNLab 云端环境」，一键完成浏览器 GitCode 授权 → 列出账号内运行中的环境 → 取临时私钥与签名隧道地址 → 下载并启动官方 Dev Space 端口转发 helper → 把 `host` / `port` / `username` / `privateKeyPath` 回填并保存到 `canness-eval`。全程逐步文案（`checking-login` → `done`），失败也会写明停在哪一步。CANNLab 不开放入站 SSH，这是唯一的接入路径。
+- **`canness-remote` 插件行**（`dsh-canness/remote-api`）：在 `webServer` 上注册 `POST /canness/probe`、`POST /canness/cannlab/connect`（SSE 逐步推送）、`POST /canness/cannlab/disconnect`、`GET /canness/cannlab/status`；每条路由先问 `connection.requestRejection`（Host/Origin 栅栏 + 浏览器凭据），再在 wire 边界校验方法与请求体。
+- **连接轨迹落盘**：每次尝试写到 `~/.dsh/canness/cannlab/last-connect.log`，刷新页面或关面板都不丢，失败原因一并写入。
+- **环境名选择**：账号同时有 CPU 与 NPU 两个环境在跑时，可在卡片上指定名字或 ID；留空用唯一运行中的那个。
+- **配置**：`canness-remote` 提供 `tokenRef`、`cacheRoot`、`keyDir`、`logPath`、`instance`。
+
+### 变更
+
+- **连通性检查改走 HTTP 路由**：原「测试联通」经 `/canness-probe` 会话命令执行，必须存在活跃 agent 会话，且会向会话日志写入 `command/run` / `command/done`；现改为 `POST /canness/probe`，与对话无关。旧的 `src/client/probe-remote.ts` 及其测试已删除。
+- **设置卡重排**：改为「状态条 → CANNLab → 连接 → 凭据 → 远端目录 → 高级」一条阅读线。层次只靠字号与字重（19 / 13 / 12 / 11.5px，600 / 500 / 400），颜色全部取自 `--dsw-alias-*` token，无自造色值。就绪状态收进一条带边框的状态条（点 + 目标 + 就绪标签 + 认证方式），「测试联通」和结果并排在其中；长长的说明文案（认证方式、CANNLab 连接过程、环境名）折进 `<details>`；连接日志默认折叠，**失败时自动展开**（那时它才是重点）。CANNLab 日志摘要行直接显示步数 + 最后一步，不必展开就能看出卡在哪。
+- GitCode 凭据只持久化 refresh token，存进凭据引用 `CANNLAB_GITCODE_TOKEN`；access token 不落盘。
+
+### 修复
+
+- **「连接失败: `"path" argument must be of type string. Received an instance of Object`」**：`canness-remote` 的 `.volatile()` 配置经 Loader 校验后并不总是原始字符串，`logPath` / `cacheRoot` / `keyDir` / `instance` 之一以对象形态传到了 `node:path`，连接在写出第一行日志前就中断。现在所有配置读取都经过类型收口（`setting()` / `pathOption()`），非字符串一律回落默认值；`startAttemptLog()` 也改为失败时返回空 appender——**写日志永远不能让连接失败**。已加回归测试：把五个配置项全传对象，断言流程仍能走到 `login-awaiting`。
+- **临时私钥在 Windows 上对外部工具不可用**：`0600` 在 Windows 上无效，文件保留目录继承的 ACL（含所有人可读的沙箱/用户组），OpenSSH 因此拒绝该私钥（`UNPROTECTED PRIVATE KEY FILE`）。插件自身用 `ssh2` 不受影响，但用户手动 `ssh`/`scp`/VS Code 全部被挡。现在写盘后按平台收口：POSIX 走 `0600`，Windows 用 `icacls /inheritance:r` + 只授予当前账号 `(R)`；收口失败时连接照旧成功，但日志会 `warn` 说明外部 ssh 可能拒绝该文件。
+- **「测试联通」在无会话时不可用**：根因是命令链路依赖活跃 agent，现由宿主进程直接应答。
+- **OAuth 回调端口不释放**：原实现 `server.close()` 会被浏览器 keep-alive 连接拖住，导致第二次连接报 `port 3000 is busy`；现在回包带 `connection: close`、`closeAllConnections()` 后再 `close()`，并且等监听真正关闭才让登录结算。
+- **关面板会堵死下一次连接**：面板关闭即中断流程并释放回调端口，不再留下最多 5 分钟的悬挂监听。
+- **建隧道失败留残留**：hub 与心跳在失败路径上会被清理，并输出一句可读的原因（签名地址过期与实例已关机都长这样）。
+
+### 验证
+
+- 单元/集成测试 20 个文件 131 个用例全绿（`pnpm test`）；`pnpm check`、`pnpm build` 通过。
+- **真实 CANNLab 环境端到端验证（Windows → DevEnvC_J2Hn2 / Ascend910 A3）**：浏览器授权 → 实例发现 → 隧道 `127.0.0.1:20022 -> 22` → 回填保存，链路全通；远端 `whoami`/`npu-smi`（2×Ascend910，CANN 9.0.0，镜像 `py3.11-a3-arm-20261019`）、`g++` 编译运行、`numpy 1.26.4`、`/mnt/workspace` 读写均实测通过；私钥 ACL 收口后用系统 `ssh` 登录亦成功。
+- 路由集成测跑在真实 HTTP 监听上：SSE 帧序、探活成功/拒绝、方法 405、媒体类型 415、以及「拒绝的 peer 一个 handler 都不执行」。
+- 真机验证（Windows）：Dev Space 扩展下载与解包（v1.0.12，走 `tar -xf`，无需 unzip）、helper 启动与 `/heartbeat`、`create-forward-hub` 的失败路径；全流程编排用打桩的 GitCode/CANNLab 接口 + 真实回调服务器跑通到 WebSocket 建立为止。
+- **未完成**：尚无用真实隧道跑过一次 `run_evaluation`（上传测试包并取回 `results.json`）；连接本身已在真机验证。
+
 ## [0.1.1] - 2026-11-03
 
 ### 新增

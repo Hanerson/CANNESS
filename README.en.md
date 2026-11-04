@@ -89,8 +89,9 @@ Nothing is compiled locally, no CANN call is made locally, and no cloud API is i
 | `canness-generator` | `dsh-canness/generator` | `submit_spec`, `write_operator`, `build_test_package` | — |
 | `canness-eval` | `dsh-canness/eval` | `run_evaluation` | — |
 | `canness-loop` | `dsh-canness/loop` | — | `agent/pre-step`, `agent/turn-stopping` |
+| `canness-remote` | `dsh-canness/remote-api` | — | — (HTTP routes on `webServer` for the reachability check and the CANNLab connection; see 9.4) |
 
-The four host plugins share `{workspace}/.canness/state.json`. The `canness` row carries no logic, but the browser half attaches only to the bare-package-name row — remove it and the settings card disappears.
+The four host plugins share `{workspace}/.canness/state.json`. The `canness` row carries no logic, but the browser half attaches only to the bare-package-name row — remove it and the settings card disappears. `canness-remote` is the one row that needs the `webServer` service, so a headless profile does not have to load it.
 
 ### Who controls what
 
@@ -264,7 +265,7 @@ The terminal prints `dsh web: http://127.0.0.1:<port>/?token=...`; open it in a 
 dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 ```
 
-You should see five rows: `canness`, `canness-knowledge`, `canness-generator`, `canness-eval`, `canness-loop`.
+You should see six rows: `canness`, `canness-knowledge`, `canness-generator`, `canness-eval`, `canness-loop`, `canness-remote`.
 
 After starting, **Settings → CANNESS** should show the settings card; asking the model to call `kb_search` confirms the plugin is loaded.
 
@@ -383,6 +384,18 @@ Configuration for the four host plugins. Except `workspace`, every `canness-eval
 
 > **The budget is written twice and the numbers must match.** `canness-eval` uses it to reject over-budget calls and to decide stopping; `canness-loop` uses it to decide whether to steer. Mismatched values produce “the tool refuses but the loop keeps steering”.
 
+### `canness-remote`
+
+Affects only the settings card's reachability check and the CANNLab connection; it never participates in an evaluation.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `tokenRef` | string | `CANNLAB_GITCODE_TOKEN` | Credential reference holding the GitCode refresh token |
+| `cacheRoot` | string | `""` | Where the port-forwarding helper is downloaded and unpacked; empty = `~/.dsh/canness/devspace-helper` |
+| `keyDir` | string | `""` | Where temporary SSH keys are written; empty = `~/.dsh/canness/cannlab` |
+| `logPath` | string | `""` | Connect trace file; empty = `~/.dsh/canness/cannlab/last-connect.log` |
+| `instance` | string | `""` | Default environment name or id; empty = the only running one |
+
 ### Stop conditions
 
 | Condition | Threshold | `lastReport.summary` |
@@ -474,6 +487,36 @@ python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
 
 It scans `{inbox}/*/manifest.json` and writes a `status: "pass"` result per generation with `analysis.source: "msprof-mock"` and `kernelTimeUs` taken from `manifest.performanceTargetUs`. It never calls msprof and never overwrites an existing result file.
 
+### 9.4 Connecting to CANNLab (free cloud NPU)
+
+CANNLab exposes no inbound SSH at all: the only way in is a signed tunnel, reached through the port-forwarding helper inside the official AtomGit Dev Space extension. CANNESS folds that whole path into the settings card — **no VS Code, no hand-typed commands**.
+
+Settings → CANNESS → “CANNLab cloud environment” → “Connect to CANNLab”:
+
+1. the Host process starts a one-shot callback listener on `127.0.0.1:3000` and opens your system browser for GitCode authorization (with a `state` check);
+2. it calls the CANNLab open API with the access token, lists the environments in your account, and picks the running one;
+3. it fetches that environment's temporary private key and signed tunnel URL, downloads the Dev Space extension, extracts the official `port-forward-hub.js`, and starts it;
+4. it maps remote `22` to a random local port and **fills `host` / `port` / `username` / `privateKeyPath` into `canness-eval` and saves them**, so the next `run_evaluation` goes through that tunnel.
+
+What you need to know:
+
+| Item | Notes |
+|---|---|
+| Callback port | Fixed at `3000` — the address the official OAuth client registered, so it cannot move. A conflict is reported in the log; closing the panel releases the port at once so the next attempt is never blocked |
+| Choosing an environment | The only *running* one is used by default. When the account holds both a CPU and an NPU environment, put its name or id in “Environment” |
+| Stored credential | Only the refresh token is persisted, under the dsh credential reference `CANNLAB_GITCODE_TOKEN` — **never in a config file**. The access token stays in memory for one operation |
+| Temporary key | Written per connect to `~/.dsh/canness/cannlab/<instance id>/id_*` with mode `0600`; old directories are safe to delete |
+| First-run cost | The first connect downloads the extension (about 2 MB) and unpacks it into `~/.dsh/canness/devspace-helper`; later connects reuse it |
+| Connect log | Every stage is shown in the card and also recorded in `~/.dsh/canness/cannlab/last-connect.log`, so a reload or a closed panel does not lose the evidence — **the failure reason is in there too** |
+| Disconnecting | “Close the tunnel” calls `delete-forward-hub`; the helper also exits after ten idle minutes |
+| Billing | The free allowance is 100 card-hours and a running instance keeps burning it. CANNESS **does not start or stop instances for you** — power it off in the CANNLab console |
+
+CANNLab paths differ from a typical host, which matters for any script you put on the remote side:
+
+- CANN lives at `/home/developer/Ascend` (not `/usr/local/Ascend`); run `source /home/developer/Ascend/ascend-toolkit/set_env.sh` before compiling;
+- only `/mnt/workspace` is persistent — `/home/developer` is lost on shutdown, so keep code and artifacts under the former;
+- `~/.bashrc` has a non-interactive guard, so `ssh host 'cmd'` never loads the PATH from `/etc/profile`; anything needing the toolchain has to be wrapped in `bash -lc`.
+
 ## 10. Authentication and credentials
 
 `run_evaluation` resolves authentication in this order:
@@ -488,6 +531,11 @@ Two ways to store the password:
 - **Environment variable** — `CANNNESS_SSH_PASSWORD=... dsh --profile canness-web`. It is the fallback layer of the credential store.
 
 > The card's “Use password authentication” switch only picks which input to show; server-side priority is always private key first. When both are configured, the key wins.
+
+The CANNLab connection keeps its own credentials, independent of SSH authentication:
+
+- **GitCode refresh token** — the first “Connect to CANNLab” completes browser authorization and stores only the refresh token under the credential reference `CANNLAB_GITCODE_TOKEN` (renameable through `canness-remote`'s `tokenRef`). The access token is never written to disk and is dropped after one operation.
+- **Temporary SSH key** — issued by CANNLab per instance, written under `~/.dsh/canness/cannlab/<instance id>/`, and filled into `privateKeyPath`. It is equivalent to a hand-configured key: `run_evaluation` just reads that path.
 
 ## 11. Workspace layout
 
