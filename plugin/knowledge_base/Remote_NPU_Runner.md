@@ -8,7 +8,18 @@
 
 ```
 /tmp/canness-a/                     # A 的远端根目录（与 B 的 /tmp/canness-b 隔离）
-├── inbox/<generationId>/           # 测试包：manifest.json / build.sh / run_once.sh / 四层代码
+├── inbox/<generationId>/           # 测试包：四层代码 + 构建契约 + config.json + manifest.json
+│   ├── op_kernel/kernel.cpp
+│   ├── op_host/host.cpp
+│   ├── op_api/api.cpp
+│   ├── op_plugin/plugin.py
+│   ├── build.sh                    # 模板渲染：编译 + 链接，最后一行 stdout 是 exe
+│   ├── run_once.sh                 # 模板渲染：跑 1 次，输出 CANNESS_RESULT
+│   ├── main.cpp                    # 模板渲染：ACL 主机骨架
+│   ├── golden.h                    # 占位或模型填写的精度参考
+│   ├── canness_tiling.h            # 通用 CannessTilingData + GET_TILING_DATA shim
+│   ├── config.json                 # 按 dtype 推导的 maxAbsErr 与 tiling 参数
+│   └── manifest.json
 ├── outbox/<generationId>/results.json
 ├── runner-<uuid>.py                # 每次评测临时上传，结束后删除
 └── .canness-upload-<uuid>.b64      # 上传用的 base64 tar，解包后删除
@@ -21,19 +32,31 @@
 
 ## 2. 测试包契约（v1）
 
-包根目录必须包含：
+包根目录必须包含（`build_test_package` 自动渲染，模型不需要逐算子重写）：
 
 | 文件 | 约定 |
 |---|---|
-| `manifest.json` | 根级；runner 只依赖 `generationId` / `operatorName` / `performanceTargetUs`，可增量加字段 |
-| `build.sh` | LF；成功时**最后一行 stdout** 打印可执行文件绝对路径；失败非 0 退出 |
+| `manifest.json` | 根级；runner 只依赖 `generationId` / `operatorName` / `performanceTargetUs`，可增量加字段；`files` 是实际落盘清单，`layers` 是四层 |
+| `build.sh` | LF；渲染时写入 `soc_version` 与 bisheng 参数；成功时**最后一行 stdout** 打印可执行文件绝对路径；失败非 0 退出 |
 | `run_once.sh` | LF；跑 1 次正确性，stdout 打印一行 `CANNESS_RESULT {...}`；`badCount==0` 时 exit 0 |
+| `main.cpp` | LF；ACL 骨架：按 spec 的输入/输出个数与 dtype 分配、填充、launch、`aclrtSynchronizeDevice`、误差统计 |
+| `golden.h` | 模型唯一可写的包内文件（`write_package_file` 白名单）；模板先给占位实现 |
+| `canness_tiling.h` | 通用 `CannessTilingData { totalLength, blockLength, tileLength }` + `GET_TILING_DATA`；`GET_TILING_DATA` 带 `#ifndef` 守卫，kernel 自带的 shim 不会被覆盖 |
+| `config.json` | `maxAbsErr` 按 dtype 推导：fp16 `2^-10`、bf16 `2^-7`、fp32 `2^-13`；另有 `params`（blockDim / tileSize / blockLength / totalElements） |
+
+**kernel 入口约定**：`op_kernel/kernel.cpp` 必须导出固定符号
+`extern "C" __global__ __aicore__ void canness_kernel(...)`，参数顺序为
+**全部输入 → 全部输出 → tiling**（均为 `GM_ADDR`）。`main.cpp` 只按这个约定 launch。
 
 `CANNESS_RESULT` 的 JSON 至少包含：
 
 ```json
-{"maxAbsErr":0.0009,"maxRelErr":0.00002,"badCount":0,"total":32768}
+{"maxAbsErr":0.0009,"maxRelErr":0.00002,"badCount":0,"total":32768,"golden":"custom"}
 ```
+
+`golden` 为 `placeholder` 时（或 `badCount < 0`），runner 判 `accuracy_fail`，摘要固定为
+`golden not implemented: fill golden.h in the package, then re-run build_test_package and run_evaluation`，
+`maxRelativeError` 保留原始数值，`runRecord.params.golden` 记录来源。
 
 正确性阈值：`maxAbsErr` 上限从包内 `config.json` 的 `maxAbsErr` / `tolerance.maxAbsErr`（或 `manifest.json` 的同名字段）读取，缺省 `1e-3`。runner **不会**自己编造阈值，也不会在缺少脚本时猜编译命令：
 
@@ -74,11 +97,11 @@ export ASCEND_VISIBLE_DEVICES=7     # 容器只映射了 /dev/davinci7 时必须
 
 - **不要**手动把 CANN 的 `lib64` 放到 `LD_LIBRARY_PATH` 最前面，会让 `npu-smi` 报
   `undefined symbol: dms_get_util_from_udis`；以 `set_env.sh` 给出的顺序为准，runner 不会重排。
-- tiling 必须放 device 内存（由 `run_once.sh` / kernel 侧保证）。
+- tiling 必须放 device 内存（`main.cpp` 用 `aclrtMalloc` + `aclrtMemcpy` 分配并传入）。
 - 同步用 `aclrtSynchronizeDevice()`，不是 `aclrtSynchronizeStream()`。
 - `aclInit` 报 `chipType=0 does not support get device msg feature` 通常是设备没映射，不是 CANN 版本问题。
-- 已验证的编译参数（写进 runner 文档，不在插件里拼命令）：
-  `bisheng -x cce -std=c++17 --cce-soc-version=Ascend910B2 --cce-soc-core-type=VecCore`，
+- 已验证的编译参数固化在构建契约模板 `templates/build-contract/build.sh`（runner 只调用包内脚本，不拼命令）：
+  `bisheng -x cce -std=c++17 --cce-soc-version=<spec.soc_version> --cce-soc-core-type=VecCore`，
   链接 `-lascendcl -lruntime`。
 
 ## 5. 上传 / 下载：不依赖 SFTP
@@ -107,20 +130,24 @@ msprof --application="<exe> 100" --output=<预建目录>
 ```
 
 - CSV 统一从 `<输出目录>/mindstudio_profiler_output/` 下递归查找。
-- 控制台出现 `no summary data` 属正常；只有 **CSV 缺失**才是错误：
+- 控制台出现 `no summary data` 属正常；只有 **CSV 缺失 / 没有时长行**才是错误：
   `results.json` 的 `status` 为 `error`，`kernelTimeUs` 为 `null`，绝不写成 pass。
-- `kernelTimeUs` = CSV 中 `Task Duration(us)` 的平均值（按 `Op Name` 匹配 `operatorName`；匹配不到就取全部行）。
+- **`kernelTimeUs` 口径**：优先读 `op_summary_*.csv`，按 `Op Name`（或 `Op Type`）匹配
+  `operatorName`，取该算子**全部行**的 `Task Duration(us)` 算术平均；匹配不到就取文件全部行。
+  只有完全没有 `op_summary` 行时才读 `op_statistic_*.csv` 的 `Avg` 列（聚合值，不与其他文件
+  混算）。两者都没有 → `status: error`，摘要列出搜过的目录与 CSV 文件名。
+  `analysis.summary` 写明来源与参与平均的行数（如 `op_summary ... over 3 rows`）。
 - `analysis.source` 只允许 `msprof`；`manifest` 的 `performanceTargetUs` 只写入 `performance.targetUs`，不会写入 `kernelTimeUs`。
 
 ## 7. 一次完整评测的步骤
 
 ```text
-1. 上传四层代码 + build.sh / run_once.sh / manifest.json（exec + base64 tar）
+1. 上传四层代码 + 构建契约 + config.json + manifest.json（exec + base64 tar）
 2. 远端 bash build.sh，取最后一行 stdout 作为 exe
-3. 远端 flock + bash run_once.sh，解析 CANNESS_RESULT
+3. 远端 flock + bash run_once.sh，解析 CANNESS_RESULT（含 golden 来源）
 4. 远端 flock + msprof --application="<exe> 100" --output=<预建目录>
-5. 读 mindstudio_profiler_output/*.csv，算 Task Duration 平均值
-6. 写 outbox/<gen>/results.json（含 runRecord）
+5. 读 CSV：op_summary 全部行求平均；只有聚合文件时取 op_statistic 的 Avg
+6. 写 outbox/<gen>/results.json（含 runRecord.params.golden）
 7. run_evaluation 轮询并解析 results.json
 ```
 
@@ -133,7 +160,9 @@ msprof --application="<exe> 100" --output=<预建目录>
 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * (x + 0.044715 * x**3)))
 ```
 
-用 float32 算参考、再转 fp16；验收 `maxAbsErr <= 1e-3`。本算子实测 `0.000972748`，`bad = 0/32768`。
+用 float32 算参考、再转 fp16；本算子实测 `0.000972748`，`bad = 0/32768`。
+fp16 的包内阈值由模板写成 `2^-10`（`config.json.maxAbsErr`）。`golden.h` 保留占位实现时，
+runner 判 `accuracy_fail` 并在摘要里写 `golden not implemented`，不会假通过。
 
 ## 9. 性能基线（910B，[8, 4096]，fp16）
 
@@ -152,6 +181,7 @@ msprof --application="<exe> 100" --output=<预建目录>
 
 `plugin/tests/eval-runner.test.ts` 用 `tests/fixtures/eval-contract/` 包和一个假
 `msprof`（只写 CSV）跑通整条链路：manifest 目标 40us、CSV 30.9us 时报告必须是
-30.9us；CSV 缺失必须是 `error`。Linux CI 直接运行；Windows 本地需要
-`CANNESS_TEST_PYTHON` 指向 `python.exe`，并让 PATH 能解析 Git Bash（或设
-`CANNESS_TEST_BASH`）。
+30.9us；多行 CSV（10/20/30）必须是平均值 20；只有 `op_statistic` 时取 Avg 列；
+CSV 缺失必须是 `error`；占位 golden（`badCount:-1`）必须是 `accuracy_fail` 且摘要含
+`golden not implemented`。Linux CI 直接运行；Windows 本地需要 `CANNESS_TEST_PYTHON`
+指向 `python.exe`，并让 PATH 能解析 Git Bash（或设 `CANNESS_TEST_BASH`）。

@@ -39,7 +39,7 @@ const CSV = [
 ].join('\n')
 
 /** A stand-in for msprof: writes the CSV the real tool would leave behind. */
-function fakeMsprof(root: string, csv: string | null): string {
+function fakeMsprof(root: string, csv: string | null, fileName = 'op_summary_0.csv'): string {
   const path = join(root, 'msprof')
   const body = csv === null
     ? '#!/usr/bin/env bash\nexit 0\n'
@@ -49,7 +49,7 @@ function fakeMsprof(root: string, csv: string | null): string {
         'out=""',
         'for arg in "$@"; do case "$arg" in --output=*) out="${arg#--output=}";; esac; done',
         'mkdir -p "$out/mindstudio_profiler_output"',
-        `cat > "$out/mindstudio_profiler_output/op_summary_0.csv" <<'CSV'`,
+        `cat > "$out/mindstudio_profiler_output/${fileName}" <<'CSV'`,
         csv,
         'CSV',
         '',
@@ -141,4 +141,69 @@ test.skipIf(python === null)('the maxAbsErr budget comes from the package config
   expect(report.status).toBe('accuracy_fail')
   expect(report.correctness.ok).toBe(false)
   expect(report.performance.kernelTimeUs).toBeNull()
+})
+
+test.skipIf(python === null)('a multi-row op_summary is averaged, not first-row sampled', () => {
+  const header = CSV.split('\n')[0]!
+  const row = (duration: number) => `Gelu_v1,Gelu,AI_CORE,${String(duration)},0.5,16,0.12,0.71,0.09,18.4`
+  const multi = [header, row(10), row(20), row(30)].join('\n')
+  const { root, inbox, outbox } = packageAt()
+  const done = runRunner(root, inbox, outbox, fakeMsprof(root, multi))
+  expect(done.status, done.stderr).toBe(0)
+  const report = results(outbox)
+  expect(report.status).toBe('pass')
+  expect(report.performance.kernelTimeUs).toBe(20)
+  expect(report.analysis.summary).toContain('over 3 rows')
+  expect(report.analysis.summary).toContain('op_summary')
+})
+
+test.skipIf(python === null)('op_statistic is only used when no op_summary rows exist', () => {
+  const statistic = [
+    'Op Type,Avg Time(us),Min Time(us),Max Time(us)',
+    'Gelu,25,20,30',
+  ].join('\n')
+  const { root, inbox, outbox } = packageAt()
+  const done = runRunner(root, inbox, outbox, fakeMsprof(root, statistic, 'op_statistic_0.csv'))
+  expect(done.status, done.stderr).toBe(0)
+  const report = results(outbox)
+  expect(report.status).toBe('pass')
+  expect(report.performance.kernelTimeUs).toBe(25)
+  expect(report.analysis.summary).toContain('op_statistic')
+  expect(report.analysis.summary).toContain('over 1 rows')
+})
+
+test.skipIf(python === null)('a placeholder golden is an explicit accuracy_fail, never a pass', () => {
+  const { root, inbox, outbox } = packageAt()
+  writeFileSync(join(inbox, 'gen-fixture001', 'run_once.sh'), [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'echo \'CANNESS_RESULT {"maxAbsErr":0.25,"maxRelErr":0.5,"badCount":-1,"total":32768,"golden":"placeholder"}\'',
+    '',
+  ].join('\n'))
+  const done = runRunner(root, inbox, outbox, fakeMsprof(root, CSV))
+  expect(done.status, done.stderr).toBe(0)
+  const report = results(outbox)
+  expect(report.status).toBe('accuracy_fail')
+  expect(report.correctness.ok).toBe(false)
+  expect(report.correctness.maxRelativeError).toBe(0.5)
+  expect(report.performance.kernelTimeUs).toBeNull()
+  expect(report.summary).toBe(
+    'golden not implemented: fill golden.h in the package, then re-run build_test_package and run_evaluation',
+  )
+  expect(report.runRecord.params.golden).toBe('placeholder')
+})
+
+test.skipIf(python === null)('a custom golden records itself in runRecord.params', () => {
+  const { root, inbox, outbox } = packageAt()
+  writeFileSync(join(inbox, 'gen-fixture001', 'run_once.sh'), [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'echo \'CANNESS_RESULT {"maxAbsErr":0.0009,"maxRelErr":0.00002,"badCount":0,"total":32768,"golden":"custom"}\'',
+    '',
+  ].join('\n'))
+  const done = runRunner(root, inbox, outbox, fakeMsprof(root, CSV))
+  expect(done.status, done.stderr).toBe(0)
+  const report = results(outbox)
+  expect(report.status).toBe('pass')
+  expect(report.runRecord.params.golden).toBe('custom')
 })

@@ -80,7 +80,9 @@ test('registers the eval tools by name and the two loop listeners', () => {
     workspace, maxIterations: 10, maxCompileRetries: 3, negativeStreakLimit: 3, convergenceThreshold: 0.05,
   })
   expect(kb.toolsRegistered.map(tool => tool.name)).toEqual(['kb_search'])
-  expect(gen.toolsRegistered.map(tool => tool.name)).toEqual(['submit_spec', 'write_operator', 'build_test_package'])
+  expect(gen.toolsRegistered.map(tool => tool.name)).toEqual(expect.arrayContaining([
+    'submit_spec', 'write_operator', 'build_test_package', 'write_package_file',
+  ]))
   // The eval tool set may grow (fetch_remote_file); assert membership, not an exact array.
   expect(ev.toolsRegistered.map(tool => tool.name)).toEqual(expect.arrayContaining(['run_evaluation', 'fetch_remote_file']))
   expect(lp.listeners.map(item => item.event)).toEqual(['agent/pre-step', 'agent/turn-stopping'])
@@ -277,19 +279,42 @@ test('run_evaluation returns workspace, packageDir and resultsPath', async () =>
 test('fetch_remote_file copies a remote file into the workspace', async () => {
   const pkg = readyPackage()
   const remote = new MemoryRemote()
-  remote.files.set('/tmp/canness-a/outbox/gen-0123abcd/op_summary_0.csv', Buffer.from('Task Duration(us)\n30.9\n'))
+  remote.files.set('/out/gen-0123abcd/op_summary_0.csv', Buffer.from('Task Duration(us)\n30.9\n'))
+  remote.files.set('/in/gen-0123abcd/runner.log', Buffer.from('log\n'))
   const ctx = fakeCtx()
   evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
     async () => remote)
   const fetch = ctx.toolsRegistered.find(tool => tool.name === 'fetch_remote_file')!
   const value = await fetch.execute({
-    remotePath: '/tmp/canness-a/outbox/gen-0123abcd/op_summary_0.csv',
+    remotePath: '/out/gen-0123abcd/op_summary_0.csv',
     localPath: 'results/op_summary_0.csv',
   }) as { path: string; bytes: number }
   expect(value.bytes).toBe(Buffer.byteLength('Task Duration(us)\n30.9\n'))
   expect(readFileSync(value.path, 'utf8')).toBe('Task Duration(us)\n30.9\n')
-  await expect(fetch.execute({ remotePath: '/tmp/canness-a/missing.csv' })).rejects.toThrow('remote file not found')
-  await expect(fetch.execute({ remotePath: '/tmp/x', localPath: '../escape.csv' })).rejects.toThrow('inside the workspace')
+  // The current generation's inbox is readable too.
+  await expect(fetch.execute({
+    remotePath: '/in/gen-0123abcd/runner.log', localPath: 'results/runner.log',
+  })).resolves.toMatchObject({ bytes: 4 })
+  await expect(fetch.execute({ remotePath: '/out/gen-0123abcd/missing.csv' })).rejects.toThrow('remote file not found')
+  await expect(fetch.execute({ remotePath: '/out/x', localPath: '../escape.csv' })).rejects.toThrow('inside the workspace')
+})
+
+test('fetch_remote_file rejects non-absolute and out-of-tree remote paths', async () => {
+  const pkg = readyPackage()
+  const remote = new MemoryRemote()
+  remote.files.set('/etc/passwd', Buffer.from('root'))
+  remote.files.set('/out/gen-0123abcd/op_summary_0.csv', Buffer.from('csv'))
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
+    async () => remote)
+  const fetch = ctx.toolsRegistered.find(tool => tool.name === 'fetch_remote_file')!
+  await expect(fetch.execute({ remotePath: '../../etc/passwd' })).rejects.toThrow('absolute POSIX path')
+  await expect(fetch.execute({ remotePath: '~/.ssh/id_rsa' })).rejects.toThrow('absolute POSIX path')
+  await expect(fetch.execute({ remotePath: '/etc/passwd' })).rejects.toThrow('outside the allowed remote directories')
+  await expect(fetch.execute({ remotePath: '/in/gen-0123abcd/../../../etc/passwd' }))
+    .rejects.toThrow('outside the allowed remote directories')
+  await expect(fetch.execute({ remotePath: '/in/other-generation/log.txt' }))
+    .rejects.toThrow('outside the allowed remote directories')
 })
 
 test('the private key wins over a stored password', async () => {
@@ -354,6 +379,58 @@ test('passwordEnv names the resolved reference', async () => {
     async () => trackedRemote([]).files)
   await ctx.toolsRegistered[0]!.execute({})
   expect(refs).toEqual(['CUSTOM_SSH_REF'])
+})
+
+test('a down CANNLab tunnel is reported before any SSH connection', async () => {
+  const pkg = readyPackage()
+  let connected = false
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
+    async () => { connected = true; throw new Error('connected') },
+    undefined,
+    { matches: () => true, health: async () => 'down', renew: async () => false })
+  const value = await ctx.toolsRegistered[0]!.execute({})
+  expect(value).toMatchObject({ status: 'error' })
+  expect((value as { summary: string }).summary).toContain('tunnel')
+  expect(connected).toBe(false)
+})
+
+test('a live CANNLab tunnel is renewed once before connecting', async () => {
+  const pkg = readyPackage()
+  const events: string[] = []
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)), timeoutSec: vol(0) }),
+    async () => { events.push('connect'); return trackedRemote([]).files },
+    undefined,
+    {
+      matches: () => true,
+      health: async () => 'up',
+      renew: async () => { events.push('renew'); return true },
+    })
+  await ctx.toolsRegistered[0]!.execute({})
+  expect(events).toEqual(['renew', 'connect'])
+})
+
+test('write_package_file owns golden.h and rejects every other path', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
+  const gen = fakeCtx()
+  generator.apply(gen as never, { workspace })
+  const submit = gen.toolsRegistered.find(tool => tool.name === 'submit_spec')!
+  const submitted = await submit.execute({
+    spec: {
+      operator_name: 'Add',
+      operator_type: 'elementwise',
+      input_specs: [{ name: 'x', shape: ['N'], dtype: 'float16' }],
+      output_specs: [{ name: 'y', shape: ['N'], dtype: 'float16' }],
+      target_platform: { chip: 'Ascend910B' },
+      performance_target: { metric: 'kernel_time', target_us: 50 },
+    },
+  }) as { generationId: string }
+  const write = gen.toolsRegistered.find(tool => tool.name === 'write_package_file')!
+  await expect(write.execute({ path: 'golden.h', content: 'CUSTOM\n' }))
+    .resolves.toMatchObject({ bytes: 7 })
+  expect(readFileSync(join(workspace, 'operators', submitted.generationId, 'golden.h'), 'utf8')).toBe('CUSTOM\n')
+  await expect(write.execute({ path: 'build.sh', content: 'x' })).rejects.toThrow('only accepts golden.h')
 })
 
 test('pre-step appends a retry only when shouldSteer is true', async () => {

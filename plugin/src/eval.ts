@@ -8,6 +8,7 @@ import { runEvaluation } from './eval-run.js'
 import { loadState, saveState } from './state-file.js'
 import { registerProbeCommand, type TcpDial } from './probe.js'
 import { connectRemote, type SftpOptions } from './ssh2-transport.js'
+import { renewTunnel, tunnelHealth, usesCurrentTunnel } from './cannlab/connect.js'
 import type { RemoteHost } from './remote.js'
 import { stoppedReport, type EvalReport } from './report.js'
 import { stopReason, type PolicyConfig } from './policy.js'
@@ -88,6 +89,34 @@ function connectFailedReport(generationId: string | null, detail: string): EvalR
   }
 }
 
+function tunnelDownReport(generationId: string | null): EvalReport {
+  return {
+    generationId: generationId ?? 'unknown',
+    status: 'error',
+    compile: { ok: false, log: '' },
+    correctness: { ok: false, maxRelativeError: null },
+    performance: { kernelTimeUs: null, targetUs: null },
+    analysis: null,
+    summary: 'tunnel is down; reconnect from Settings → CANNESS',
+  }
+}
+
+/**
+ * How `run_evaluation` asks about the CANNLab forward. Tests inject this so a
+ * dead tunnel is reachable without a real helper process.
+ */
+export interface TunnelProbe {
+  matches(host: string, port: number): boolean
+  health(): Promise<'up' | 'down' | 'none'>
+  renew(): Promise<boolean>
+}
+
+const defaultTunnelProbe: TunnelProbe = {
+  matches: usesCurrentTunnel,
+  health: tunnelHealth,
+  renew: renewTunnel,
+}
+
 /** One consistent read of the volatile fields, captured when an operation starts. */
 function snapshot(config: Config) {
   return {
@@ -152,6 +181,27 @@ function localTargetFor(workspace: string, remotePath: string, localPath: string
   return target
 }
 
+/**
+ * Remote reads are confined to the configured outbox and the current
+ * generation's inbox. Anything else (keys, /etc, a sibling generation) is
+ * rejected before the transport sees it.
+ */
+export function remoteTargetAllowed(
+  remotePath: string,
+  outbox: string,
+  inbox: string,
+  generationId: string | null,
+): boolean {
+  if (!posix.isAbsolute(remotePath)) return false
+  const target = posix.normalize(remotePath)
+  const within = (root: string): boolean => {
+    const base = posix.normalize(root)
+    return target === base || target.startsWith(base.endsWith('/') ? base : `${base}/`)
+  }
+  if (within(outbox)) return true
+  return generationId !== null && within(posix.join(inbox, generationId))
+}
+
 /** The tool result: the report plus the three paths an agent would otherwise guess (i4). */
 type RunEvaluationValue = EvalReport & {
   workspace: string
@@ -178,6 +228,7 @@ export function apply(
   config: Config,
   connect: (opts: SftpOptions) => Promise<RemoteHost> = connectRemote,
   dial?: TcpDial,
+  tunnel: TunnelProbe = defaultTunnelProbe,
 ): void {
   if (dial === undefined) registerProbeCommand(ctx)
   else registerProbeCommand(ctx, dial)
@@ -194,6 +245,7 @@ export function apply(
       '(100 iterations, CSV under mindstudio_profiler_output/), and reads <outbox>/<generationId>/results.json.',
       'Nothing is compiled locally: this Windows side has no CANN toolchain.',
       'A missing build.sh/run_once.sh is reported as compile_fail with "package does not implement build contract v1".',
+      'A placeholder golden.h (write_package_file) returns accuracy_fail with "golden not implemented", never pass.',
       'The result always carries workspace, packageDir and resultsPath, plus status / compile.log /',
       'correctness.maxRelativeError / performance.kernelTimeUs / analysis / summary.',
     ].join(' '),
@@ -304,6 +356,14 @@ export function apply(
       if (auth.privateKey === undefined && auth.password === undefined) {
         return fail(missingCredentialsReport(state.generationId))
       }
+      // A CANNLab endpoint is 127.0.0.1:<helpers' local port>. Probe the
+      // helper first so a reaped tunnel reports "tunnel is down" instead of a
+      // generic SSH failure, then renew its idle timer for the long run ahead.
+      if (tunnel.matches(cfg.host, cfg.port)) {
+        const health = await tunnel.health().catch(() => 'down' as const)
+        if (health === 'down') return fail(tunnelDownReport(state.generationId))
+        if (health === 'up') await tunnel.renew().catch(() => false)
+      }
       let files: RemoteHost
       try {
         files = await connect({ host: cfg.host, port: cfg.port, username: cfg.username, ...auth })
@@ -339,6 +399,8 @@ export function apply(
     name: 'fetch_remote_file',
     description: [
       'Copy one file from the remote NPU host into the local workspace over SSH exec + base64 (no SFTP).',
+      'remotePath must be absolute; reads are limited to the configured outbox and the current',
+      'generation\'s inbox — any other remote path is rejected before transmission.',
       'Use it to pull msprof CSVs or runner logs back after run_evaluation; for example',
       'remotePath="/tmp/canness-a/outbox/<generationId>/results.json" and localPath="results/<generationId>.json".',
       'localPath is relative to the workspace; it defaults to remote-files/<basename>.',
@@ -362,6 +424,13 @@ export function apply(
       const cfg = snapshot(config)
       if (cfg.host === '') throw new Error('ssh host is empty')
       const target = localTargetFor(config.workspace, args.remotePath, args.localPath)
+      if (!posix.isAbsolute(args.remotePath)) {
+        throw new Error('remotePath must be an absolute POSIX path')
+      }
+      const state = loadState(statePath)
+      if (!remoteTargetAllowed(args.remotePath, cfg.outbox, cfg.inbox, state.generationId)) {
+        throw new Error('remotePath is outside the allowed remote directories (outbox and inbox/<generationId>)')
+      }
       const body = await withRemoteHost(ctx, connect, cfg, async files => files.readFile(args.remotePath))
       if (body === null) throw new Error(`remote file not found: ${args.remotePath}`)
       mkdirSync(dirname(target), { recursive: true })

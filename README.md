@@ -45,14 +45,14 @@ CANNESS 把这个循环交给智能体，但把边界划得很清楚：
 | **CANNESS 插件** | 领域契约：规格书、四层文件、测试包、评估报告、知识库、迭代预算 |
 | **远端主机** | 真正跑编译、精度校验、性能采集与 msprof |
 
-本地**不编译算子、不调用 CANN、不调用任何云 API**。评测只发生在你自己那台装了 CANN 工具链的机器上，CANNESS 对它只有一个要求：能 SSH 登录。评测由上传到远端的 `runner.py` 执行，测试包须自带构建契约（见 [9.1](#91-目录布局)）。
+本地**不编译算子、不调用 CANN、不调用任何云 API**。评测只发生在远端那台装了 CANN 工具链（含 `bisheng` 与 `msprof`）的机器上，CANNESS 对它只有一个要求：能 SSH 登录。`run_evaluation` 上传测试包后，由 `remote/runner.py` 依次执行包内 `build.sh`、`run_once.sh` 与真实 `msprof`（见 [9.1](#91-目录布局)）。
 
 ## 2. 特性
 
 - **规格书驱动** —— `submit_spec` 逐字段校验；缺字段直接失败并给出字段路径，由模型回头追问用户，不写半成品状态。
 - **四层落盘** —— `write_operator` 一次写入 `op_kernel` / `op_host` / `op_api` / `op_plugin` 四个文件。
-- **测试包自包含** —— `build_test_package` 复制四层文件并生成 `manifest.json`，远端拿到即可编译。
-- **通用 SSH 传输** —— 基于 `ssh2` 的 exec 通道上传（base64 tar）+ 远端 runner 执行 + 结果轮询；私钥与密码两种认证，密码走 dsh 凭据存储。
+- **测试包自包含** —— `build_test_package` 组装四层文件、构建契约（`build.sh` / `run_once.sh` / `main.cpp` / `golden.h` / `canness_tiling.h`）、`config.json` 与 `manifest.json`，远端拿到即可编译运行。
+- **通用 SSH 传输** —— 基于 `ssh2` 的 `exec` + base64 tar 上传（不依赖远端 `sftp-server`）+ 结果轮询；私钥与密码两种认证，密码走 dsh 凭据存储。
 - **预算与停机** —— 有效迭代、编译重试、超时、性能连续变差、收敛、目标达成，六类条件独立判定。
 - **自动续轮** —— `canness-loop` 在 `agent/turn-stopping` 处 `steer` 一轮带评测上下文的增强块，不需要用户手动催。
 - **性能分析内建** —— 解析 msprof 形状的 `analysis`（瓶颈类型、MAC/MTE2/Scalar 比例、cube 利用率），失败原因直接进提示。
@@ -74,7 +74,8 @@ CANNESS 把这个循环交给智能体，但把边界划得很清楚：
 │                                                                                  │
 │  canness-knowledge  ──► kb_search                                                │
 │  canness-generator  ──► submit_spec · write_operator · build_test_package        │
-│  canness-eval       ──► run_evaluation ──── exec ────► 远端 NPU 主机             │
+│                     ──► write_package_file（仅 golden.h）                        │
+│  canness-eval       ──► run_evaluation · fetch_remote_file ─ SSH exec ─► NPU 主机│
 │  canness-loop       ──► 预算与停机策略（两个事件监听器）                         │
 │  canness (client)   ──► Web 设置卡                                               │
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -86,8 +87,8 @@ CANNESS 把这个循环交给智能体，但把边界划得很清楚：
 |---|---|---|---|
 | `canness` | `dsh-canness` | — | — （只作为浏览器半区的挂载行） |
 | `canness-knowledge` | `dsh-canness/knowledge` | `kb_search` | — |
-| `canness-generator` | `dsh-canness/generator` | `submit_spec`、`write_operator`、`build_test_package` | — |
-| `canness-eval` | `dsh-canness/eval` | `run_evaluation` | — |
+| `canness-generator` | `dsh-canness/generator` | `submit_spec`、`write_operator`、`build_test_package`、`write_package_file` | — |
+| `canness-eval` | `dsh-canness/eval` | `run_evaluation`、`fetch_remote_file` | — |
 | `canness-loop` | `dsh-canness/loop` | — | `agent/pre-step`、`agent/turn-stopping` |
 | `canness-remote` | `dsh-canness/remote-api` | — | — （在 `webServer` 上提供连通检查与 CANNLab 连接的路由，见 9.4） |
 
@@ -123,8 +124,8 @@ flowchart LR
 2. `submit_spec` 校验规格书，生成 `generationId`（形如 `gen-1a2b3c4d`）并写状态文件。
 3. `kb_search` 按算子名检索知识库，拿回参考实现与 tiling 提示。
 4. `write_operator` 把四层文件写到 `{workspace}/operators/<generationId>/`。
-5. `build_test_package` 组装 `{workspace}/packages/<generationId>/`，附 `manifest.json`。
-6. `run_evaluation` 上传到 `{inbox}/<generationId>/`，轮询 `{outbox}/<generationId>/results.json`，解析为评估报告作为工具结果返回。
+5. `build_test_package` 组装 `{workspace}/packages/<generationId>/`：四层 + 构建契约 + `config.json` + `manifest.json`；模型需要时用 `write_package_file('golden.h', ...)` 填精度公式。
+6. `run_evaluation` 上传到 `{inbox}/<generationId>/`，由远端 `runner.py` 执行 `build.sh` / `run_once.sh` / `msprof`，轮询 `{outbox}/<generationId>/results.json`，解析为评估报告作为工具结果返回。
 7. `canness-loop` 依据报告与预算决定 `steer` 下一轮还是结束，并把失败上下文拼进增强块。
 
 ## 5. 环境要求
@@ -134,7 +135,7 @@ flowchart LR
 | Node.js | `>= 24.9.0` | 插件运行时 |
 | pnpm | `>= 10` | 实测 `11.28.5` |
 | dsh | `>= 0.2.0 < 0.3.0` | 对照版本 `0.2.1-rc.3` |
-| 远端主机（可选） | Linux + sshd | 真实 CANN / msprof 可选；只跑 mock 时不需要 CANN |
+| 远端主机（可选） | Linux + sshd + NPU | 需要 CANN 工具链（`bisheng`、`msprof`）；编译与评测只在远端发生 |
 
 dsh 有两种来源，任选一种，下文分别给出命令：
 
@@ -328,20 +329,44 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 
 ### `build_test_package`
 
-无参数。返回 `{ packageDir }`。复制当前 generation 的四层文件并写入 `manifest.json`：
+无参数。返回 `{ packageDir }`。复制当前 generation 的四层文件，并渲染**构建契约 v1**：
+`build.sh`、`run_once.sh`、`main.cpp`、`golden.h`、`canness_tiling.h`，再写 `config.json` 与
+`manifest.json`。`main.cpp` 按 spec 的输入/输出个数与 dtype 生成；`build.sh` 固化
+`soc_version` 与 bisheng 编译参数；`config.json` 按 dtype 给 `maxAbsErr`（fp16 `2^-10`、
+bf16 `2^-7`、fp32 `2^-13`）。
 
 ```json
 {
   "generationId": "gen-1a2b3c4d",
   "operatorName": "Add",
   "performanceTargetUs": 8,
-  "files": ["op_kernel/kernel.cpp", "op_host/host.cpp", "op_api/api.cpp", "op_plugin/plugin.py"]
+  "buildContract": "v1",
+  "layers": ["op_kernel/kernel.cpp", "op_host/host.cpp", "op_api/api.cpp", "op_plugin/plugin.py"],
+  "files": [
+    "build.sh", "canness_tiling.h", "config.json", "golden.h", "main.cpp",
+    "manifest.json", "op_api/api.cpp", "op_host/host.cpp", "op_kernel/kernel.cpp",
+    "op_plugin/plugin.py", "run_once.sh"
+  ]
 }
 ```
 
+`files` 是**实际落盘清单**（含 `manifest.json` 自身），排序稳定；`layers` 单独保留四层。
+
+### `write_package_file`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `path` | string | 是 | 只接受 `golden.h` |
+| `content` | string | 是 | 完整的 `golden.h` 内容 |
+
+模型唯一可写的包内文件。写入 `operators/<generationId>/golden.h`（以及已存在的
+`packages/<generationId>/golden.h`），随后应重新 `build_test_package`。模板里的
+`golden.h` 是占位实现：只要 `CANNESS_GOLDEN_PLACEHOLDER` 还在，评测就判
+`accuracy_fail`、摘要为 `golden not implemented: ...`，不会假通过。
+
 ### `run_evaluation`
 
-无参数。返回一份评估报告（结构见 [9.2](#92-结果文件)）。以下情况**不抛异常**，而是返回 `status: "error"` 的报告：`host` 为空、凭据缺失、SSH 连接失败、远端 runner 失败、预算已耗尽。以下情况抛异常：未 `submit_spec`（`submit_spec first`）、未 `build_test_package`（`build_test_package first`）。
+无参数。返回一份评估报告（结构见 [9.2](#92-结果文件)）。以下情况**不抛异常**，而是返回 `status: "error"` 的报告：`host` 为空、凭据缺失、CANNLab 隧道断开、SSH 连接失败、预算已耗尽。以下情况抛异常：未 `submit_spec`（`submit_spec first`）、未 `build_test_package`（`build_test_package first`）。
 
 ## 8. 配置参考
 
@@ -425,6 +450,12 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 {inbox}/{generationId}/op_host/host.cpp
 {inbox}/{generationId}/op_api/api.cpp
 {inbox}/{generationId}/op_plugin/plugin.py
+{inbox}/{generationId}/build.sh          # 插件模板渲染：编译 + 链接
+{inbox}/{generationId}/run_once.sh       # 插件模板渲染：跑 1 次并输出 CANNESS_RESULT
+{inbox}/{generationId}/main.cpp          # 插件模板渲染：ACL 主机骨架
+{inbox}/{generationId}/golden.h          # 占位或模型填写的精度参考
+{inbox}/{generationId}/canness_tiling.h  # 通用 CannessTilingData + GET_TILING_DATA
+{inbox}/{generationId}/config.json       # 按 dtype 推导的 maxAbsErr 与 tiling 参数
 {inbox}/{generationId}/manifest.json
 {inbox}/{generationId}/build.sh          # 构建契约 v1：最后一行 stdout 打印可执行文件路径
 {inbox}/{generationId}/run_once.sh       # 构建契约 v1：输出 CANNESS_RESULT {...}
@@ -432,11 +463,17 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 {outbox}/{generationId}/results.json
 ```
 
-`run_evaluation` 每轮会先删除上一次的 `results.json`，然后上传测试包与 `remote/runner.py`，在一次 SSH `exec` 内依次执行包的 `build.sh`、`run_once.sh` 和真实 `msprof`，再读回结果。
+`run_evaluation` 每轮会先删除上一次的 `results.json` 再开始轮询，避免读到陈结果。包里的
+`build.sh` / `run_once.sh` / `main.cpp` / `golden.h` 由 `build_test_package` 渲染，模型只通过
+`write_package_file('golden.h', ...)` 填精度公式；kernel 入口固定为 `canness_kernel`
+（输入 → 输出 → tiling）。
 
-**包必须自带构建契约 v1。** 缺 `build.sh` 或 `run_once.sh` 时 runner 直接判 `compile_fail`，摘要固定为 `package does not implement build contract v1`，不会去猜编译命令。`kernelTimeUs` 只来自 `mindstudio_profiler_output/` 下的 CSV；CSV 缺失一律 `status: "error"`，不会回落到 manifest 里的目标值。
+包上传后远端执行的是 `remote/runner.py`：依次 `bash build.sh`、`bash run_once.sh`、真实
+`msprof`，再按 §9.3 的口径取 `kernelTimeUs`。**评测不依赖任何 inbox 消费者进程。**
 
-> **已知缺口**：`build_test_package` 目前只产出四层文件与 `manifest.json`，**尚未生成这两个脚本**，因此真实链路仍会在 runner 处判 `compile_fail`。补齐方案见 [`docs/plans/2026-11-05-build-contract-skeleton.md`](docs/plans/2026-11-05-build-contract-skeleton.md)。
+若当前 SSH 端点是 CANNLab 隧道（`127.0.0.1:<helper 端口>`），`run_evaluation` 在连接前先
+探测 helper 的 `/heartbeat` 并续约一次；隧道已断时返回 `status: "error"`、摘要为
+`tunnel is down; reconnect from Settings → CANNESS`，而不是把它埋成 SSH 认证错误。
 
 ### 9.2 结果文件
 
@@ -475,15 +512,31 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 | `compile` | `ok` 布尔，`log` 字符串（进入增强块时截断到 2000 字符） |
 | `correctness.maxRelativeError` | 数字或 `null` |
 | `performance.kernelTimeUs` / `targetUs` | 数字或 `null` |
-| `analysis` | 可为 `null`；`source` 目前只有 `msprof`；`bottleneck` ∈ `cube`、`memory`、`scalar`、`unknown`；`op` 可为 `null` |
+| `analysis` | 可为 `null`；`source` 只能是 `msprof`；`bottleneck` ∈ `cube`、`memory`、`scalar`、`unknown`；`op` 可为 `null` |
+| `runRecord` | 可选；`{ timestamp, host, params, toolchain, durationMs }`，`params.golden` 标明精度参考来源（`placeholder` / `custom`） |
 
 字段不合法时不会抛错，而是返回 `status: "error"`、`summary` 为 `malformed result: <原因>` 的报告，让闭环继续跑而不是中断。
 
-### 9.3 真实 runner
+`golden.h` 还是占位实现时，报告为 `status: "accuracy_fail"`、`correctness.ok = false`、
+`correctness.maxRelativeError` 保留原始数值，`summary` 固定为
+`golden not implemented: fill golden.h in the package, then re-run build_test_package and run_evaluation`。
 
-评测由 [`plugin/remote/runner.py`](plugin/remote/runner.py) 在远端执行，流程固定：跑包的 `build.sh` → 拿可执行文件路径 → 跑 `run_once.sh` 取 `CANNESS_RESULT` → 用 `msprof` 采集 `<runs>` 次 → 解析 `mindstudio_profiler_output/` 下的 CSV → 写 `results.json`（含 `runRecord`）。
+### 9.3 真实 runner 与产物
 
-`run_evaluation` 每次会把 runner 以 uuid 名上传到 `dirname(inbox)`，执行完即删除；`fetch_remote_file` 可把 CSV、日志拉回 workspace。**没有 mock 回落**：没有 CANN 的机器上跑不出 `pass`。
+远端执行器是 [`plugin/remote/runner.py`](plugin/remote/runner.py)，`run_evaluation` 每次以
+uuid 临时上传、结束后删除。它只认包内的构建契约，不拼编译命令：
+
+1. `bash build.sh`，取**最后一行 stdout** 作为可执行文件路径；缺脚本或路径不存在 → `compile_fail`；
+2. `bash run_once.sh`（同一把 `flock`、`ASCEND_VISIBLE_DEVICES=7`），解析 `CANNESS_RESULT`；
+3. `msprof --application="<exe> 100" --output=<预建目录>`；
+4. 读 `mindstudio_profiler_output/*.csv`：优先 `op_summary` 全部行的 `Task Duration(us)`
+   算术平均；只有聚合文件时取 `op_statistic` 的 `Avg` 列；两者都没有 → `status: "error"`，
+   摘要列出搜过的目录与文件名，绝不写成 `pass`；
+5. 写 `{outbox}/<generationId>/results.json`（含 `runRecord`）。
+
+`manifest.json` 的 `performanceTargetUs` 只写入 `performance.targetUs`，永远不会变成
+`kernelTimeUs`。CSV 与日志可用 `fetch_remote_file` 拉回 workspace，读取范围仅限
+`outbox` 与当前 generation 的 `inbox/<generationId>`，`remotePath` 必须是绝对路径。
 
 ### 9.4 连接 CANNLab（免费 NPU 云环境）
 
@@ -593,12 +646,12 @@ CANNESS/
 │   │   ├── index.ts               # 裸包名入口（浏览器半区的挂载行）
 │   │   ├── knowledge.ts           # kb_search
 │   │   ├── knowledge-search.ts    # 文件级检索
-│   │   ├── generator.ts           # submit_spec / write_operator / build_test_package
+│   │   ├── generator.ts           # submit_spec / write_operator / build_test_package / write_package_file
 │   │   ├── spec.ts                # 规格书校验
 │   │   ├── package-files.ts       # 四层落盘与测试包
 │   │   ├── eval.ts                # run_evaluation
 │   │   ├── eval-run.ts            # 上传 → 轮询 → 解析
-│   │   ├── ssh2-transport.ts      # ssh2 exec 通道适配
+│   │   ├── ssh2-transport.ts      # ssh2 传输适配（exec + base64）
 │   │   ├── remote.ts              # RemoteFiles 接口 + 内存实现
 │   │   ├── report.ts              # 评估报告结构与解析
 │   │   ├── analysis.ts            # msprof 形状的性能分析
@@ -609,7 +662,8 @@ CANNESS/
 │   │   └── client/                # 浏览器半区（Web 设置卡）
 │   ├── tests/                     # Vitest 单元测试
 │   ├── knowledge_base/            # 知识库条目
-│   ├── remote/runner.py           # 远端真实评测 runner（build.sh → run_once.sh → msprof）
+│   ├── remote/runner.py           # 远端真实评测器（build.sh → run_once.sh → msprof）
+│   ├── templates/build-contract/  # build.sh / run_once.sh / main.cpp / golden.h / tiling shim 模板
 │   ├── scripts/build-client.mjs   # 浏览器半区打包脚本
 │   ├── cordis.patch.yml           # bundle 默认配置层
 │   └── package.json
@@ -651,8 +705,8 @@ CANNESS/
 
 | 阶段 | 目标 |
 |---|---|
-| v0.1（当前） | 打通单个算子的完整闭环，mock 与真实主机可切换 |
-| v0.2 | 真实主机端到端验收；失败分类细化；增强块按失败类型分化 |
+| v0.2（当前） | 构建契约 + 真实 msprof 评测；CANNLab 隧道接入 |
+| 下一步 | 真实主机端到端验收；失败分类细化；增强块按失败类型分化 |
 | v0.3 | 知识库结构化索引；参考实现与 tiling 模板自动注入 |
 | 之后 | 并行候选、搜索、Dashboard、更多算子类型 |
 
@@ -676,11 +730,10 @@ bundle 默认的相对路径按 dsh 进程 cwd 解析。按 [6.3](#63-在-profil
 
 **Q：`run_evaluation` 一直等到超时？**
 
-先看报告 `summary`。`remote runner failed: …` 后面跟的是远端 stderr 前 20 行，通常是 `build.sh` 找不到工具链或 `python3` 缺失；`timed out after …` 说明 runner 在 `timeoutSec` 内没有写出 `results.json`，多为 `msprof` 卡住或 `outbox` 与 runner 写出的位置不一致。
-
-**Q：报告是 `compile_fail`，摘要为 `package does not implement build contract v1`？**
-
-测试包里缺 `build.sh` 或 `run_once.sh`。runner 不会替你猜编译方式，需要由包提供这两个脚本（见 [9.1](#91-目录布局)）。目前 `build_test_package` 还不会生成它们，这是已知缺口。
+先看报告 `summary`：以 `package does not implement build contract v1` 开头说明包缺
+`build.sh` / `run_once.sh`，重新跑 `build_test_package`；以 `tunnel is down` 开头说明
+CANNLab 隧道已断，回设置卡重新连接；其余情况用 `fetch_remote_file` 把
+`{outbox}/<generationId>/results.json` 和 runner 日志拉回来看。
 
 **Q：pnpm 警告 peerDependencies 未解析？**
 

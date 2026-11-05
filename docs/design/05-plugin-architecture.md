@@ -55,7 +55,7 @@ relates_to:
 | Agent 编排引擎（CrewAI 原型 / LangGraph 生产） | dsh agent loop 本身；编排策略降级为事件监听器 |
 | 迭代留痕、结构化日志 | Session Event Log（append-only、可重放） |
 | 智能体间通信超时/重试（01 文档 §8） | harness 工具管线与 `llm-retry` 承接 |
-| SSH 连接管理 | 不交给 dsh-ssh。`canness-eval` 用 `ssh2` 的 exec 通道上传并执行 runner（§5.3） |
+| SSH 连接管理 | 不交给 dsh-ssh。`canness-eval` 用 `ssh2` 的 exec + base64 tar 上传并等待（§5.3） |
 
 ### 3.2 CANNESS 插件保留的（领域部分）
 
@@ -182,12 +182,12 @@ ctx.on('agent/turn-stopping', ({ agent }) => {
 
 2026-10-29 补充决定：**去掉模力方舟、华为云、CANN Lab 等平台依赖**。02 文档 §4 的四套执行器不再实现。测试机是任意一台能 SSH 上去、且自己装有 CANN 工具链的机器；插件不包含该平台的 SDK 或控制台流程。
 
-传输**不用** dsh `ssh` 包家族。`@deepseek-ai/dsh-ssh` 要求两端都是 Linux/macOS，还要在远端安装带 SHA-256 的 helper（`packages/ssh/ssh/README.md`）。开发机是 Windows，这和「通用 SSH、只上传再等待」相反。MVP 用 `ssh2` 的 exec 通道：base64 打包上传目录、在远端启动 runner、轮询结果文件并拉回。本地在测试环节只有两步：
+传输**不用** dsh `ssh` 包家族。`@deepseek-ai/dsh-ssh` 要求两端都是 Linux/macOS，还要在远端安装带 SHA-256 的 helper（`packages/ssh/ssh/README.md`）。开发机是 Windows，这和「通用 SSH、只上传再等待」相反。现在用 `ssh2` 的 `exec` + base64 + 纯 JS POSIX tar 上传（不依赖远端 `sftp-server`），结果文件用 base64 拉回。本地在测试环节只有两步：
 
 1. **上传**。把本轮测试包写到远端约定的 inbox 目录。
 2. **等待**。轮询约定的结果路径，直到结果文件出现或超时，再拉回解析为评估报告 JSON。
 
-编译、正确性、边界、性能都在远端发生。本地不逐条执行 cmake / kernel_eval，也不调用云 API。远端怎么启动编译由包内的构建契约决定，插件不替主机猜编译命令（见 §5.3.1）。
+编译、正确性、边界、性能都在远端发生。本地不逐条执行 cmake / kernel_eval，也不调用云 API。远端怎么启动编译由包内的构建契约决定，插件不替主机猜编译命令（见 §5.3.1）。上传的 `remote/runner.py` 只调用测试包自己的 `build.sh` / `run_once.sh`，再运行真实 `msprof`；没有伪造结果的路径，也没有 inbox 消费者进程。
 
 | 旧实现（02 文档 §4） | 处置 |
 |---|---|
@@ -214,17 +214,13 @@ negativeStreakLimit: 3
 convergenceThreshold: 0.05
 ```
 
-#### 5.3.1 构建契约与真实 runner（2026-11-05 修订）
+#### 5.3.1 包内构建契约（2026-11-05 补充）
 
-评测侧已从"上传后等人消费 inbox"改为**包自带构建契约、plugin 侧 runner 执行**：
+插件的职责边界是「算子无关的构建骨架归插件，精度公式归模型」。`build_test_package` 在四层之外渲染 `build.sh`、`run_once.sh`、`main.cpp`、`golden.h`、`canness_tiling.h`，并写 `config.json`（按 dtype 推导 `maxAbsErr`）与 `manifest.json`（`files` = 实际落盘清单）。kernel 入口固定为 `canness_kernel`（输入 → 输出 → tiling），tiling 统一用通用 `CannessTilingData`。模型只通过 `write_package_file('golden.h', ...)` 填精度参考；占位实现判 `accuracy_fail`，不会假通过。
 
-- 测试包内必须有 `build.sh`（最后一行 stdout 打印可执行文件绝对路径）与 `run_once.sh`（输出 `CANNESS_RESULT {...}`）；缺任一个判 `compile_fail`，摘要固定为 `package does not implement build contract v1`。
-- `run_evaluation` 上传测试包与 `remote/runner.py`，在一次 SSH `exec` 内完成 `build.sh` → `run_once.sh` → 真实 `msprof`，`kernelTimeUs` 只来自 `mindstudio_profiler_output/` 下的 CSV。
-- 上传走 `exec` + base64 tar，不依赖远端 `sftp-server`。
+评测侧已从「上传后等人消费 inbox」改为**包自带构建契约、plugin 侧 runner 执行**：`run_evaluation` 上传测试包与 `remote/runner.py`，在一次 SSH `exec` 内完成 `build.sh` → `run_once.sh` → 真实 `msprof`，`kernelTimeUs` 只来自 `mindstudio_profiler_output/` 下的 CSV。上传走 `exec` + base64 tar，不依赖远端 `sftp-server`。
 
-> **待补（v0.2.0 遗留）**：`build_test_package` 目前只产四层文件与 `manifest.json`，**不产 `build.sh` / `run_once.sh`**，因此真实链路仍会恒返回 `compile_fail`。补齐方案见 [`docs/plans/2026-11-05-build-contract-skeleton.md`](../plans/2026-11-05-build-contract-skeleton.md)。
-
-原"远端自举 mock 消费者"方案（`watch.py` / `bootstrap` / `bootstrapCommand`）已删除，历史记录见 [`docs/plans/2026-11-03-remote-bootstrap.md`](../plans/2026-11-03-remote-bootstrap.md)。
+权威定义见根 README §9 与 [`plugin/knowledge_base/Remote_NPU_Runner.md`](../../plugin/knowledge_base/Remote_NPU_Runner.md)，本节不重复契约内容。原「远端自举 mock 消费者」方案（`watch.py` / `bootstrap` / `bootstrapCommand`）已删除，历史记录见 [`docs/plans/2026-11-03-remote-bootstrap.md`](../plans/2026-11-03-remote-bootstrap.md)。
 
 ### 5.4 知识库 → 服务 + 检索工具 + 上下文注入
 
@@ -246,7 +242,7 @@ convergenceThreshold: 0.05
 | Agent 编排 | CrewAI / LangGraph | dsh agent loop | 删除依赖 |
 | LLM | OpenAI SDK | `ctx.llm` + provider 路由 | 用 dsh profile 配好的提供商。CANNESS 不绑定模力方舟或其他平台端点 |
 | 配置 | YAML + Pydantic | `cordis.yml` + Schemastery | 机制对等，API 不同 |
-| 远程执行 | paramiko；四后端含华为云 / CANN Lab | `ssh2` exec + 远端 runner | 见 §5.3。不用 dsh-ssh helper，无平台 SDK |
+| 远程执行 | paramiko；四后端含华为云 / CANN Lab | `ssh2` exec + base64 tar，只上传并等待结果 | 见 §5.3。不用 dsh-ssh helper，无平台 SDK |
 | 测试脚本 / 参考实现 / 数据生成 | pytest / NumPy | **不变**（仍为 Python） | 属于测试包内容，跑在 NPU 环境 |
 | 包管理 | pip / pyproject | pnpm / package.json | 团队需熟悉 |
 | 教程基准 | 无 | `docs/cordis-tutorial/`（7 章） | 上手路径，无需 API key |
@@ -274,7 +270,7 @@ convergenceThreshold: 0.05
 
 | # | 问题 | 影响 | 缓解 |
 |---|------|------|------|
-| 1 | **远端结果契约**：结果路径、JSON 格式、超时，以及包里的构建契约是否齐备 | 高，闭环的前提 | 2026-11-05 起由 §5.3.1 的真实 runner 承接（包自带 `build.sh` / `run_once.sh`，runner 执行并只从 CSV 取耗时）；`build_test_package` 尚未产出这两个脚本，是当前唯一的阻断项 |
+| 1 | **远端结果契约**：结果路径、JSON 格式、超时，以及构建契约（`build.sh` / `run_once.sh`）是否真的产出结果 | 高，闭环的前提 | 上传后由 `remote/runner.py` 直接执行包内脚本并写 `results.json`；缺脚本立即 `compile_fail`，不进入空等 |
 | 2 | 团队 Python → TS 转型 | 中 | tutorial 7 章练手；胶水层面积已压到最小（§6） |
 | 3 | dsh 处于 Developer Preview，机制演进 | 中 | `engines.dsh` 锁版本窗；升级看 `docs/upgrade-guide/` |
 | 4 | `agent/turn-stopping` 的裁决语义与预期不完全一致（如停机时如何"输出最优"） | 中 | spike 验证；兜底方案是 `canness-loop` 自管一轮"收尾请求" |

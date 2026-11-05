@@ -29,8 +29,9 @@ Only `dsh-base + dsh-canness` (for example a profile named `canness`) has no app
 | `kb_search` | 按算子名检索知识库 / search the knowledge base by operator name |
 | `submit_spec` | 校验规格书并开启新一轮 / validate a spec and start a generation |
 | `write_operator` | 写入 kernel / host / api / plugin 四层文件 |
-| `build_test_package` | 组装测试包与 `manifest.json` / assemble the test package |
-| `run_evaluation` | SFTP 上传测试包并等待 `results.json` / upload and wait for the result |
+| `build_test_package` | 组装四层 + 构建契约 + `config.json` / `manifest.json` / assemble the build-contract package |
+| `write_package_file` | 只写 `golden.h`（精度参考的唯一模型扩展点）/ write `golden.h` only |
+| `run_evaluation` | 上传测试包，远端 `build.sh → run_once.sh → msprof`，等待 `results.json` |
 
 ## 3. 认证 / Authentication
 
@@ -44,11 +45,34 @@ The CANNLab connection uses a separate credential: only the refresh token is per
 
 ## 4. 远端 / Remote
 
-`run_evaluation` 上传测试包与 [`remote/runner.py`](remote/runner.py)，在一次 SSH `exec` 内依次执行包自己的 `build.sh`、`run_once.sh` 和真实 `msprof`，再读回 `{outbox}/<generationId>/results.json`。上传走 `exec` + base64 tar，不需要远端有 `sftp-server`。
+`build_test_package` 在四层之外渲染**构建契约 v1**：`build.sh`、`run_once.sh`、`main.cpp`、
+`golden.h`、`canness_tiling.h`，并写 `config.json`（按 dtype 推导 `maxAbsErr`）与
+`manifest.json`（`files` 为实际落盘清单，`layers` 为四层）。`main.cpp` / `build.sh` 是算子
+无关的骨架；kernel 入口固定为 `canness_kernel`（输入 → 输出 → tiling）。模型只通过
+`write_package_file('golden.h', ...)` 填精度公式；占位实现会让评测返回 `accuracy_fail`
+与 `golden not implemented`，不会假通过。
 
-测试包必须自带构建契约 v1：`build.sh` 最后一行 stdout 打印可执行文件绝对路径，`run_once.sh` 输出一行 `CANNESS_RESULT {...}`。缺任一个直接判 `compile_fail`（摘要 `package does not implement build contract v1`），runner 不猜编译命令。契约细节见 [`knowledge_base/Remote_NPU_Runner.md`](knowledge_base/Remote_NPU_Runner.md)。
+```bash
+# 远端手工复现（runner 由 run_evaluation 以 runner-<uuid>.py 上传到 dirname(inbox)）
+python3 /tmp/canness/runner-<uuid>.py \
+  --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --generation <gen> --once
+```
 
-`run_evaluation` uploads the package and [`remote/runner.py`](remote/runner.py), then runs the package's `build.sh`, its `run_once.sh` and the real `msprof` inside one SSH `exec` before reading `{outbox}/<generationId>/results.json` back. The upload is `exec` + base64 tar, so the host needs no `sftp-server`. The package must ship build contract v1; a missing script is `compile_fail`, never a guessed compile command.
+`run_evaluation` 上传测试包后，由 [`remote/runner.py`](remote/runner.py) 执行包的
+`build.sh`、`run_once.sh` 和真实 `msprof`，`kernelTimeUs` 只来自
+`mindstudio_profiler_output/*.csv`。若 SSH 端点是 CANNLab 隧道，连接前会检查 helper 心跳；
+隧道断开时返回 `status: "error"` 与 `tunnel is down; reconnect from Settings → CANNESS`。
+
+`build_test_package` renders build contract v1 on top of the four layers: `build.sh`,
+`run_once.sh`, `main.cpp`, `golden.h`, `canness_tiling.h`, plus `config.json` (dtype-derived
+`maxAbsErr`) and `manifest.json` (`files` = actual on-disk list, `layers` = the four layers).
+`main.cpp` / `build.sh` are operator-independent; the kernel entry is fixed to `canness_kernel`
+(inputs, then outputs, then tiling). The model only owns `golden.h` through
+`write_package_file`; the placeholder yields `accuracy_fail` / `golden not implemented`, never a
+fake pass. `run_evaluation` uploads the package, then `remote/runner.py` runs `build.sh`,
+`run_once.sh` and the real `msprof`; `kernelTimeUs` comes only from
+`mindstudio_profiler_output/*.csv`. A CANNLab tunnel is heartbeat-checked before connecting, and a
+dead tunnel returns `status: "error"` with `tunnel is down; reconnect from Settings → CANNESS`.
 
 ### 连接到 CANNLab / Connect to CANNLab
 
