@@ -45,14 +45,6 @@ export interface RemoteHost extends RemoteFiles, RemoteShell {
   stat(remotePath: string): Promise<RemoteStat | null>
 }
 
-export function isRemoteHost(files: RemoteFiles): files is RemoteHost {
-  const candidate = files as Partial<RemoteHost>
-  return typeof candidate.mkdirp === 'function'
-    && typeof candidate.put === 'function'
-    && typeof candidate.stat === 'function'
-    && typeof candidate.exec === 'function'
-}
-
 export interface WaitOptions {
   timeoutMs: number
   intervalMs: number

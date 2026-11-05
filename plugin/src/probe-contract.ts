@@ -36,16 +36,6 @@ export function parseProbeInput(raw: string): { host: string; port: number } | {
 }
 
 /**
- * The slash line the card sends for one draft target.
- * @param host - host field text.
- * @param port - port field value.
- * @returns the complete command line.
- */
-export function probeCommandLine(host: string, port: number): string {
-  return `/${PROBE_COMMAND} ${host} ${port}`
-}
-
-/**
  * Encode a probe outcome as the command result the card can read back.
  * @param outcome - what the TCP check decided.
  * @returns the command result text.

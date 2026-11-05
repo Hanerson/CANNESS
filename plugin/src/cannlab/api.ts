@@ -7,7 +7,7 @@
  */
 
 import {
-  CANNLAB_API_BASE, CANNLAB_DEVENV_PATH, LOOPBACK, SSH_REMOTE_PORT, STATUS_RUNNING,
+  CANNLAB_API_BASE, CANNLAB_DEVENV_PATH, STATUS_RUNNING,
 } from './constants.js'
 
 /** The subset of `fetch` these wrappers need, so tests can pass a fake. */
@@ -193,9 +193,4 @@ export function rewriteConnectUrl(connectUrl: string): string {
   target.search = source.search
   target.hash = source.hash
   return target.toString()
-}
-
-/** The local endpoint a tunnel exposes once it is open. */
-export function localSshTarget(localPort: number): { host: string, port: number, remotePort: number } {
-  return { host: LOOPBACK, port: localPort, remotePort: SSH_REMOTE_PORT }
 }
