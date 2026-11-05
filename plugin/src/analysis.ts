@@ -13,13 +13,14 @@ export interface MsprofOp {
 }
 
 export interface PerformanceAnalysis {
-  source: 'msprof-mock' | 'msprof'
+  source: 'msprof'
   bottleneck: 'cube' | 'memory' | 'scalar' | 'unknown'
   summary: string
   op: MsprofOp | null
 }
 
-const SOURCES = ['msprof-mock', 'msprof'] as const
+/** The only accepted origin: numbers came from an actual msprof run. */
+const SOURCES = ['msprof'] as const
 const BOTTLENECKS = ['cube', 'memory', 'scalar', 'unknown'] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -17,16 +17,14 @@
         port: 22
         username: ""
         privateKeyPath: ""
-        inbox: /tmp/canness/inbox
-        outbox: /tmp/canness/outbox
+        inbox: /tmp/canness-a/inbox
+        outbox: /tmp/canness-a/outbox
         timeoutSec: 1800
         pollIntervalMs: 2000
         maxIterations: 10
         maxCompileRetries: 3
         negativeStreakLimit: 3
         convergenceThreshold: 0.05
-        bootstrap: true
-        bootstrapCommand: ""
     - id: canness-loop
       name: dsh-canness/loop
       config:

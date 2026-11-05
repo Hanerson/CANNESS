@@ -21,7 +21,6 @@ function evalConfig(workspace: string, overrides: Record<string, unknown> = {}) 
     privateKeyPath: vol(''), passwordEnv: vol('CANNNESS_SSH_PASSWORD'),
     inbox: vol('/in'), outbox: vol('/out'), timeoutSec: vol(0), pollIntervalMs: vol(1),
     maxIterations: vol(10), maxCompileRetries: vol(3), negativeStreakLimit: vol(3), convergenceThreshold: vol(0.05),
-    bootstrap: vol(true), bootstrapCommand: vol(''),
     ...overrides,
   }
 }
@@ -68,7 +67,7 @@ test('registers a tcp probe command when the commands service is present', async
   await expect(definition!.handler({ rawInput: '   ' })).resolves.toEqual({ kind: 'error', text: 'empty-host' })
 })
 
-test('registers the five tools and two loop listeners', () => {
+test('registers the eval tools by name and the two loop listeners', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
   const kb = fakeCtx()
   knowledge.apply(kb as never, { kbRoot: new URL('../knowledge_base/', import.meta.url).pathname })
@@ -82,7 +81,8 @@ test('registers the five tools and two loop listeners', () => {
   })
   expect(kb.toolsRegistered.map(tool => tool.name)).toEqual(['kb_search'])
   expect(gen.toolsRegistered.map(tool => tool.name)).toEqual(['submit_spec', 'write_operator', 'build_test_package'])
-  expect(ev.toolsRegistered.map(tool => tool.name)).toEqual(['run_evaluation'])
+  // The eval tool set may grow (fetch_remote_file); assert membership, not an exact array.
+  expect(ev.toolsRegistered.map(tool => tool.name)).toEqual(expect.arrayContaining(['run_evaluation', 'fetch_remote_file']))
   expect(lp.listeners.map(item => item.event)).toEqual(['agent/pre-step', 'agent/turn-stopping'])
 })
 
@@ -182,7 +182,8 @@ test('run_evaluation closes after a finished attempt and after an upload failure
     async () => finishedRemote.files)
   const finishedValue = await finishedCtx.toolsRegistered[0]!.execute({})
   expect(finishedValue).toMatchObject({ status: 'compile_fail', summary: 'failed compile' })
-  expect(finishedEvents).toEqual(['upload', 'remove', 'read', 'close'])
+  // The final remove drops the per-run runner script before the connection closes.
+  expect(finishedEvents).toEqual(['upload', 'remove', 'read', 'remove', 'close'])
 
   const failedEvents: string[] = []
   const failed = readyPackage()
@@ -203,7 +204,8 @@ test('run_evaluation closes after a poll timeout and does not connect when alrea
     async () => timedRemote.files)
   const timedOut = await timeoutCtx.toolsRegistered[0]!.execute({})
   expect(timedOut).toMatchObject({ status: 'timeout' })
-  expect(timeoutEvents).toEqual(['upload', 'remove', 'read', 'close'])
+  // One immediate read after the runner, one poll before the zero budget expires, then cleanup.
+  expect(timeoutEvents).toEqual(['upload', 'remove', 'read', 'read', 'remove', 'close'])
 
   const stoppedEvents: string[] = []
   const stopped = readyPackage()
@@ -223,25 +225,26 @@ function keyFile(workspace: string): string {
   return join(workspace, 'id_key')
 }
 
-test('a failed bootstrap returns an error report without uploading, polling or writing state', async () => {
+test('a runner that cannot start reports the remote stderr excerpt', async () => {
   const pkg = readyPackage()
   const remote = new MemoryRemote()
-  remote.execHandler = command => ({ code: 1, stdout: '', stderr: command.includes('pgrep') ? '' : 'not found' })
-  const statePath = join(pkg.workspace, '.canness', 'state.json')
-  const before = readFileSync(statePath, 'utf8')
+  remote.execHandler = command => command.includes('command -v python3')
+    ? { code: 127, stdout: '', stderr: 'python3 not found on remote\n' }
+    : { code: 0, stdout: '', stderr: '' }
   const ctx = fakeCtx()
   evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
     async () => remote)
   const value = await ctx.toolsRegistered[0]!.execute({})
   expect(value).toMatchObject({ status: 'error' })
-  expect((value as { summary: string }).summary).toMatch(/^remote bootstrap failed: /)
-  expect((value as { summary: string }).summary).toContain('python')
-  expect(readFileSync(statePath, 'utf8')).toBe(before)
-  expect(remote.reads).toBe(0)
-  expect([...remote.files.keys()].some(path => path.startsWith('/in/'))).toBe(false)
+  expect((value as { summary: string }).summary).toMatch(/^remote runner failed: /)
+  expect((value as { summary: string }).summary).toContain('python3 not found on remote')
+  expect(remote.execCalls.some(command => command.includes('--generation'))).toBe(true)
+  expect(remote.files.has(`/in/${pkg.generationId}/manifest.json`)).toBe(true)
+  // The per-run runner script is removed again after the attempt.
+  expect([...remote.files.keys()].some(path => path.startsWith('/runner-'))).toBe(false)
 })
 
-test('bootstrap: false keeps the upload-then-poll behaviour', async () => {
+test('run_evaluation returns workspace, packageDir and resultsPath', async () => {
   const pkg = readyPackage()
   const remote = new MemoryRemote()
   const resultPath = `/out/${pkg.generationId}/results.json`
@@ -250,19 +253,43 @@ test('bootstrap: false keeps the upload-then-poll behaviour', async () => {
     status: 'pass',
     compile: { ok: true, log: '' },
     correctness: { ok: true, maxRelativeError: 0 },
-    performance: { kernelTimeUs: 120, targetUs: 150 },
+    performance: { kernelTimeUs: 30.9, targetUs: 40 },
+    analysis: { source: 'msprof', bottleneck: 'memory', summary: 'csv', op: null },
+    runRecord: {
+      timestamp: '2026-11-05T09:00:00+0800', host: 'npu-host', params: { blockDim: 16 },
+      toolchain: 'CANN 9.0.0', durationMs: 1234,
+    },
     summary: 'ok',
   })), 1)
   const ctx = fakeCtx()
-  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, {
-    privateKeyPath: vol(keyFile(pkg.workspace)),
-    bootstrap: vol(false),
-  }), async () => remote)
-  const value = await ctx.toolsRegistered[0]!.execute({})
-  expect(value).toMatchObject({ status: 'pass' })
-  expect(remote.execCalls).toEqual([])
-  expect(remote.files.has(`/in/${pkg.generationId}/manifest.json`)).toBe(true)
-  expect(remote.reads).toBeGreaterThan(0)
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
+    async () => remote)
+  const value = await ctx.toolsRegistered[0]!.execute({}) as Record<string, unknown>
+  expect(value).toMatchObject({
+    status: 'pass',
+    workspace: pkg.workspace,
+    packageDir: join(pkg.workspace, 'packages', pkg.generationId),
+    resultsPath: resultPath,
+    runRecord: { host: 'npu-host', params: { blockDim: 16 }, toolchain: 'CANN 9.0.0', durationMs: 1234 },
+  })
+})
+
+test('fetch_remote_file copies a remote file into the workspace', async () => {
+  const pkg = readyPackage()
+  const remote = new MemoryRemote()
+  remote.files.set('/tmp/canness-a/outbox/gen-0123abcd/op_summary_0.csv', Buffer.from('Task Duration(us)\n30.9\n'))
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
+    async () => remote)
+  const fetch = ctx.toolsRegistered.find(tool => tool.name === 'fetch_remote_file')!
+  const value = await fetch.execute({
+    remotePath: '/tmp/canness-a/outbox/gen-0123abcd/op_summary_0.csv',
+    localPath: 'results/op_summary_0.csv',
+  }) as { path: string; bytes: number }
+  expect(value.bytes).toBe(Buffer.byteLength('Task Duration(us)\n30.9\n'))
+  expect(readFileSync(value.path, 'utf8')).toBe('Task Duration(us)\n30.9\n')
+  await expect(fetch.execute({ remotePath: '/tmp/canness-a/missing.csv' })).rejects.toThrow('remote file not found')
+  await expect(fetch.execute({ remotePath: '/tmp/x', localPath: '../escape.csv' })).rejects.toThrow('inside the workspace')
 })
 
 test('the private key wins over a stored password', async () => {
