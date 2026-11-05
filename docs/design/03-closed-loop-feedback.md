@@ -9,6 +9,11 @@ relates_to:
 
 # CANN 算子自动化生成 Harness 设计指导
 
+> **历史文档（2026-11-05 标注）**：本文是闭环反馈的设计愿景，不是当前实现的接口契约。
+> 评测侧已经改为 `plugin/remote/runner.py`（真实 `build.sh` → `run_once.sh` → `msprof`，
+> 无 mock、无自举部署）。当前可执行的约定见
+> [`plugin/knowledge_base/Remote_NPU_Runner.md`](../../plugin/knowledge_base/Remote_NPU_Runner.md)。
+
 > 基于 `auto_pipeline` 的逆向分析与经验提炼  
 > 目标：构建一个具备**闭环反馈能力**的 CANN 算子自动生成系统
 

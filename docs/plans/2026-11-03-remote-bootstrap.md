@@ -8,6 +8,12 @@ relates_to:
 
 # 远端自举修复提示词
 
+> **历史文档（2026-11-05 标注）**：本方案已被 `fix/eval-truthfulness` 取代。
+> `bootstrap` / `bootstrapCommand` 配置项、`remote-bootstrap.ts` 与 `remote/watch.py`
+> 均已删除；远端不再自举任何消费者，改由 `run_evaluation` 上传
+> `remote/runner.py` 并在一次 SSH `exec` 内完成真实评测。
+> 本文仅保留作为历史记录，**不要**按这里的步骤实现。
+
 把「1. 提示词正文」整段交给一个在 `D:\projects\CANNESS` 打开的编码 agent 执行。设计契约见 [`../design/05-plugin-architecture.md`](../design/05-plugin-architecture.md) §5.3.1；本文只负责把那份契约翻译成可执行的任务说明。
 
 ## 背景（实测）
