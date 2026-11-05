@@ -1,0 +1,4 @@
+# Remote evaluation scripts are executed by bash on Linux; a CRLF checkout
+# breaks them (`tail -n 40` sees `40\r`). Keep these LF on every platform.
+*.sh text eol=lf
+*.py text eol=lf

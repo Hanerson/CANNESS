@@ -1,7 +1,11 @@
-import { readdirSync, statSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { Client, type SFTPWrapper } from 'ssh2'
-import type { ExecResult, RemoteFiles, RemoteHost, RemoteShell, RemoteStat } from './remote.js'
+import {
+  base64WriteCommands, createTar, firstLines, remoteFileBundlePath, remoteUploadBundlePath, shellQuote,
+  type ExecResult, type RemoteFiles, type RemoteHost, type RemoteShell, type RemoteStat,
+} from './remote.js'
 
 export interface SftpLike {
   mkdir(path: string): Promise<void>
@@ -73,7 +77,7 @@ export function remoteFromSftp(sftp: SftpLike, mkdir: (dir: string) => Promise<v
   }
 }
 
-/** Same SFTP session plus the three host operations bootstrap needs. */
+/** Same SFTP session plus the host operations the legacy upload path needs. */
 export function remoteHostFrom(sftp: SftpLike, shell: RemoteShell): RemoteHost {
   const mkdir = createMkdirp(sftp)
   return {
@@ -89,9 +93,107 @@ export async function connectSftp(opts: SftpOptions, dial: Dial = defaultDial): 
   return remoteFromSftp(await dial(opts))
 }
 
+/**
+ * Connect with the exec+base64 transport.
+ *
+ * This is the default because the evaluation hosts often ship an SSH server
+ * without `sftp-server` (`Received exit code 127 while establishing SFTP
+ * session`). Every operation — upload, read, stat, remove — runs through
+ * `exec`, so no SFTP subsystem is requested at all.
+ * @param opts - SSH endpoint and authentication.
+ * @returns a host whose uploads are in-process tar streams.
+ */
 export async function connectRemote(opts: SftpOptions): Promise<RemoteHost> {
-  // Client's event overloads are wider than the ready/error/sftp/exec subset this session uses.
-  return openRemote(new Client() as unknown as RemoteClient, opts)
+  // Client's event overloads are wider than the ready/error/exec subset this session uses.
+  return openExecRemote(new Client() as unknown as RemoteClient, opts)
+}
+
+/**
+ * Format one failed exec into a message carrying the first 20 stderr lines.
+ * The remote side is the only place the actionable line appears, so it must
+ * survive into the report instead of being replaced by a bare exit code.
+ */
+function execFailure(what: string, result: ExecResult): Error {
+  const detail = firstLines(result.stderr, 20) || firstLines(result.stdout, 20)
+  return new Error(`${what} failed (exit ${result.code})${detail === '' ? '' : `:\n${detail}`}`)
+}
+
+/** A {@link RemoteHost} whose entire transfer path is `exec` + base64 + tar. */
+export function remoteFromShell(
+  shell: RemoteShell,
+  end: () => void,
+  token: () => string = () => randomUUID(),
+): RemoteHost {
+  let closed = false
+  const close = async (): Promise<void> => {
+    if (closed) return
+    closed = true
+    end()
+  }
+  const run = async (command: string, what: string): Promise<ExecResult> => {
+    const result = await shell.exec(command)
+    if (result.code !== 0) throw execFailure(what, result)
+    return result
+  }
+  const writeBundle = async (remotePath: string, bytes: Uint8Array): Promise<void> => {
+    const parent = remotePath.slice(0, remotePath.lastIndexOf('/')) || '.'
+    await run(`mkdir -p -- ${shellQuote(parent)}`, `mkdir ${parent}`)
+    for (const command of base64WriteCommands(remotePath, bytes)) {
+      await run(command, `write ${remotePath}`)
+    }
+  }
+  const removeQuietly = async (remotePath: string): Promise<void> => {
+    await shell.exec(`rm -f -- ${shellQuote(remotePath)}`)
+  }
+
+  return {
+    async uploadDir(localDir, remoteDir) {
+      const baseDir = remoteDir.slice(0, remoteDir.lastIndexOf('/')) || '.'
+      const bundle = remoteUploadBundlePath(baseDir, token())
+      try {
+        await run(`mkdir -p -- ${shellQuote(remoteDir)}`, `mkdir ${remoteDir}`)
+        await writeBundle(bundle, createTar(localDir))
+        await run(`base64 -d < ${shellQuote(bundle)} | tar -xf - -C ${shellQuote(remoteDir)}`, `extract into ${remoteDir}`)
+      } finally {
+        await removeQuietly(bundle)
+      }
+    },
+    async readFile(remotePath) {
+      const quoted = shellQuote(remotePath)
+      const result = await shell.exec(
+        `if [ -f ${quoted} ]; then base64 -w 0 ${quoted} 2>/dev/null || base64 ${quoted}; else exit 44; fi`,
+      )
+      if (result.code === 44) return null
+      if (result.code !== 0) throw execFailure(`read ${remotePath}`, result)
+      return new Uint8Array(Buffer.from(result.stdout.replace(/\s+/g, ''), 'base64'))
+    },
+    async removeFile(remotePath) {
+      await run(`rm -f -- ${shellQuote(remotePath)}`, `remove ${remotePath}`)
+    },
+    async mkdirp(remoteDir) {
+      await run(`mkdir -p -- ${shellQuote(remoteDir)}`, `mkdir ${remoteDir}`)
+    },
+    async put(localPath, remotePath) {
+      const baseDir = remotePath.slice(0, remotePath.lastIndexOf('/')) || '.'
+      const bundle = remoteFileBundlePath(baseDir, token())
+      try {
+        await writeBundle(bundle, readFileSync(localPath))
+        await run(`base64 -d < ${shellQuote(bundle)} > ${shellQuote(remotePath)}`, `write ${remotePath}`)
+      } finally {
+        await removeQuietly(bundle)
+      }
+    },
+    async stat(remotePath) {
+      const quoted = shellQuote(remotePath)
+      const result = await shell.exec(`if [ -d ${quoted} ]; then echo dir; elif [ -f ${quoted} ]; then echo file; else exit 44; fi`)
+      if (result.code === 44) return null
+      if (result.code !== 0) throw execFailure(`stat ${remotePath}`, result)
+      const kind = result.stdout.trim()
+      return { isFile: kind === 'file', isDirectory: kind === 'dir' }
+    },
+    exec: command => shell.exec(command),
+    close,
+  }
 }
 
 export function isMissingSftpError(err: unknown): boolean {
@@ -223,6 +325,21 @@ export function openSftp(client: DialClient, opts: SftpOptions): Promise<SftpLik
 
 export function openRemote(client: RemoteClient, opts: SftpOptions): Promise<RemoteHost> {
   return openSession(client, opts, (sftp, end) => remoteHostFrom(sftpLike(sftp, end), shellFromClient(client)))
+}
+
+/** Open one SSH exec session without ever requesting the SFTP subsystem. */
+export function openExecRemote(client: RemoteClient, opts: SftpOptions): Promise<RemoteHost> {
+  return new Promise((resolve, reject) => {
+    let ended = false
+    const end = () => {
+      if (ended) return
+      ended = true
+      client.end()
+    }
+    client.on('ready', () => {
+      resolve(remoteFromShell(shellFromClient(client), end))
+    }).on('error', reject).connect(connectConfig(opts))
+  })
 }
 
 function defaultDial(opts: SftpOptions): Promise<SftpLike> {

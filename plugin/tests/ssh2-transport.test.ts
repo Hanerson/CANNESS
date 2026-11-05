@@ -1,8 +1,9 @@
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, test } from 'vitest'
-import { connectSftp, isMissingSftpError, openRemote, openSftp, remoteFromSftp, remoteHostFrom, shellFromClient, type RemoteClient, type SftpLike } from '../src/ssh2-transport.ts'
+import { createTar, type ExecResult } from '../src/remote.ts'
+import { connectSftp, isMissingSftpError, openExecRemote, openRemote, openSftp, remoteFromSftp, remoteFromShell, remoteHostFrom, shellFromClient, type RemoteClient, type SftpLike } from '../src/ssh2-transport.ts'
 
 test('uploads a tree and reads a missing file as null', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'canness-sftp-'))
@@ -189,6 +190,105 @@ test('a remote host ends the client once across repeated close calls', async () 
   })
   const host = await openRemote(client as unknown as RemoteClient, dialOpts)
   await host.close()
+  await host.close()
+  expect(client.ends).toBe(1)
+})
+
+/** Read a tar stream produced by createTar without spawning an external tar. */
+function readTar(archive: Buffer): { files: Map<string, string>; dirs: string[] } {
+  const files = new Map<string, string>()
+  const dirs: string[] = []
+  let offset = 0
+  while (offset + 512 <= archive.length) {
+    const header = archive.subarray(offset, offset + 512)
+    if (header.every(byte => byte === 0)) break
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/, '')
+    const size = parseInt(header.subarray(124, 136).toString('ascii').replace(/\0.*$/, '').trim() || '0', 8)
+    const type = header.subarray(156, 157).toString('ascii')
+    offset += 512
+    if (type === '5') {
+      dirs.push(name)
+    } else if (type === '0') {
+      files.set(name, archive.subarray(offset, offset + size).toString('utf8'))
+    }
+    offset += Math.ceil(size / 512) * 512
+  }
+  return { files, dirs }
+}
+
+test('createTar writes a POSIX ustar archive without spawning tar', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'canness-tar-'))
+  mkdirSync(join(dir, 'operator'), { recursive: true })
+  writeFileSync(join(dir, 'manifest.json'), '{"generationId":"gen-1"}')
+  writeFileSync(join(dir, 'operator', 'kernel.cpp'), 'void kernel() {}')
+  const archive = readTar(createTar(dir))
+  expect(archive.files.get('manifest.json')).toBe('{"generationId":"gen-1"}')
+  expect(archive.files.get('operator/kernel.cpp')).toBe('void kernel() {}')
+  expect(archive.dirs).toContain('operator/')
+  // ustar magic is present at offset 257 of the first header.
+  expect(createTar(dir).subarray(257, 262).toString('ascii')).toBe('ustar')
+})
+
+function shellRecorder(replies: (command: string) => ExecResult = () => ({ code: 0, stdout: '', stderr: '' })) {
+  const commands: string[] = []
+  return {
+    commands,
+    shell: {
+      async exec(command: string) {
+        commands.push(command)
+        return replies(command)
+      },
+    },
+  }
+}
+
+test('remoteFromShell uploads through exec + base64 tar and removes its temp bundle', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'canness-exec-'))
+  writeFileSync(join(dir, 'manifest.json'), '{}')
+  let n = 0
+  const recorder = shellRecorder()
+  const host = remoteFromShell(recorder.shell, () => {}, () => `token${++n}`)
+  await host.uploadDir(dir, '/tmp/canness-a/inbox/gen-1')
+  expect(recorder.commands[0]).toContain('mkdir -p --')
+  expect(recorder.commands.some(command => command.includes('base64 -d <') && command.includes('tar -xf - -C'))).toBe(true)
+  expect(recorder.commands.some(command => command.includes('.canness-upload-token1.b64'))).toBe(true)
+  expect(recorder.commands.at(-1)).toContain("rm -f -- '/tmp/canness-a/inbox/.canness-upload-token1.b64'")
+  expect(recorder.commands.some(command => command.toLowerCase().includes('sftp'))).toBe(false)
+})
+
+test('remoteFromShell reads base64 and treats missing files as null', async () => {
+  const recorder = shellRecorder(command => command.startsWith('if [ -f')
+    ? (command.includes('/missing') ? { code: 44, stdout: '', stderr: '' } : { code: 0, stdout: 'aGVsbG8=\n', stderr: '' })
+    : { code: 0, stdout: '', stderr: '' })
+  const host = remoteFromShell(recorder.shell, () => {})
+  expect(Buffer.from((await host.readFile('/present.txt'))!).toString()).toBe('hello')
+  await expect(host.readFile('/missing')).resolves.toBeNull()
+})
+
+test('remoteFromShell surfaces the first 20 stderr lines of a failed command', async () => {
+  const lines = Array.from({ length: 25 }, (_, index) => `remote-line-${index + 1}`)
+  const recorder = shellRecorder(command => command.startsWith('mkdir -p')
+    ? { code: 1, stdout: '', stderr: `${lines.join('\n')}\n` }
+    : { code: 0, stdout: '', stderr: '' })
+  const host = remoteFromShell(recorder.shell, () => {})
+  const failure = await host.mkdirp('/denied').catch((error: Error) => error)
+  expect(failure).toBeInstanceOf(Error)
+  expect((failure as Error).message).toContain('remote-line-20')
+  expect((failure as Error).message).not.toContain('remote-line-21')
+})
+
+test('openExecRemote never requests the SFTP subsystem', async () => {
+  let sftpCalls = 0
+  const handlers = new Map<string, Function>()
+  const client = {
+    ends: 0,
+    on(event: string, fn: Function) { handlers.set(event, fn); return client },
+    connect() { handlers.get('ready')?.(); return client },
+    sftp() { sftpCalls += 1 },
+    end() { client.ends += 1 },
+  }
+  const host = await openExecRemote(client as unknown as RemoteClient, dialOpts)
+  expect(sftpCalls).toBe(0)
   await host.close()
   expect(client.ends).toBe(1)
 })
