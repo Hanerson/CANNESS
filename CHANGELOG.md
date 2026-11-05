@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### 清理
+
+- **文档归位**：根 README、README.en.md、`plugin/README.md` 与 `docs/design/05` 里残留的 `watch.py` / `bootstrap` / `bootstrapCommand` / `msprof-mock` / SFTP 描述全部改为真实 runner 的说法；`docs/README.md` 把已作废的远端自举计划标记为历史，并登记构建契约与 PR 验收两份新文档。
+- **删除死代码**：`probe-contract.ts` 的 `probeCommandLine`（客户端已改走 HTTP 路由）、`cannlab/api.ts` 的 `localSshTarget`（无调用方，随之移除两个未用导入）、`remote.ts` 的 `isRemoteHost`（类型守卫无调用方）。
+- **构建残留**：删除 `lib/remote-bootstrap.*`（源码已删，重新 build 不再生成）。
+
 ## [0.2.0] - 2026-11-04
 
 ### 新增

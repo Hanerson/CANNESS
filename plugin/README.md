@@ -44,18 +44,11 @@ The CANNLab connection uses a separate credential: only the refresh token is per
 
 ## 4. 远端 / Remote
 
-`run_evaluation` 首次上传前会做一次**幂等自举**：建 `inbox` / `outbox`，复用已在运行的消费者（`watch.pid` 存活或 `pgrep` 命中 `watch.py`），否则把 [`remote/watch.py`](remote/watch.py) 上传到 `dirname(inbox)` 并以 `--loop` 拉起——已存在的 `watch.py` 不覆盖。没有 CANN 的机器因此不需要人工准备就能模拟评测：
+`run_evaluation` 上传测试包与 [`remote/runner.py`](remote/runner.py)，在一次 SSH `exec` 内依次执行包自己的 `build.sh`、`run_once.sh` 和真实 `msprof`，再读回 `{outbox}/<generationId>/results.json`。上传走 `exec` + base64 tar，不需要远端有 `sftp-server`。
 
-```bash
-# 自举已拉起时不必手动执行；关闭自举或想补跑时用
-python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
-```
+测试包必须自带构建契约 v1：`build.sh` 最后一行 stdout 打印可执行文件绝对路径，`run_once.sh` 输出一行 `CANNESS_RESULT {...}`。缺任一个直接判 `compile_fail`（摘要 `package does not implement build contract v1`），runner 不猜编译命令。契约细节见 [`knowledge_base/Remote_NPU_Runner.md`](knowledge_base/Remote_NPU_Runner.md)。
 
-它写出 `status: "pass"`、`analysis.source: "msprof-mock"` 的 `results.json`，不调用 msprof，也不改已有结果文件。
-
-自举任一步失败时 `run_evaluation` 不进入轮询，直接返回 `status: "error"` 与 `remote bootstrap failed: <原因>`。主机侧已有真实 runner 时设 `bootstrapCommand`（执行你的启动命令，退出码须为 0）或 `bootstrap: false`（完全不介入远端）。
-
-The first `run_evaluation` bootstraps the remote: it creates the directories, reuses a running consumer, or deploys and starts `watch.py` in `--loop` mode. Failures return an error report instead of polling; a host with its own runner sets `bootstrapCommand` or `bootstrap: false`.
+`run_evaluation` uploads the package and [`remote/runner.py`](remote/runner.py), then runs the package's `build.sh`, its `run_once.sh` and the real `msprof` inside one SSH `exec` before reading `{outbox}/<generationId>/results.json` back. The upload is `exec` + base64 tar, so the host needs no `sftp-server`. The package must ship build contract v1; a missing script is `compile_fail`, never a guessed compile command.
 
 ### 连接到 CANNLab / Connect to CANNLab
 

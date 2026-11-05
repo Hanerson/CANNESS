@@ -45,14 +45,14 @@ CANNESS gives that loop to an agent, with sharp boundaries:
 | **CANNESS plugin** | Domain contract: spec, four-layer files, test package, evaluation report, knowledge base, iteration budget |
 | **Remote host** | Actually runs the compile, accuracy check, performance collection and msprof |
 
-Nothing is compiled locally, no CANN call is made locally, and no cloud API is involved. Evaluation happens on your own machine with the CANN toolchain; CANNESS only requires that it accepts SSH. The inbox consumer is bootstrapped by the first `run_evaluation` (see [9.1](#91-layout)), and a host that already has a real runner can turn that off.
+Nothing is compiled locally, no CANN call is made locally, and no cloud API is involved. Evaluation happens on your own machine with the CANN toolchain; CANNESS only requires that it accepts SSH. Evaluation runs through `runner.py` uploaded to the host, and the test package must ship the build contract (see [9.1](#91-layout)).
 
 ## 2. Features
 
 - **Spec-driven** — `submit_spec` validates field by field. A missing field fails with its path (`missing performance_target.metric`) and writes no half-baked state, so the model turns around and asks the user.
 - **Four-layer output** — `write_operator` writes `op_kernel`, `op_host`, `op_api` and `op_plugin` in one call.
 - **Self-contained test package** — `build_test_package` copies the four layers and adds a `manifest.json`; the remote side can compile it as-is.
-- **Plain SSH transport** — SFTP upload plus result polling over `ssh2`, with private-key or password authentication; the password lives in dsh's credential store.
+- **Plain SSH transport** — exec-channel upload (base64 tar) plus a remote runner and result polling over `ssh2`, with private-key or password authentication; the password lives in dsh's credential store.
 - **Budget and stop conditions** — valid iterations, compile retries, timeouts, performance regression streak, convergence and target met are judged independently.
 - **Automatic continuation** — `canness-loop` steers another round carrying the evaluation context from `agent/turn-stopping`, without the user pushing it.
 - **Performance analysis built in** — msprof-shaped `analysis` (bottleneck, MAC/MTE2/Scalar ratios, cube utilization) is parsed and fed straight into the retry prompt.
@@ -74,7 +74,7 @@ Nothing is compiled locally, no CANN call is made locally, and no cloud API is i
 │                                                                                  │
 │  canness-knowledge  ──► kb_search                                                │
 │  canness-generator  ──► submit_spec · write_operator · build_test_package        │
-│  canness-eval       ──► run_evaluation ──── SFTP ────► remote NPU host           │
+│  canness-eval       ──► run_evaluation ──── exec ────► remote NPU host           │
 │  canness-loop       ──► budget and stop policy (two event listeners)             │
 │  canness (client)   ──► Web settings card                                        │
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -339,7 +339,7 @@ No parameters. Returns `{ packageDir }`. Copies the current generation's four la
 
 ### `run_evaluation`
 
-No parameters. Returns an evaluation report (see [9.2](#92-result-file)). These cases do **not** throw; they return a report with `status: "error"`: empty `host`, missing credentials, SSH connection failure, remote bootstrap failure, budget exhausted. These cases throw: no `submit_spec` (`submit_spec first`), no `build_test_package` (`build_test_package first`).
+No parameters. Returns an evaluation report (see [9.2](#92-result-file)). These cases do **not** throw; they return a report with `status: "error"`: empty `host`, missing credentials, SSH connection failure, remote runner failure, budget exhausted. These cases throw: no `submit_spec` (`submit_spec first`), no `build_test_package` (`build_test_package first`).
 
 ## 8. Configuration reference
 
@@ -375,8 +375,6 @@ Configuration for the four host plugins. Except `workspace`, every `canness-eval
 | `maxCompileRetries` | number | `3` | Consecutive compile-failure limit |
 | `negativeStreakLimit` | number | `3` | Consecutive performance-regression limit |
 | `convergenceThreshold` | number | `0.05` | Two passes within this relative difference count as converged |
-| `bootstrap` | boolean | `true` | Prepare the remote before the first upload: create directories, reuse or start the inbox consumer. `false` leaves the remote untouched |
-| `bootstrapCommand` | string | `""` | When non-empty, run this POSIX command to start the consumer (must exit 0) instead of deploying the bundled mock |
 
 ### `canness-loop`
 
@@ -426,15 +424,17 @@ Affects only the settings card's reachability check and the CANNLab connection; 
 {inbox}/{generationId}/op_api/api.cpp
 {inbox}/{generationId}/op_plugin/plugin.py
 {inbox}/{generationId}/manifest.json
+{inbox}/{generationId}/build.sh          # build contract v1: last stdout line prints the executable path
+{inbox}/{generationId}/run_once.sh       # build contract v1: prints CANNESS_RESULT {...}
 
 {outbox}/{generationId}/results.json
 ```
 
-Each round deletes the previous `results.json` before polling, so a stale result is never read.
+Each round deletes the previous `results.json`, uploads the package plus `remote/runner.py`, and in one SSH `exec` runs the package's `build.sh`, its `run_once.sh`, and the real `msprof`, then reads the result back.
 
-**The inbox consumer is bootstrapped on first use.** `run_evaluation` creates `{baseDir}` (which is `dirname(inbox)`), `inbox` and `outbox`, then reuses a consumer it finds running (a live pid in `{baseDir}/watch.pid`, or a `pgrep` hit on `watch.py`). When neither is found it uploads the bundled `remote/watch.py` (an existing file is never overwritten) and starts it with `nohup … --loop`, leaving the pid and log under `{baseDir}`. This is the only command the plugin runs over SSH; compiling and evaluating stay in the host-side runner, and a host with a real runner sets `bootstrapCommand` or `bootstrap: false` to stay untouched.
+**The package must ship build contract v1.** A missing `build.sh` or `run_once.sh` is reported as `compile_fail` with the fixed summary `package does not implement build contract v1`; the runner never guesses a compile command. `kernelTimeUs` only ever comes from the CSVs under `mindstudio_profiler_output/`; a missing CSV is `status: "error"` and never falls back to the manifest target.
 
-When any step fails (directory permission, no python on the remote, non-zero `bootstrapCommand`, a consumer that dies right away), the tool does not poll: it returns `status: "error"` within seconds with `summary: "remote bootstrap failed: <reason>"`. Fix the configuration and retry; the failed attempt consumes no iteration budget.
+> **Known gap:** `build_test_package` still emits only the four layer files and `manifest.json`, not these two scripts, so the real path currently always ends in `compile_fail`. The fix is described in [`docs/plans/2026-11-05-build-contract-skeleton.md`](docs/plans/2026-11-05-build-contract-skeleton.md).
 
 ### 9.2 Result file
 
@@ -473,19 +473,15 @@ When any step fails (directory permission, no python on the remote, non-zero `bo
 | `compile` | `ok` boolean, `log` string (truncated to 2000 characters when it enters the enhancement block) |
 | `correctness.maxRelativeError` | Number or `null` |
 | `performance.kernelTimeUs` / `targetUs` | Number or `null` |
-| `analysis` | May be `null`; `source` ∈ `msprof`, `msprof-mock`; `bottleneck` ∈ `cube`, `memory`, `scalar`, `unknown`; `op` may be `null` |
+| `analysis` | May be `null`; `source` is currently only `msprof`; `bottleneck` ∈ `cube`, `memory`, `scalar`, `unknown`; `op` may be `null` |
 
 An invalid result does not throw: it produces `status: "error"` with `summary: "malformed result: <reason>"` so the loop keeps going instead of aborting.
 
-### 9.3 Remote mock
+### 9.3 Real runner
 
-Without a CANN environment, [`plugin/remote/watch.py`](plugin/remote/watch.py) fakes the evaluation. The first `run_evaluation` against a bare host deploys this script and starts it in `--loop` mode (see [9.1](#91-layout)); run it from cron or by hand when bootstrap is off or you want to restart it:
+Evaluation runs [`plugin/remote/runner.py`](plugin/remote/runner.py) on the remote host, in a fixed order: run the package's `build.sh` → take the executable path → run `run_once.sh` for the `CANNESS_RESULT` line → profile with `msprof` for `<runs>` iterations → parse the CSVs under `mindstudio_profiler_output/` → write `results.json` (including `runRecord`).
 
-```bash
-python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
-```
-
-It scans `{inbox}/*/manifest.json` and writes a `status: "pass"` result per generation with `analysis.source: "msprof-mock"` and `kernelTimeUs` taken from `manifest.performanceTargetUs`. It never calls msprof and never overwrites an existing result file.
+`run_evaluation` uploads the runner under a uuid name next to `dirname(inbox)` and deletes it afterwards; `fetch_remote_file` pulls CSVs and logs back into the workspace. **There is no mock fallback**: a host without CANN can never produce a `pass`.
 
 ### 9.4 Connecting to CANNLab (free cloud NPU)
 
@@ -600,7 +596,7 @@ CANNESS/
 │   │   ├── package-files.ts       # four-layer output and packaging
 │   │   ├── eval.ts                # run_evaluation
 │   │   ├── eval-run.ts            # upload → poll → parse
-│   │   ├── ssh2-transport.ts      # ssh2 SFTP adapter
+│   │   ├── ssh2-transport.ts      # ssh2 exec-channel adapter
 │   │   ├── remote.ts              # RemoteFiles interface + in-memory double
 │   │   ├── report.ts              # report shape and parsing
 │   │   ├── analysis.ts            # msprof-shaped performance analysis
@@ -611,7 +607,7 @@ CANNESS/
 │   │   └── client/                # browser half (the Web settings card)
 │   ├── tests/                     # Vitest unit tests
 │   ├── knowledge_base/            # knowledge entries
-│   ├── remote/watch.py            # remote mock result writer
+│   ├── remote/runner.py           # real remote runner (build.sh → run_once.sh → msprof)
 │   ├── scripts/build-client.mjs   # browser-half bundler
 │   ├── cordis.patch.yml           # bundle default config layer
 │   └── package.json
@@ -627,7 +623,7 @@ CANNESS/
 
 ### Constraints
 
-- Plugin code is **TypeScript / ESM only**; Python appears only in `remote/watch.py` and knowledge-base content.
+- Plugin code is **TypeScript / ESM only**; Python appears only in `remote/runner.py` and knowledge-base content.
 - The browser half may value-import only packages in dsh's frozen module table (`react`, `cordis`, `dsh-client-*`, …); everything else is inlined by esbuild.
 - The four budget fields exist twice, in `canness-eval` and `canness-loop`; the numbers must match.
 - When adding a tool or field, update [docs/design/05-plugin-architecture.md](docs/design/05-plugin-architecture.md) and the tables here.
@@ -678,7 +674,11 @@ It was not built. Run `pnpm build` in `plugin/`.
 
 **Q: `run_evaluation` waits until it times out.**
 
-Check `summary` first: when it starts with `remote bootstrap failed: `, fix the reported cause (directory permission, missing python, `bootstrapCommand` exit code). Otherwise `outbox` probably differs from where the consumer writes — confirm the paths manually with `watch.py --once`.
+Check `summary` first. `remote runner failed: …` carries the first 20 stderr lines, usually `build.sh` missing its toolchain or a missing `python3`; `timed out after …` means the runner never wrote `results.json` within `timeoutSec`, typically `msprof` hanging or an `outbox` that differs from where the runner writes.
+
+**Q: The report is `compile_fail` with `package does not implement build contract v1`.**
+
+The package is missing `build.sh` or `run_once.sh`. The runner will not guess a compile command — the package must ship both scripts (see [9.1](#91-layout)). `build_test_package` does not generate them yet; that is the known gap.
 
 **Q: pnpm warns about unresolved peerDependencies.**
 

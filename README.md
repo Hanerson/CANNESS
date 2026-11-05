@@ -45,14 +45,14 @@ CANNESS 把这个循环交给智能体，但把边界划得很清楚：
 | **CANNESS 插件** | 领域契约：规格书、四层文件、测试包、评估报告、知识库、迭代预算 |
 | **远端主机** | 真正跑编译、精度校验、性能采集与 msprof |
 
-本地**不编译算子、不调用 CANN、不调用任何云 API**。评测只发生在你自己那台装了 CANN 工具链的机器上，CANNESS 对它只有一个要求：能 SSH 登录。inbox 的消费者由 `run_evaluation` 首次自举（见 [9.1](#91-目录布局)）；主机侧已有真实 runner 时也可以关掉自举。
+本地**不编译算子、不调用 CANN、不调用任何云 API**。评测只发生在你自己那台装了 CANN 工具链的机器上，CANNESS 对它只有一个要求：能 SSH 登录。评测由上传到远端的 `runner.py` 执行，测试包须自带构建契约（见 [9.1](#91-目录布局)）。
 
 ## 2. 特性
 
 - **规格书驱动** —— `submit_spec` 逐字段校验；缺字段直接失败并给出字段路径，由模型回头追问用户，不写半成品状态。
 - **四层落盘** —— `write_operator` 一次写入 `op_kernel` / `op_host` / `op_api` / `op_plugin` 四个文件。
 - **测试包自包含** —— `build_test_package` 复制四层文件并生成 `manifest.json`，远端拿到即可编译。
-- **通用 SSH 传输** —— 基于 `ssh2` 的 SFTP 上传 + 结果轮询；私钥与密码两种认证，密码走 dsh 凭据存储。
+- **通用 SSH 传输** —— 基于 `ssh2` 的 exec 通道上传（base64 tar）+ 远端 runner 执行 + 结果轮询；私钥与密码两种认证，密码走 dsh 凭据存储。
 - **预算与停机** —— 有效迭代、编译重试、超时、性能连续变差、收敛、目标达成，六类条件独立判定。
 - **自动续轮** —— `canness-loop` 在 `agent/turn-stopping` 处 `steer` 一轮带评测上下文的增强块，不需要用户手动催。
 - **性能分析内建** —— 解析 msprof 形状的 `analysis`（瓶颈类型、MAC/MTE2/Scalar 比例、cube 利用率），失败原因直接进提示。
@@ -74,7 +74,7 @@ CANNESS 把这个循环交给智能体，但把边界划得很清楚：
 │                                                                                  │
 │  canness-knowledge  ──► kb_search                                                │
 │  canness-generator  ──► submit_spec · write_operator · build_test_package        │
-│  canness-eval       ──► run_evaluation ──── SFTP ────► 远端 NPU 主机             │
+│  canness-eval       ──► run_evaluation ──── exec ────► 远端 NPU 主机             │
 │  canness-loop       ──► 预算与停机策略（两个事件监听器）                         │
 │  canness (client)   ──► Web 设置卡                                               │
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -341,7 +341,7 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 
 ### `run_evaluation`
 
-无参数。返回一份评估报告（结构见 [9.2](#92-结果文件)）。以下情况**不抛异常**，而是返回 `status: "error"` 的报告：`host` 为空、凭据缺失、SSH 连接失败、远端自举失败、预算已耗尽。以下情况抛异常：未 `submit_spec`（`submit_spec first`）、未 `build_test_package`（`build_test_package first`）。
+无参数。返回一份评估报告（结构见 [9.2](#92-结果文件)）。以下情况**不抛异常**，而是返回 `status: "error"` 的报告：`host` 为空、凭据缺失、SSH 连接失败、远端 runner 失败、预算已耗尽。以下情况抛异常：未 `submit_spec`（`submit_spec first`）、未 `build_test_package`（`build_test_package first`）。
 
 ## 8. 配置参考
 
@@ -377,8 +377,6 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 | `maxCompileRetries` | number | `3` | 编译失败累计上限 |
 | `negativeStreakLimit` | number | `3` | 性能连续变差上限 |
 | `convergenceThreshold` | number | `0.05` | 两次通过结果的相对差小于该值即判收敛 |
-| `bootstrap` | boolean | `true` | 首次上传前做远端自举：建目录、探测/补齐 inbox 消费者；设 `false` 则完全不介入远端 |
-| `bootstrapCommand` | string | `""` | 非空时执行该 POSIX 命令作为消费者启动方式（要求退出码 0），不再部署内置 mock |
 
 ### `canness-loop`
 
@@ -428,15 +426,17 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 {inbox}/{generationId}/op_api/api.cpp
 {inbox}/{generationId}/op_plugin/plugin.py
 {inbox}/{generationId}/manifest.json
+{inbox}/{generationId}/build.sh          # 构建契约 v1：最后一行 stdout 打印可执行文件路径
+{inbox}/{generationId}/run_once.sh       # 构建契约 v1：输出 CANNESS_RESULT {...}
 
 {outbox}/{generationId}/results.json
 ```
 
-`run_evaluation` 每轮会先删除上一次的 `results.json` 再开始轮询，避免读到陈结果。
+`run_evaluation` 每轮会先删除上一次的 `results.json`，然后上传测试包与 `remote/runner.py`，在一次 SSH `exec` 内依次执行包的 `build.sh`、`run_once.sh` 和真实 `msprof`，再读回结果。
 
-**inbox 的消费者在首次调用时自举。** `run_evaluation` 会先建 `{baseDir}`（= `dirname(inbox)`）、`inbox`、`outbox`，再复用已在运行的消费者（`{baseDir}/watch.pid` 里的 pid 存活，或 `pgrep` 命中 `watch.py`）；都没有时上传插件包里的 `remote/watch.py`（已存在则不覆盖）并用 `nohup … --loop` 启动，pid 与日志落在 `{baseDir}`。这是插件唯一一次通过 SSH 执行命令：编译与评测仍由主机侧 runner 负责；已有真实 runner 的机器设 `bootstrapCommand` 或 `bootstrap: false` 即可完全不介入。
+**包必须自带构建契约 v1。** 缺 `build.sh` 或 `run_once.sh` 时 runner 直接判 `compile_fail`，摘要固定为 `package does not implement build contract v1`，不会去猜编译命令。`kernelTimeUs` 只来自 `mindstudio_profiler_output/` 下的 CSV；CSV 缺失一律 `status: "error"`，不会回落到 manifest 里的目标值。
 
-自举任一步失败（目录权限、远端没有 python、`bootstrapCommand` 非 0 退出、进程起不来）时不会进入轮询，而是在数秒内返回 `status: "error"`、`summary` 为 `remote bootstrap failed: <原因>`；修好配置后重试即可，这次失败不消耗迭代预算。
+> **已知缺口**：`build_test_package` 目前只产出四层文件与 `manifest.json`，**尚未生成这两个脚本**，因此真实链路仍会在 runner 处判 `compile_fail`。补齐方案见 [`docs/plans/2026-11-05-build-contract-skeleton.md`](docs/plans/2026-11-05-build-contract-skeleton.md)。
 
 ### 9.2 结果文件
 
@@ -475,19 +475,15 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 | `compile` | `ok` 布尔，`log` 字符串（进入增强块时截断到 2000 字符） |
 | `correctness.maxRelativeError` | 数字或 `null` |
 | `performance.kernelTimeUs` / `targetUs` | 数字或 `null` |
-| `analysis` | 可为 `null`；`source` ∈ `msprof`、`msprof-mock`；`bottleneck` ∈ `cube`、`memory`、`scalar`、`unknown`；`op` 可为 `null` |
+| `analysis` | 可为 `null`；`source` 目前只有 `msprof`；`bottleneck` ∈ `cube`、`memory`、`scalar`、`unknown`；`op` 可为 `null` |
 
 字段不合法时不会抛错，而是返回 `status: "error"`、`summary` 为 `malformed result: <原因>` 的报告，让闭环继续跑而不是中断。
 
-### 9.3 远端 mock
+### 9.3 真实 runner
 
-没有 CANN 环境时，用 [`plugin/remote/watch.py`](plugin/remote/watch.py) 模拟评测。空白主机的第一次 `run_evaluation` 会自动部署该脚本并以 `--loop` 拉起（见 [9.1](#91-目录布局)）；关掉自举或想手动补跑时，用 cron 或手动执行：
+评测由 [`plugin/remote/runner.py`](plugin/remote/runner.py) 在远端执行，流程固定：跑包的 `build.sh` → 拿可执行文件路径 → 跑 `run_once.sh` 取 `CANNESS_RESULT` → 用 `msprof` 采集 `<runs>` 次 → 解析 `mindstudio_profiler_output/` 下的 CSV → 写 `results.json`（含 `runRecord`）。
 
-```bash
-python3 watch.py --inbox /tmp/canness/inbox --outbox /tmp/canness/outbox --once
-```
-
-它扫描 `{inbox}/*/manifest.json`，为每个 generation 写一份 `status: "pass"`、`analysis.source: "msprof-mock"` 的 `results.json`，`kernelTimeUs` 取 `manifest` 里的 `performanceTargetUs`。不调用 msprof，也不改已有结果文件。
+`run_evaluation` 每次会把 runner 以 uuid 名上传到 `dirname(inbox)`，执行完即删除；`fetch_remote_file` 可把 CSV、日志拉回 workspace。**没有 mock 回落**：没有 CANN 的机器上跑不出 `pass`。
 
 ### 9.4 连接 CANNLab（免费 NPU 云环境）
 
@@ -602,7 +598,7 @@ CANNESS/
 │   │   ├── package-files.ts       # 四层落盘与测试包
 │   │   ├── eval.ts                # run_evaluation
 │   │   ├── eval-run.ts            # 上传 → 轮询 → 解析
-│   │   ├── ssh2-transport.ts      # ssh2 SFTP 适配
+│   │   ├── ssh2-transport.ts      # ssh2 exec 通道适配
 │   │   ├── remote.ts              # RemoteFiles 接口 + 内存实现
 │   │   ├── report.ts              # 评估报告结构与解析
 │   │   ├── analysis.ts            # msprof 形状的性能分析
@@ -613,7 +609,7 @@ CANNESS/
 │   │   └── client/                # 浏览器半区（Web 设置卡）
 │   ├── tests/                     # Vitest 单元测试
 │   ├── knowledge_base/            # 知识库条目
-│   ├── remote/watch.py            # 远端 mock 结果生成器
+│   ├── remote/runner.py           # 远端真实评测 runner（build.sh → run_once.sh → msprof）
 │   ├── scripts/build-client.mjs   # 浏览器半区打包脚本
 │   ├── cordis.patch.yml           # bundle 默认配置层
 │   └── package.json
@@ -629,7 +625,7 @@ CANNESS/
 
 ### 约束
 
-- 插件代码只能是 **TypeScript / ESM**；Python 只出现在 `remote/watch.py` 与知识库正文里。
+- 插件代码只能是 **TypeScript / ESM**；Python 只出现在 `remote/runner.py` 与知识库正文里。
 - 浏览器半区只能 value-import dsh 冻结模块表里的包（`react`、`cordis`、`dsh-client-*` 等），其余由 esbuild 内联。
 - 预算四字段在 `canness-eval` 与 `canness-loop` 各写一份，两处数字必须相同。
 - 新增工具或字段时同步更新 [docs/design/05-plugin-architecture.md](docs/design/05-plugin-architecture.md) 与 README 的配置表。
@@ -680,7 +676,11 @@ bundle 默认的相对路径按 dsh 进程 cwd 解析。按 [6.3](#63-在-profil
 
 **Q：`run_evaluation` 一直等到超时？**
 
-先看报告 `summary`：以 `remote bootstrap failed: ` 开头时按原因修配置（目录权限、远端缺 python、`bootstrapCommand` 退出码）；其余情况多半是 `outbox` 路径与消费者写出的位置不一致，用 `watch.py --once` 手动确认路径。
+先看报告 `summary`。`remote runner failed: …` 后面跟的是远端 stderr 前 20 行，通常是 `build.sh` 找不到工具链或 `python3` 缺失；`timed out after …` 说明 runner 在 `timeoutSec` 内没有写出 `results.json`，多为 `msprof` 卡住或 `outbox` 与 runner 写出的位置不一致。
+
+**Q：报告是 `compile_fail`，摘要为 `package does not implement build contract v1`？**
+
+测试包里缺 `build.sh` 或 `run_once.sh`。runner 不会替你猜编译方式，需要由包提供这两个脚本（见 [9.1](#91-目录布局)）。目前 `build_test_package` 还不会生成它们，这是已知缺口。
 
 **Q：pnpm 警告 peerDependencies 未解析？**
 

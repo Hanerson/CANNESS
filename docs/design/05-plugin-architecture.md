@@ -1,4 +1,4 @@
----
+﻿---
 title: CANNESS 插件化架构设计（基于 deepseek-harness）
 order: 5
 relates_to:
@@ -55,7 +55,7 @@ relates_to:
 | Agent 编排引擎（CrewAI 原型 / LangGraph 生产） | dsh agent loop 本身；编排策略降级为事件监听器 |
 | 迭代留痕、结构化日志 | Session Event Log（append-only、可重放） |
 | 智能体间通信超时/重试（01 文档 §8） | harness 工具管线与 `llm-retry` 承接 |
-| SSH 连接管理 | 不交给 dsh-ssh。`canness-eval` 用 `ssh2` SFTP 上传并等待（§5.3） |
+| SSH 连接管理 | 不交给 dsh-ssh。`canness-eval` 用 `ssh2` 的 exec 通道上传并执行 runner（§5.3） |
 
 ### 3.2 CANNESS 插件保留的（领域部分）
 
@@ -66,7 +66,7 @@ relates_to:
 | 测试评估（编译→正确性→边界→性能→汇总报告） | `canness-eval`：`run_evaluation` 只经 SSH 上传测试包并等待结果；五步执行在远端，不在本地 |
 | 失败分类与 prompt 增强（03 文档） | `canness-loop`：`tools/result` 监听 + `agent/pre-step` 注入增强块 |
 | 迭代控制与停机条件 | `canness-loop`：`agent/turn-stopping` 监听（硬闸）+ 评测服务内规则（编译失败不计迭代） |
-| RemoteExecutor 四实现 | **取消**。不再做本地 / SSH 逐步执行 / 华为云 / CANN Lab 四后端，只留通用 SSH 上传 + 等待（§5.3） |
+| RemoteExecutor 四实现 | **取消**。不再做本地 / SSH 逐步执行 / 华为云 / CANN Lab 四后端，只留通用 SSH 上传 + 远端 runner 执行（§5.3） |
 | 知识库（规范/芯片/参考实现/tiling/错误模式） | `canness-knowledge` 服务 + 检索工具 |
 | 任务级状态 JSON（04 文档 §6.1） | `canness-eval` 自管状态文件（会话日志之外的持久产物） |
 
@@ -93,20 +93,20 @@ relates_to:
 ```
 
 ```yaml
-# cordis.patch.yml — bundle 补丁：插入四个插件行
+# cordis.patch.yml — bundle 补丁：插入五个插件行
 - insert:
     - id: canness-knowledge
       name: dsh-canness/knowledge
       config: { kbRoot: './knowledge_base' }
     - id: canness-generator
       name: dsh-canness/generator
-      inject: [tools, cannessKnowledge]
     - id: canness-eval
       name: dsh-canness/eval
-      inject: [tools, cannessExecutor]
     - id: canness-loop
       name: dsh-canness/loop
       config: { maxIterations: 10, convergenceThreshold: 0.05 }
+    - id: canness-remote
+      name: dsh-canness/remote-api
 ```
 
 用户侧：`dsh plugin --profile canness add github:<org>/canness-dsh`（或本地 `link:` 路径），然后 `dsh --profile canness`。TS 源码分发需带自包含 `prepare` 构建脚本；或发布时构建好 `lib/`。
@@ -117,10 +117,11 @@ relates_to:
 |---|---|---|---|
 | `canness-knowledge` | 函数 | `kb_search` | — |
 | `canness-generator` | 函数 | `submit_spec`、`write_operator`、`build_test_package` | — |
-| `canness-eval` | 函数 | `run_evaluation` | — |
+| `canness-eval` | 函数 | `run_evaluation`、`fetch_remote_file` | — |
 | `canness-loop` | 函数 | — | `agent/pre-step`、`agent/turn-stopping` |
+| `canness-remote` | 函数（需 `webServer`） | — | — （HTTP 路由：连通检查与 CANNLab 连接） |
 
-MVP 不挂 Cordis Service。四个插件共享 `{workspace}/.canness/state.json`。失败分类在 `run_evaluation` 里完成，不另听 `tools/result`。上面 §4.1 补丁里的 `inject` / `cannessExecutor` 是旧草图，以计划中的 `cordis.patch.yml` 为准。
+MVP 不挂 Cordis Service。四个领域插件共享 `{workspace}/.canness/state.json`。失败分类在 `run_evaluation` 里完成，不另听 `tools/result`。`canness-remote` 只服务 Web 设置卡，无 Web profile 时可不加载。
 
 ### 4.3 一个典型回合（数据流）
 
@@ -129,7 +130,7 @@ MVP 不挂 Cordis Service。四个插件共享 `{workspace}/.canness/state.json`
   │
   ▼ agent loop（harness）
   模型调用 submit_spec ──► 规格书 JSON 校验通过（缺字段 → 工具报错，模型追问用户）
-  模型调用 kb_search   ──► cannessKnowledge 检索参考实现/tiling 模板（few-shot 注入）
+  模型调用 kb_search   ──► 知识库检索参考实现/tiling 模板（few-shot 注入）
   模型调用 write_operator + build_test_package ──► 四层代码 + 测试包落盘
   模型调用 run_evaluation ──► 本地只做两步：SSH 上传测试包 → 等待远端结果文件
   │                        └─► 拉回的评估报告 JSON 作为工具结果返回
@@ -155,7 +156,7 @@ MVP 不挂 Cordis Service。四个插件共享 `{workspace}/.canness/state.json`
 |---|---|---|
 | 需求分析 Agent | `submit_spec` 工具 + 追问式对话 | 工具参数 schema 即规格书 schema（02 文档 §3.1 的 JSON 结构原样搬入）；字段缺失由校验失败驱动模型向用户追问，不再单独写追问策略代码 |
 | 算子生成 Agent | `kb_search` + `write_operator` + `build_test_package` | 生成策略（检索模板 → 生成 → 修复）改由系统提示词 + 知识注入表达；编译修复由反馈回路驱动（§5.2） |
-| 测试评估 Agent | `run_evaluation` 工具 + `cannessExecutor` 服务 | 测试包结构、评估报告 JSON（02 文档 §3.3）仍是领域契约。五步执行改在远端机器上完成；本地只上传并等待。停机判断从 Agent 内挪到 `turn-stopping` 监听 |
+| 测试评估 Agent | `run_evaluation` 工具 + 远端 runner | 测试包结构、评估报告 JSON（02 文档 §3.3）仍是领域契约。五步执行改在远端机器上完成；本地只上传并等待。停机判断从 Agent 内挪到 `turn-stopping` 监听 |
 
 ### 5.2 迭代控制（原 Orchestrator）
 
@@ -181,12 +182,12 @@ ctx.on('agent/turn-stopping', ({ agent }) => {
 
 2026-10-29 补充决定：**去掉模力方舟、华为云、CANN Lab 等平台依赖**。02 文档 §4 的四套执行器不再实现。测试机是任意一台能 SSH 上去、且自己装有 CANN 工具链的机器；插件不包含该平台的 SDK 或控制台流程。
 
-传输**不用** dsh `ssh` 包家族。`@deepseek-ai/dsh-ssh` 要求两端都是 Linux/macOS，还要在远端安装带 SHA-256 的 helper（`packages/ssh/ssh/README.md`）。开发机是 Windows，这和「通用 SSH、只上传再等待」相反。MVP 用 `ssh2` 做 SFTP：上传目录、轮询结果文件、拉回。本地在测试环节只有两步：
+传输**不用** dsh `ssh` 包家族。`@deepseek-ai/dsh-ssh` 要求两端都是 Linux/macOS，还要在远端安装带 SHA-256 的 helper（`packages/ssh/ssh/README.md`）。开发机是 Windows，这和「通用 SSH、只上传再等待」相反。MVP 用 `ssh2` 的 exec 通道：base64 打包上传目录、在远端启动 runner、轮询结果文件并拉回。本地在测试环节只有两步：
 
 1. **上传**。把本轮测试包写到远端约定的 inbox 目录。
 2. **等待**。轮询约定的结果路径，直到结果文件出现或超时，再拉回解析为评估报告 JSON。
 
-编译、正确性、边界、性能都在远端发生。本地不逐条执行 cmake / kernel_eval，也不调用云 API。远端靠什么开始跑（目录监听，或那台机器上原有的 runner）是主机侧约定，不是 CANNESS 要适配的平台。缺省情况下（远端没有现成 runner）由插件按 §5.3.1 自举一个 mock 消费者；主机侧已有 runner 时只上传、不介入。
+编译、正确性、边界、性能都在远端发生。本地不逐条执行 cmake / kernel_eval，也不调用云 API。远端怎么启动编译由包内的构建契约决定，插件不替主机猜编译命令（见 §5.3.1）。
 
 | 旧实现（02 文档 §4） | 处置 |
 |---|---|
@@ -195,7 +196,7 @@ ctx.on('agent/turn-stopping', ({ agent }) => {
 | `CloudAPIExecutor` | 删除。不对接华为云 |
 | `ManualExecutor` | 删除。不再提示用户手工上传 CANN Lab |
 
-MVP 不挂 `cannessExecutor` 服务。`run_evaluation` 直接上传，然后等待。配置是扁平字段，不用 dsh 的 ssh 主机表。预算四字段在 `canness-loop` 里再写一份相同的数。字段以计划为准，例如：
+`run_evaluation` 上传后直接启动远端 runner，再等待结果，不挂服务。配置是扁平字段，不用 dsh 的 ssh 主机表。预算四字段在 `canness-loop` 里再写一份相同的数。字段以计划为准，例如：
 
 ```yaml
 # canness-eval config（节选）
@@ -213,28 +214,21 @@ negativeStreakLimit: 3
 convergenceThreshold: 0.05
 ```
 
-#### 5.3.1 远端自举（2026-11-03 补充）
+#### 5.3.1 构建契约与真实 runner（2026-11-05 修订）
 
-现场问题（§8 风险 1 的现实版）：远端能 SSH 登录，但 `/tmp/canness` 不存在、没有 `watch.py`、也没有任何进程消费 inbox。上传本身会自建 `{inbox}/{generationId}/`，所以流程看起来"在跑"，实际是没人写 `results.json`——一次调用要白等 `timeoutSec`（默认 1800s）才返回 `timeout`。
+评测侧已从"上传后等人消费 inbox"改为**包自带构建契约、plugin 侧 runner 执行**：
 
-决定：把"远端准备"从人工前置步骤改成 `run_evaluation` 的**幂等自举**，由 agent 的一次工具调用顺带完成（确定性代码，不让模型临场拼命令；失败时模型按报错修配置）：
+- 测试包内必须有 `build.sh`（最后一行 stdout 打印可执行文件绝对路径）与 `run_once.sh`（输出 `CANNESS_RESULT {...}`）；缺任一个判 `compile_fail`，摘要固定为 `package does not implement build contract v1`。
+- `run_evaluation` 上传测试包与 `remote/runner.py`，在一次 SSH `exec` 内完成 `build.sh` → `run_once.sh` → 真实 `msprof`，`kernelTimeUs` 只来自 `mindstudio_profiler_output/` 下的 CSV。
+- 上传走 `exec` + base64 tar，不依赖远端 `sftp-server`。
 
-| 步骤 | 动作 | 幂等性 |
-|---|---|---|
-| 1 | `mkdirp(inbox)`、`mkdirp(outbox)` | 已存在则跳过 |
-| 2 | 探测消费者：`${baseDir}/watch.pid` + `kill -0`，回退 `pgrep -f '[w]atch.py'` | 已在跑则复用，不重复拉起 |
-| 3 | 缺失时上传插件包中的 `remote/watch.py` 到 `${baseDir}/watch.py`，`nohup python3 … --loop` 启动，日志与 pid 落 `${baseDir}` | 现成的 `watch.py` 不覆盖，只补缺 |
-| 4 | 10s 内确认进程存活 | 不存活即判失败 |
+> **待补（v0.2.0 遗留）**：`build_test_package` 目前只产四层文件与 `manifest.json`，**不产 `build.sh` / `run_once.sh`**，因此真实链路仍会恒返回 `compile_fail`。补齐方案见 [`docs/plans/2026-11-05-build-contract-skeleton.md`](../plans/2026-11-05-build-contract-skeleton.md)。
 
-- `baseDir = dirname(inbox)`（默认 `/tmp/canness`）。
-- 新增两个 volatile 配置：`bootstrap`（默认 `true`）与 `bootstrapCommand`（默认空 = 用内置 mock；非空则执行该命令，供真实 runner 使用）。
-- 自举失败**不进入轮询、不写状态文件**：返回 `status: "error"`、`summary: "remote bootstrap failed: <原因>"`，不消耗迭代预算；模型改配置后可重试。
-- 边界：SSH exec 只用于这一次自举（建目录、起进程）；编译/评测命令仍由主机侧 runner 执行，本地不编排。已有真实 runner 的机器设 `bootstrapCommand` 或 `bootstrap: false`，插件不会启动 mock，也不会覆盖其 `watch.py`。
-- 已知限制：消费者探测是"尽力而为"（pid 文件 + 进程名），并发多会话共用同一远端目录时不做互斥；单 agent 串行使用是前提。
+原"远端自举 mock 消费者"方案（`watch.py` / `bootstrap` / `bootstrapCommand`）已删除，历史记录见 [`docs/plans/2026-11-03-remote-bootstrap.md`](../plans/2026-11-03-remote-bootstrap.md)。
 
 ### 5.4 知识库 → 服务 + 检索工具 + 上下文注入
 
-- **载体**：`cannessKnowledge` Service 封装 `knowledge_base/` 目录（结构沿用 02 文档 §5.1），MVP 用文件级检索（关键词 + 算子类型索引），SQLite/向量库留到 Phase 3（04 文档 §7.2 本就暂缓）。
+- **载体**：知识库模块封装 `knowledge_base/` 目录（结构沿用 02 文档 §5.1），MVP 用文件级检索（关键词 + 算子类型索引），SQLite/向量库留到 Phase 3（04 文档 §7.2 本就暂缓）。
 - **检索**：`kb_search` 工具（模型主动查）。
 - **注入**：`agent/pre-step` waterfall 监听器按任务阶段自动注入芯片规格表、当前算子类型的 tiling 模板（被动知识），与主动检索互补——即 03 文档的 Prompt 增强策略，载体从"拼 prompt 字符串"变为"注入上下文块"。
 
@@ -252,7 +246,7 @@ convergenceThreshold: 0.05
 | Agent 编排 | CrewAI / LangGraph | dsh agent loop | 删除依赖 |
 | LLM | OpenAI SDK | `ctx.llm` + provider 路由 | 用 dsh profile 配好的提供商。CANNESS 不绑定模力方舟或其他平台端点 |
 | 配置 | YAML + Pydantic | `cordis.yml` + Schemastery | 机制对等，API 不同 |
-| 远程执行 | paramiko；四后端含华为云 / CANN Lab | `ssh2` SFTP，只上传并等待结果 | 见 §5.3。不用 dsh-ssh helper，无平台 SDK |
+| 远程执行 | paramiko；四后端含华为云 / CANN Lab | `ssh2` exec + 远端 runner | 见 §5.3。不用 dsh-ssh helper，无平台 SDK |
 | 测试脚本 / 参考实现 / 数据生成 | pytest / NumPy | **不变**（仍为 Python） | 属于测试包内容，跑在 NPU 环境 |
 | 包管理 | pip / pyproject | pnpm / package.json | 团队需熟悉 |
 | 教程基准 | 无 | `docs/cordis-tutorial/`（7 章） | 上手路径，无需 API key |
@@ -280,7 +274,7 @@ convergenceThreshold: 0.05
 
 | # | 问题 | 影响 | 缓解 |
 |---|------|------|------|
-| 1 | **远端结果契约**：结果路径、JSON 格式、超时，以及 inbox 无人消费时会一直等到超时 | 高，闭环的前提 | 第一周 spike：向一台 SSH 主机丢一个测试包，确认能等到结果文件；2026-11-03 起由 §5.3.1 自举承接（缺目录/缺消费者自动补齐，自举失败立即报错而不是干等） |
+| 1 | **远端结果契约**：结果路径、JSON 格式、超时，以及包里的构建契约是否齐备 | 高，闭环的前提 | 2026-11-05 起由 §5.3.1 的真实 runner 承接（包自带 `build.sh` / `run_once.sh`，runner 执行并只从 CSV 取耗时）；`build_test_package` 尚未产出这两个脚本，是当前唯一的阻断项 |
 | 2 | 团队 Python → TS 转型 | 中 | tutorial 7 章练手；胶水层面积已压到最小（§6） |
 | 3 | dsh 处于 Developer Preview，机制演进 | 中 | `engines.dsh` 锁版本窗；升级看 `docs/upgrade-guide/` |
 | 4 | `agent/turn-stopping` 的裁决语义与预期不完全一致（如停机时如何"输出最优"） | 中 | spike 验证；兜底方案是 `canness-loop` 自管一轮"收尾请求" |

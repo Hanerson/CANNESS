@@ -30,7 +30,9 @@
 | [2026-10-29 dsh-canness MVP](plans/2026-10-29-dsh-canness-mvp.md) | MVP 的分任务实现计划（TDD 步骤、验收断言） |
 | [2026-10-30 SSH 凭据设计提案](plans/2026-10-30-canness-ssh-credentials-design.md) | SSH 密码认证与 Web 设置卡的设计取舍 |
 | [2026-10-30 SSH 密码认证实现计划](plans/2026-10-30-canness-ssh-password-auth.md) | 上一份提案的实现计划与偏差记录 |
-| [2026-11-03 远端自举修复提示词](plans/2026-11-03-remote-bootstrap.md) | 问题二（远端无目录 / 无 `watch.py` 消费者）的处置：契约见 design/05 §5.3.1，本文是给编码 agent 的执行提示词 |
+| ~~[2026-11-03 远端自举修复提示词](plans/2026-11-03-remote-bootstrap.md)~~ | **已作废**：`watch.py` / `bootstrap` 方案已删除，改为真实 runner。仅保留作历史记录 |
+| [2026-11-05 构建契约补齐（方案 B）](plans/2026-11-05-build-contract-skeleton.md) | 当前阻断项的设计：`build_test_package` 补出构建契约（骨架 + golden 插槽） |
+| [2026-11-05 PR v0.2.0 验收意见](plans/2026-11-05-pr-v0.2.0-review.md) | 对外部 PR 的逐条修改指导（M1/M2/M3） |
 
 ## 约定
 
