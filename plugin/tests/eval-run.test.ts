@@ -123,5 +123,26 @@ test('a later read of the same generation ignores a seeded results.json', async 
   })
   expect(report.status).toBe('accuracy_fail')
   expect(report.summary).toBe('fresh accuracy')
-  expect(slept).toBe(1)
+  // The immediate post-runner read already sees the fresh file, so no poll sleep is needed.
+  expect(slept).toBe(0)
+})
+
+test('a runner exit without a result becomes an error carrying the stderr excerpt', async () => {
+  const remote = new MemoryRemote()
+  remote.execHandler = () => ({ code: 2, stdout: '', stderr: 'line 1\nline 2\nbuild environment missing\n' })
+  const { report, state } = await runEvaluation({
+    files: remote,
+    localPackageDir: pack(),
+    generationId: 'gen-0123abcd',
+    inbox: '/in',
+    outbox: '/out',
+    timeoutMs: 1000,
+    intervalMs: 1000,
+    state: emptyState(),
+    config,
+  })
+  expect(report.status).toBe('error')
+  expect(report.summary).toContain('remote runner failed:')
+  expect(report.summary).toContain('build environment missing')
+  expect(state.lastReport?.summary).toContain('build environment missing')
 })

@@ -86,7 +86,7 @@ test('keeps an msprof-shaped analysis and drops a bad one', () => {
     generationId: 'gen-1',
     status: 'pass',
     analysis: {
-      source: 'msprof-mock',
+      source: 'msprof',
       bottleneck: 'memory',
       summary: 'aic_mte2_ratio 0.71',
       op: {
@@ -118,7 +118,7 @@ test('enhancement names the status and does not steer before any report', () => 
   const analyzed = applyReport(emptyState(), report({
     status: 'perf_fail',
     analysis: {
-      source: 'msprof-mock',
+      source: 'msprof',
       bottleneck: 'memory',
       summary: 'aic_mte2_ratio 0.71',
       op: null,

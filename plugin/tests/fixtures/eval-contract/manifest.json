@@ -1,0 +1,10 @@
+{
+  "generationId": "gen-fixture001",
+  "operatorName": "Gelu",
+  "performanceTargetUs": 40,
+  "params": {
+    "blockDim": 16,
+    "tileSize": 1024,
+    "approximation": "tanh"
+  }
+}
