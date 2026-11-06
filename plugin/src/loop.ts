@@ -22,6 +22,10 @@ export const Config: z<Config> = z.object({
   maxCompileRetries: z.number().required(),
   negativeStreakLimit: z.number().required(),
   convergenceThreshold: z.number().required(),
+  // Defaults keep the round working without the three newer policy keys.
+  stallRounds: z.number().default(2),
+  stallGain: z.number().default(0.03),
+  stallGap: z.number().default(1.5),
 })
 
 function notice(text: string) {
