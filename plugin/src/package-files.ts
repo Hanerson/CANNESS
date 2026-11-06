@@ -198,7 +198,12 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
   const firstOutput = outputs[0]!
   const reference = firstInput ?? firstOutput
   const totalElements = elementCount(reference)
-  const blockDim = DEFAULT_BLOCK_DIM
+  // Launch geometry: the spec may pin blockDim (issue 006: the 16 default caps a
+  // kernel at 40% of the AIV cores on a 40-core device, measured 1.96x).
+  const blockDim = spec.launch?.block_dim ?? DEFAULT_BLOCK_DIM
+  // Optional scratch space for the kernel, exposed as the tail of the tiling
+  // buffer (issue 013). 0 keeps the historical layout bit-for-bit.
+  const workspaceBytes = spec.launch?.workspace_bytes ?? 0
   const blockLength = Math.max(1, Math.ceil(totalElements / blockDim))
   const tileLength = Math.min(DEFAULT_TILE_LENGTH, totalElements)
   const threshold = maxAbsErrForDtype(firstOutput.dtype || firstInput.dtype)
@@ -216,10 +221,14 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     ...outputs.map((_tensor, index) => `GM_ADDR out${index}`),
     'GM_ADDR tiling',
   ].join(', ')
+  // C-style casts, not static_cast: `GM_ADDR` expands to `__gm__ uint8_t*`, an
+  // address space, and clang rejects `static_cast<void*, __gm__ uint8_t*>` with
+  // "casts away qualifiers". The knowledge base already documents this pitfall
+  // (AscendC_Compile_Run §5.5) but the generated main.cpp kept the other spelling.
   const kernelArgsCall = [
-    ...inputs.map((_tensor, index) => `static_cast<GM_ADDR>(in${index}.device)`),
-    ...outputs.map((_tensor, index) => `static_cast<GM_ADDR>(out${index}.device)`),
-    'static_cast<GM_ADDR>(tiling_device)',
+    ...inputs.map((_tensor, index) => `(GM_ADDR)in${index}.device`),
+    ...outputs.map((_tensor, index) => `(GM_ADDR)out${index}.device`),
+    '(GM_ADDR)tiling_device',
   ].join(', ')
 
   const values: Record<string, string> = {
@@ -235,6 +244,7 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     BLOCK_LENGTH: String(blockLength),
     TILE_LENGTH: String(tileLength),
     MAX_ABS_ERR: String(threshold),
+    WORKSPACE_BYTES: String(workspaceBytes),
     TENSOR_SETUP: tensorSetup,
     INPUT_LIST: inputList,
     OUTPUT_LIST: outputList,

@@ -11,10 +11,17 @@
 using DTYPE_X = {{DTYPE_X}};
 using DTYPE_Y = {{DTYPE_Y}};
 
+// `workspaceSize` makes a scratch buffer available to the kernel WITHOUT adding
+// a parameter to canness_kernel: main.cpp allocates sizeof(CannessTilingData) +
+// workspaceSize bytes and passes the same pointer, so the kernel reaches the
+// scratch area at
+//     (__gm__ uint8_t *)tiling + sizeof(CannessTilingData)
+// Kernels stay signature-compatible (issue 013); 0 means "no scratch".
 struct CannessTilingData {
     uint32_t totalLength;
     uint32_t blockLength;
     int64_t tileLength;
+    uint64_t workspaceSize;
 };
 
 // A __gm__ struct cannot be copied to local memory as a value, so read field
@@ -29,5 +36,6 @@ struct CannessTilingData {
         tilingData.totalLength = canness_gm_tiling__->totalLength;               \
         tilingData.blockLength = canness_gm_tiling__->blockLength;               \
         tilingData.tileLength = canness_gm_tiling__->tileLength;                 \
+        tilingData.workspaceSize = canness_gm_tiling__->workspaceSize;           \
     } while (0)
 #endif

@@ -40,7 +40,12 @@ FLAGS=(-x cce -std=c++17 "--cce-soc-version=$SOC_VERSION" --cce-soc-core-type=Ve
 "$BISHENG" "${FLAGS[@]}" "${INCLUDES[@]}" -include "$HERE/canness_tiling.h" \
   -c main.cpp -o main.o
 
-"$BISHENG" main.o kernel.o -o canness_run \
+# --allow-multiple-definition: both TUs include kernel_operator.h (the host
+# driver through canness_tiling.h), and that header *defines* g_tilingKey in
+# every TU, so a plain link fails with "duplicate symbol: g_tilingKey" on
+# CANN 9.0.0. Nothing in this contract uses TILING_KEY, so the duplicate is
+# harmless once the linker is allowed to pick one.
+"$BISHENG" main.o kernel.o -o canness_run -Wl,--allow-multiple-definition \
   -L"$CANN/aarch64-linux/lib64" -L"$CANN/aarch64-linux/devlib" \
   -lascendcl -lruntime -lstdc++ -lpthread -ldl -lm \
   "-Wl,-rpath,$CANN/aarch64-linux/lib64:$CANN/aarch64-linux/devlib"
