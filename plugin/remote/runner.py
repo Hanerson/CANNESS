@@ -345,14 +345,24 @@ def build_profile(
 ) -> dict:
     mean = sum(durations) / len(durations)
     first = rows[0]
+
+    def average_ratio(key: str) -> float | None:
+        """Mean of one aic-metrics column across the rows, ignoring empties."""
+        values = [v for v in (number(row_value(row, mapping, key)) for row in rows) if v is not None]
+        return sum(values) / len(values) if values else None
+
     ratios = {
-        'mac': number(row_value(first, mapping, 'mac')),
-        'mte2': number(row_value(first, mapping, 'mte2')),
-        'scalar': number(row_value(first, mapping, 'scalar')),
+        'mac': average_ratio('mac'),
+        'mte2': average_ratio('mte2'),
+        'scalar': average_ratio('scalar'),
     }
-    known = {key: value for key, value in ratios.items() if value is not None}
-    if known:
-        bottleneck = max(known, key=lambda key: known[key])
+    # Columns that exist but are filled with 0 mean the metrics were not
+    # collected for this run (CANN 9.0.0 only writes them with the matching
+    # --aic-metrics level). Treating those zeros as data made every AIV kernel
+    # look cube-bound, because max() over three equal zeros picks the first key.
+    collected = {key: value for key, value in ratios.items() if value is not None and value > 0}
+    if collected:
+        bottleneck = max(collected, key=lambda key: collected[key])
         bottleneck = {'mac': 'cube', 'mte2': 'memory', 'scalar': 'scalar'}[bottleneck]
     else:
         bottleneck = 'unknown'
@@ -369,10 +379,12 @@ def build_profile(
         'aicScalarRatio': ratios['scalar'],
         'cubeUtilizationPct': number(row_value(first, mapping, 'cube')),
     }
+    missing = '' if collected else ' aic-metrics were not collected for this run (all aic_* ratios are zero); no bottleneck can be named.'
     summary = (
         f'msprof {source_label}: Task Duration avg {mean:.3f}us over {len(durations)} rows; '
         f'aic_mac_ratio {op["aicMacRatio"]}, aic_mte2_ratio {op["aicMte2Ratio"]}, '
         f'aic_scalar_ratio {op["aicScalarRatio"]}.'
+        f'{missing}'
     )
     return {'bottleneck': bottleneck, 'summary': summary, 'op': op}
 
@@ -383,13 +395,19 @@ def profile_from_csv(outdir: Path, operator_name: str) -> tuple[dict | None, str
     ``kernelTimeUs`` is the arithmetic mean of every ``Task Duration(us)`` row
     in ``op_summary``. Only when no summary rows exist is the ``Avg`` column of
     ``op_statistic`` used; mixing both families would count the same run twice.
+
+    The msprof export layout is version dependent: newer toolchains put
+    ``mindstudio_profiler_output/`` directly under ``--output``, while CANN 9.0.0
+    nests it under ``PROF_<timestamp>/``. Search the whole ``--output`` tree so
+    both layouts resolve instead of reporting "no CSV" for a real profile.
     """
     root = outdir / CSV_DIR
-    if not root.is_dir():
-        return None, f'no CSV under {root} (mindstudio_profiler_output/ was not created)'
-    paths = sorted(root.rglob('*.csv'))
+    if root.is_dir():
+        paths = sorted(root.rglob('*.csv'))
+    else:
+        paths = sorted(outdir.rglob('*.csv'))
     if not paths:
-        return None, f'no CSV under {root}'
+        return None, f'no CSV under {outdir} (no {CSV_DIR}/ and no *.csv anywhere below it)'
     summary_paths = [path for path in paths if 'op_summary' in path.name.lower()]
     statistic_paths = [path for path in paths if 'op_statistic' in path.name.lower()]
 
