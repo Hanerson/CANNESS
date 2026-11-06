@@ -104,5 +104,8 @@ export function enhancementBlock(state: TaskState): string {
     `性能分析：${report.analysis?.summary ?? '无'}`,
     `有效迭代 ${state.validIterations}，编译重试 ${state.compileRetries}，超时 ${state.timeouts}，变差连续 ${state.negativeStreak}。`,
     '请修改四层代码后再次调用 build_test_package 和 run_evaluation。',
+    ...(report.status === 'compile_fail'
+      ? [`编译契约：kernel 入口必须是 extern "C" __global__ __aicore__ void canness_kernel(<输入…>, <输出…>, GM_ADDR tiling)，不要带 workspace 参数；签名不对会链接失败。`]
+      : []),
   ].join('\n')
 }

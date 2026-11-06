@@ -4,7 +4,7 @@
 
 It hands the loop — *submit a spec → generate the four operator layers → package a test bundle → upload it → wait for the evaluation → iterate within a budget* — to dsh's agent loop. CANNESS only owns the domain contract.
 
-[![version](https://img.shields.io/badge/version-v0.1.1-blue.svg)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v0.2.1-blue.svg)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A524.9-brightgreen.svg)](https://nodejs.org/)
 [![dsh](https://img.shields.io/badge/dsh-0.2.1--rc.3-purple.svg)](https://github.com/deepseek-ai/deepseek-harness)
@@ -318,12 +318,14 @@ Returns `{ generationId, operator_name }`. A validation failure throws `missing 
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `kernel` | string | yes | Body of `op_kernel/kernel.cpp` |
+| `kernel` | string | yes | Body of `op_kernel/kernel.cpp`; must define `void canness_kernel(<inputs…>, <outputs…>, GM_ADDR tiling)` |
 | `host` | string | yes | Body of `op_host/host.cpp` |
 | `api` | string | yes | Body of `op_api/api.cpp` |
 | `plugin` | string | yes | Body of `op_plugin/plugin.py` |
 
 Returns `{ operatorDir }`. Fails with `submit_spec first` when no spec was submitted.
+
+**The kernel entry is fixed**: the packaged `main.cpp` is an operator-independent host driver that only knows `extern "C" __global__ __aicore__ void canness_kernel(...)`, with the order "all inputs → all outputs → tiling pointer" and no `workspace` argument. A `void gelu(...)` entry fails at link time as an undefined symbol, which reads like a toolchain problem. `write_operator` and `build_test_package` both check the signature before packaging and reject a mismatch with the expected form.
 
 ### `build_test_package`
 

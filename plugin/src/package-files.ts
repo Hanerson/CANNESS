@@ -17,6 +17,62 @@ export type LayerName = keyof typeof LAYER_FILES
 /** Build contract v1 files rendered into every test package. */
 export const CONTRACT_FILES = ['build.sh', 'run_once.sh', 'main.cpp', 'golden.h', 'canness_tiling.h'] as const
 
+/**
+ * Kernel entry the build-contract `main.cpp` launches. It is fixed because the
+ * host driver is operator-independent: it knows how many tensors exist, not
+ * what the operator is called.
+ */
+export const KERNEL_ENTRY = 'canness_kernel'
+
+/** Verdict of {@link checkKernelEntry}. */
+export type KernelEntryCheck = { ok: true } | { ok: false; reason: string }
+
+const ENTRY_PATTERN = /\bvoid\s+([A-Za-z_]\w*)\s*\(([^()]*)\)/g
+
+/**
+ * Check that `op_kernel/kernel.cpp` defines the entry the contract launches.
+ *
+ * A kernel written as `void gelu(GM_ADDR x, GM_ADDR y, GM_ADDR workspace,
+ * GM_ADDR tiling)` links to nothing — `main.o` calls `canness_kernel`, so the
+ * link fails with an undefined symbol that says nothing about the real cause.
+ * Catching it here turns that into an actionable message before the package is
+ * ever uploaded.
+ * @param kernelBody - the `op_kernel/kernel.cpp` text.
+ * @returns whether the contract entry is present with the expected shape.
+ */
+export function checkKernelEntry(kernelBody: string): KernelEntryCheck {
+  const definitions: Array<{ name: string; params: string }> = []
+  for (const match of kernelBody.matchAll(ENTRY_PATTERN)) {
+    definitions.push({ name: match[1] ?? '', params: match[2] ?? '' })
+  }
+  const entry = definitions.find(item => item.name === KERNEL_ENTRY)
+  if (entry === undefined) {
+    const names = definitions.map(item => item.name).filter(name => name.length > 0)
+    const found = names.length === 0 ? 'none' : names.join(', ')
+    return {
+      ok: false,
+      reason: `op_kernel/kernel.cpp must define "void ${KERNEL_ENTRY}(<inputs>, <outputs>, GM_ADDR tiling)"; `
+        + `the build-contract main.cpp launches that exact entry, so another name (found: ${found}) fails to link`,
+    }
+  }
+  const params = entry.params.split(',').map(part => part.trim()).filter(part => part.length > 0)
+  if (params.some(part => /\bworkspace\b/.test(part))) {
+    return {
+      ok: false,
+      reason: `void ${KERNEL_ENTRY}(...) must not take a workspace parameter; `
+        + 'the build contract passes the inputs, the outputs and the tiling pointer, nothing else',
+    }
+  }
+  const last = params[params.length - 1] ?? ''
+  if (!/\btiling\b/.test(last)) {
+    return {
+      ok: false,
+      reason: `void ${KERNEL_ENTRY}(...) must end with the tiling pointer (GM_ADDR tiling), got "${last}" instead`,
+    }
+  }
+  return { ok: true }
+}
+
 const TEMPLATE_RELATIVE = 'templates/build-contract'
 const DEFAULT_SOC_VERSION = 'Ascend910B2'
 const DEFAULT_TOTAL_ELEMENTS = 32768
@@ -198,6 +254,11 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
 export function buildTestPackage(workspace: string, generationId: string, spec: OperatorSpec): string {
   const src = join(workspace, 'operators', generationId)
   const dest = join(workspace, 'packages', generationId)
+  // Check the kernel entry before touching the package: a mismatched name only
+  // fails later as an undefined symbol at link time, which reads like a
+  // toolchain problem instead of a contract problem.
+  const entry = checkKernelEntry(readFileSync(join(src, 'op_kernel/kernel.cpp'), 'utf8'))
+  if (!entry.ok) throw new Error(entry.reason)
   rmSync(dest, { recursive: true, force: true })
   mkdirSync(dest, { recursive: true })
   cpSync(src, dest, { recursive: true })

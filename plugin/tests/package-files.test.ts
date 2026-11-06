@@ -4,12 +4,20 @@ import { join, relative, sep } from 'node:path'
 import { expect, test } from 'vitest'
 import { newGenerationId } from '../src/ids.ts'
 import {
-  buildContractTemplateDir, buildTestPackage, CONTRACT_FILES, LAYER_FILES, maxAbsErrForDtype,
-  renderBuildContract, writeOperator,
+  buildContractTemplateDir, buildTestPackage, checkKernelEntry, CONTRACT_FILES, KERNEL_ENTRY, LAYER_FILES,
+  maxAbsErrForDtype, renderBuildContract, writeOperator,
 } from '../src/package-files.ts'
 import { parseSpec } from '../src/spec.ts'
 import { emptyState } from '../src/policy.ts'
 import { loadState, saveState } from '../src/state-file.ts'
+
+/** A kernel that satisfies build contract v1. */
+const VALID_KERNEL = [
+  'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR in0, GM_ADDR out0, GM_ADDR tiling)',
+  '{',
+  '    GET_TILING_DATA(t, tiling);',
+  '}',
+].join('\n')
 
 function specFor(dtype: string, socVersion = 'Ascend910B4') {
   return parseSpec({
@@ -28,7 +36,7 @@ function specFor(dtype: string, socVersion = 'Ascend910B4') {
 function packageFor(spec = specFor('float16')): { workspace: string, pkg: string, opDir: string } {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-ws-'))
   const opDir = writeOperator(workspace, 'gen-01234567', {
-    kernel: 'K', host: 'H', api: 'A', plugin: 'P',
+    kernel: VALID_KERNEL, host: 'H', api: 'A', plugin: 'P',
   })
   return { workspace, pkg: buildTestPackage(workspace, 'gen-01234567', spec), opDir }
 }
@@ -48,6 +56,37 @@ function diskFiles(root: string): string[] {
 
 test('generation ids keep the gen- prefix and 8 hex chars', () => {
   expect(newGenerationId('01234567-89ab-cdef-0123-456789abcdef')).toBe('gen-01234567')
+})
+
+test('the contract entry is accepted only with the fixed name and parameter order', () => {
+  expect(KERNEL_ENTRY).toBe('canness_kernel')
+  expect(checkKernelEntry(VALID_KERNEL)).toEqual({ ok: true })
+
+  // Another name links to nothing: main.cpp calls canness_kernel.
+  const renamed = checkKernelEntry('extern "C" __global__ __aicore__ void gelu(GM_ADDR x, GM_ADDR y, GM_ADDR tiling) {}')
+  expect(renamed.ok).toBe(false)
+  expect(renamed.ok ? '' : renamed.reason).toContain('canness_kernel')
+  expect(renamed.ok ? '' : renamed.reason).toContain('found: gelu')
+
+  // The contract passes inputs, outputs and tiling — no workspace buffer.
+  const withWorkspace = checkKernelEntry('void canness_kernel(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {}')
+  expect(withWorkspace.ok).toBe(false)
+  expect(withWorkspace.ok ? '' : withWorkspace.reason).toContain('workspace')
+
+  // The tiling pointer is the last parameter.
+  const noTiling = checkKernelEntry('void canness_kernel(GM_ADDR x, GM_ADDR y) {}')
+  expect(noTiling.ok).toBe(false)
+  expect(noTiling.ok ? '' : noTiling.reason).toContain('tiling')
+})
+
+test('buildTestPackage refuses a kernel that does not define the contract entry', () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-ws-'))
+  writeOperator(workspace, 'gen-01234567', {
+    kernel: 'extern "C" __global__ __aicore__ void gelu(GM_ADDR x, GM_ADDR y, GM_ADDR tiling) {}',
+    host: 'H', api: 'A', plugin: 'P',
+  })
+  expect(() => buildTestPackage(workspace, 'gen-01234567', specFor('float16')))
+    .toThrow(/must define "void canness_kernel/)
 })
 
 test('writeOperator and buildTestPackage lay down the four layers and manifest', () => {

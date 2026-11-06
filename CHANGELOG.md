@@ -4,11 +4,18 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-06
+
 ### 新增
 
-- **构建契约 v1**：`build_test_package` 在四层之外渲染 `build.sh`、`run_once.sh`、`main.cpp`、`golden.h`、`canness_tiling.h`，生成按 dtype 推导阈值的 `config.json`，并让 `manifest.json.files` 反映实际落盘清单（新增 `layers` / `buildContract` 字段）。kernel 入口固定为 `canness_kernel`（输入 → 输出 → tiling），tiling 统一用通用 `CannessTilingData`。
+- **构建契约 v1**：`build_test_package` 在四层之外渲染 `build.sh`、`run_once.sh`、`main.cpp`、`golden.h`、`canness_tiling.h`，生成按 dtype 推导阈值的 `config.json`，并让 `manifest.json.files` 反映实际落盘清单（新增 `layers` / `buildContract` 字段）。tiling 统一用通用 `CannessTilingData`。
 - **`write_package_file`**：模型唯一可写的包内文件是 `golden.h`；占位实现判 `accuracy_fail`，摘要为 `golden not implemented`，`runRecord.params.golden` 记录 `placeholder` / `custom`。
 - **CANNLab 隧道健康检查**：`run_evaluation` 在连接前探测 helper 的 `/heartbeat` 并续约一次；隧道断开返回 `tunnel is down; reconnect from Settings → CANNESS`。
+
+### 修复
+
+- **kernel 入口签名校验**：包里的 `main.cpp` 只调用 `extern "C" __global__ __aicore__ void canness_kernel(<输入…>, <输出…>, GM_ADDR tiling)`，但此前没有任何环节保证 `kernel.cpp` 真的定义了它——写成 `void gelu(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)` 时链接会报 undefined symbol，读起来像工具链问题，模型改几轮也定位不到。`write_operator` 与 `build_test_package` 现在都在落盘前校验入口名、无 `workspace` 参数、末位为 `tiling`，不匹配直接报错并给出正确形式；`canness-loop` 的编译失败增强块也带上这条契约。
+- **版本徽章漂移**：README 徽章停在 `v0.1.1`，与 `package.json` 的 `0.2.0` 不一致；随本次发布统一到 `v0.2.1`。
 
 ### 变更
 

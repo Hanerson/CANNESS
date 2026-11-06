@@ -5,7 +5,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { newGenerationId } from './ids.js'
-import { buildTestPackage, writeOperator } from './package-files.js'
+import { buildTestPackage, checkKernelEntry, KERNEL_ENTRY, writeOperator } from './package-files.js'
 import { emptyState } from './policy.js'
 import { parseSpec } from './spec.js'
 import { loadState, saveState } from './state-file.js'
@@ -55,9 +55,14 @@ export function apply(ctx: Context, config: Config): void {
   }))
   ctx.tools.register(defineTool({
     name: 'write_operator',
-    description: 'Write the four operator layer files for the current generation.',
+    description: [
+      'Write the four operator layer files for the current generation.',
+      `The kernel entry point is fixed: op_kernel/kernel.cpp must define "extern \"C\" __global__ __aicore__ void ${KERNEL_ENTRY}(<inputs>, <outputs>, GM_ADDR tiling)" —`,
+      'inputs first, then outputs, then the tiling pointer, and no workspace argument.',
+      'The package\'s main.cpp calls that exact symbol, so any other name or parameter order fails to link.',
+    ].join(' '),
     parameters: {
-      kernel: { type: 'string', required: true, description: 'op_kernel/kernel.cpp body' },
+      kernel: { type: 'string', required: true, description: `op_kernel/kernel.cpp body; must define void ${KERNEL_ENTRY}(<inputs>, <outputs>, GM_ADDR tiling)` },
       host: { type: 'string', required: true, description: 'op_host/host.cpp body' },
       api: { type: 'string', required: true, description: 'op_api/api.cpp body' },
       plugin: { type: 'string', required: true, description: 'op_plugin/plugin.py body' },
@@ -73,6 +78,8 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args) {
       const state = loadState(path)
       if (state.generationId == null || state.spec == null) throw new Error('submit_spec first')
+      const entry = checkKernelEntry(args.kernel)
+      if (!entry.ok) throw new Error(entry.reason)
       const operatorDir = writeOperator(config.workspace, state.generationId, {
         kernel: args.kernel, host: args.host, api: args.api, plugin: args.plugin,
       })
@@ -86,6 +93,8 @@ export function apply(ctx: Context, config: Config): void {
       'build.sh, run_once.sh, main.cpp, golden.h, canness_tiling.h, config.json and manifest.json.',
       'main.cpp/build.sh/run_once.sh/canness_tiling.h are rendered by the plugin and are operator-independent;',
       'the accuracy reference comes from golden.h (the model-owned extension point).',
+      `The kernel entry must be void ${KERNEL_ENTRY}(<inputs>, <outputs>, GM_ADDR tiling); this tool refuses to`,
+      'package a kernel that does not define it.',
       'manifest.json.files lists what actually landed on disk; manifest.json.layers lists the four layers.',
     ].join(' '),
     parameters: {},

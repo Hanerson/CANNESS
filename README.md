@@ -4,7 +4,7 @@
 
 把「提交规格书 → 生成四层算子 → 打测试包 → 上传远端 → 等待评测 → 按预算续轮」这条闭环，交给 dsh 的 agent loop 驱动；CANNESS 只负责其中的领域契约。
 
-[![version](https://img.shields.io/badge/version-v0.1.1-blue.svg)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v0.2.1-blue.svg)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A524.9-brightgreen.svg)](https://nodejs.org/)
 [![dsh](https://img.shields.io/badge/dsh-0.2.1--rc.3-purple.svg)](https://github.com/deepseek-ai/deepseek-harness)
@@ -320,12 +320,14 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `kernel` | string | 是 | `op_kernel/kernel.cpp` 内容 |
+| `kernel` | string | 是 | `op_kernel/kernel.cpp` 内容；必须定义 `void canness_kernel(<输入…>, <输出…>, GM_ADDR tiling)` |
 | `host` | string | 是 | `op_host/host.cpp` 内容 |
 | `api` | string | 是 | `op_api/api.cpp` 内容 |
 | `plugin` | string | 是 | `op_plugin/plugin.py` 内容 |
 
 返回 `{ operatorDir }`。未调用 `submit_spec` 时报 `submit_spec first`。
+
+**kernel 入口是固定的**：包里的 `main.cpp` 是算子无关的宿主驱动，只认 `extern "C" __global__ __aicore__ void canness_kernel(...)`，参数顺序为「全部输入 → 全部输出 → tiling 指针」，不能带 `workspace` 参数。写成 `void gelu(...)` 会在链接时报 undefined symbol，看起来像工具链问题。`write_operator` 与 `build_test_package` 都会在打包前校验签名，不匹配直接报错并给出正确形式。
 
 ### `build_test_package`
 
