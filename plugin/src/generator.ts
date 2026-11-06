@@ -83,11 +83,19 @@ export function apply(ctx: Context, config: Config): void {
               previousPassKernelTimeUs: prior.previousPassKernelTimeUs,
               lastPassKernelTimeUs: prior.lastPassKernelTimeUs,
               recentKernelTimeUs: prior.recentKernelTimeUs ?? [],
+              // A new generation stays owned by the session that started the
+              // task; nothing is owed until it is evaluated.
+              ownerSessionId: prior.ownerSessionId ?? null,
             }
           : {},
         generationId,
         spec,
         targetRelaxedUs: relaxedTargetFromUs,
+        // A fresh generation owes nothing until it has been evaluated, and it
+        // keeps the owner recorded above so the loop still knows whose task it
+        // is — otherwise a resubmission would silently orphan the task and the
+        // loop would fall silent for the session that owns it.
+        pendingSteer: false,
       })
       return {
         generationId,

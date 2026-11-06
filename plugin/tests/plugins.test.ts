@@ -166,6 +166,39 @@ function trackedRemote(events: string[], upload?: () => Promise<void>): { files:
   return { files, remote }
 }
 
+test('run_evaluation claims the task for the calling session and owes exactly one retry', async () => {
+  const ready = readyPackage()
+  const remote = trackedRemote([])
+  remote.remote.appearOnRead(`/out/${ready.generationId}/results.json`, Buffer.from(JSON.stringify({
+    generationId: ready.generationId,
+    status: 'compile_fail',
+    compile: { ok: false, log: 'error: x' },
+    correctness: { ok: false, maxRelativeError: null },
+    performance: { kernelTimeUs: null, targetUs: 150 },
+    summary: 'failed compile',
+  })), 1)
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(ready.workspace, { privateKeyPath: vol(join(ready.workspace, 'id_key')) }),
+    async () => remote.files)
+  const statePath = join(ready.workspace, '.canness', 'state.json')
+  // Start from the state readyPackage() wrote (it owns the generation) and only
+  // clear the ownership fields this test is about.
+  const before = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>
+  saveState(statePath, { ...before, ownerSessionId: null, pendingSteer: false } as never)
+
+  await ctx.toolsRegistered[0]!.execute({}, { agent: { session: { id: 'session-a' } } })
+
+  const state = JSON.parse(readFileSync(statePath, 'utf8')) as { ownerSessionId?: string, pendingSteer?: boolean }
+  expect(state.ownerSessionId).toBe('session-a')
+  expect(state.pendingSteer).toBe(true)
+
+  // A later call from another session takes over the task rather than leaving
+  // two sessions believing they own it.
+  await ctx.toolsRegistered[0]!.execute({}, { agent: { session: { id: 'session-b' } } })
+  const taken = JSON.parse(readFileSync(statePath, 'utf8')) as { ownerSessionId?: string }
+  expect(taken.ownerSessionId).toBe('session-b')
+})
+
 test('run_evaluation closes after a finished attempt and after an upload failure', async () => {
   const finishedEvents: string[] = []
   const finished = readyPackage()
@@ -433,31 +466,90 @@ test('write_package_file owns golden.h and rejects every other path', async () =
   await expect(write.execute({ path: 'build.sh', content: 'x' })).rejects.toThrow('only accepts golden.h')
 })
 
-test('pre-step appends a retry only when shouldSteer is true', async () => {
+test('pre-step appends a retry only when an evaluation owes one and this session owns it', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
   const lp = fakeCtx()
   loop.apply(lp as never, { workspace, ...policy })
   const pre = lp.listeners.find(item => item.event === 'agent/pre-step')!
   const enter = async () => ({ kind: 'enter' as const, messages: [] as { content: { type: string; text: string }[] }[] })
+  const owner = { agent: { session: { id: 'session-a' } } }
+  const stranger = { agent: { session: { id: 'session-b' } } }
+  const statePath = join(workspace, '.canness', 'state.json')
 
-  saveState(join(workspace, '.canness', 'state.json'), {
-    ...emptyState(), compileRetries: 3, lastReport: failReport('compile_fail'),
+  // Stopped by policy: nothing is owed even though the session owns it.
+  saveState(statePath, {
+    ...emptyState(),
+    ownerSessionId: 'session-a',
+    pendingSteer: true,
+    compileRetries: 3,
+    lastReport: failReport('compile_fail'),
   })
-  const stopped = await pre.fn({}, enter)
-  expect(stopped.messages).toHaveLength(0)
+  expect((await pre.fn(owner, enter)).messages).toHaveLength(0)
 
-  saveState(join(workspace, '.canness', 'state.json'), {
-    ...emptyState(), compileRetries: 1, lastReport: failReport('compile_fail'),
+  // Owed, owned, and policy allows it: exactly one retry.
+  saveState(statePath, {
+    ...emptyState(),
+    ownerSessionId: 'session-a',
+    pendingSteer: true,
+    compileRetries: 1,
+    lastReport: failReport('compile_fail'),
   })
-  const steered = await pre.fn({}, enter)
+  const steered = await pre.fn(owner, enter)
   expect(steered.messages).toHaveLength(1)
   const text = steered.messages[0].content.find((block: { type: string; text?: string }) => block.type === 'text')?.text
   expect(text).toContain('compile_fail')
   expect(text).toContain('run_evaluation')
 
-  const duplicate = await pre.fn({}, async () => ({
-    kind: 'enter' as const,
-    messages: [{ content: [{ type: 'text', text: text! }] }],
-  }))
-  expect(duplicate.messages).toHaveLength(1)
+  // The retry was consumed by the injection above.
+  expect((await pre.fn(owner, enter)).messages).toHaveLength(0)
+
+  // Same state, different session: quiet, and it does not consume the retry.
+  saveState(statePath, { ...emptyState(), ownerSessionId: 'session-a', pendingSteer: true, lastReport: failReport('compile_fail') })
+  expect((await pre.fn(stranger, enter)).messages).toHaveLength(0)
+  expect((await pre.fn(owner, enter)).messages).toHaveLength(1)
+
+  // A state file written before ownership existed is not guessed at.
+  saveState(statePath, { ...emptyState(), pendingSteer: true, lastReport: failReport('compile_fail') })
+  expect((await pre.fn(owner, enter)).messages).toHaveLength(0)
+
+  // Owed nothing (no evaluation since the last retry): quiet.
+  saveState(statePath, {
+    ...emptyState(),
+    ownerSessionId: 'session-a',
+    pendingSteer: false,
+    lastReport: failReport('compile_fail'),
+  })
+  expect((await pre.fn(owner, enter)).messages).toHaveLength(0)
+})
+
+test('turn-stopping steers once per owed retry, and only for the owning session', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
+  const lp = fakeCtx()
+  loop.apply(lp as never, { workspace, ...policy })
+  const stopping = lp.listeners.find(item => item.event === 'agent/turn-stopping')!
+  const statePath = join(workspace, '.canness', 'state.json')
+  const steered: string[] = []
+  const agentFor = (id: string) => ({ agent: { session: { id }, steer: (message: { content: { text?: string }[] }) => {
+    steered.push(message.content[0]?.text ?? '')
+  } } })
+
+  saveState(statePath, {
+    ...emptyState(), ownerSessionId: 'session-a', pendingSteer: true, lastReport: failReport('perf_fail'),
+  })
+  stopping.fn(agentFor('session-b'))
+  expect(steered).toHaveLength(0)
+
+  stopping.fn(agentFor('session-a'))
+  expect(steered).toHaveLength(1)
+
+  // Consumed: a second turn end in the same session does not steer again.
+  stopping.fn(agentFor('session-a'))
+  expect(steered).toHaveLength(1)
+
+  // A new report owes a new retry.
+  saveState(statePath, {
+    ...emptyState(), ownerSessionId: 'session-a', pendingSteer: true, lastReport: failReport('perf_fail'),
+  })
+  stopping.fn(agentFor('session-a'))
+  expect(steered).toHaveLength(2)
 })

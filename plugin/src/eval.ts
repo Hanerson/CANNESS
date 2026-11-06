@@ -16,6 +16,11 @@ import { stopReason, targetGap, type PolicyConfig, type StopReason, type TaskSta
 export const name = 'canness-eval'
 export const inject = ['tools']
 
+/** The slice of a tool run context this plugin reads: who is calling. */
+interface ToolAgentContext {
+  agent?: { session?: { id?: string } }
+}
+
 // Every field the settings card edits must be volatile: the dsh settings
 // service refuses writes to non-volatile paths, and volatile references are
 // re-read per operation so a card save takes effect without a remount.
@@ -385,9 +390,13 @@ export function apply(
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    async execute() {
+    async execute(_args: unknown, exec?: ToolAgentContext) {
       const cfg = snapshot(config)
       const state = loadState(statePath)
+      // The first evaluation claims the task for this session. Without an
+      // owner the loop stays quiet, which is what keeps one session's failure
+      // from driving every other session in the profile.
+      const owner = exec?.agent?.session?.id
       const fail = (report: EvalReport): RunEvaluationValue => withPaths(report, workspace, state.generationId, cfg.outbox)
       if (cfg.host === '') return fail(emptyHostReport(state.generationId))
       if (state.generationId == null) throw new Error('submit_spec first')
@@ -431,7 +440,12 @@ export function apply(
           state,
           config: policyOf(config),
         })
-        saveState(statePath, next)
+        saveState(statePath, {
+          ...next,
+          ownerSessionId: owner ?? state.ownerSessionId ?? null,
+          // One retry is owed for this report, and only for it.
+          pendingSteer: true,
+        })
         return fail(report)
       } finally {
         await close()

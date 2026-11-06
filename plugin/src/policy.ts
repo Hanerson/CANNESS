@@ -41,6 +41,24 @@ export interface TaskState {
   recentKernelTimeUs?: number[]
   /** The target a later spec replaced with a larger one, so a pass got cheaper. */
   targetRelaxedUs?: number | null
+  /**
+   * The session that owns this task.
+   *
+   * The loop used to drive every session in the profile: the state file is
+   * shared and the listeners are global, so one session's `perf_fail` made a
+   * session that never ran the operator report a retry 40 times. Only the
+   * session recorded here is driven; a state file without an owner stays quiet
+   * until some session claims it by evaluating.
+   */
+  ownerSessionId?: string | null
+  /**
+   * One retry is owed for the newest report.
+   *
+   * Set when an evaluation writes a report and consumed by the loop before it
+   * steers. Without it the loop steered at every turn end, including turns that
+   * never touched the operator — which is how 232 prompts landed in 36 minutes.
+   */
+  pendingSteer?: boolean
   lastReport: EvalReport | null
 }
 
@@ -60,8 +78,25 @@ export function emptyState(): TaskState {
     lastPassKernelTimeUs: null,
     recentKernelTimeUs: [],
     targetRelaxedUs: null,
+    ownerSessionId: null,
+    pendingSteer: false,
     lastReport: null,
   }
+}
+
+/**
+ * Whether this session is the one the task belongs to.
+ *
+ * A state file written before ownership existed has no owner, and guessing one
+ * is what made the loop reach every session; those files stay quiet until a
+ * session claims them by running an evaluation.
+ * @param state - the stored fold.
+ * @param sessionId - the session asking.
+ * @returns true only for the recorded owner.
+ */
+export function ownsSession(state: TaskState, sessionId: string | undefined): boolean {
+  const owner = state.ownerSessionId
+  return owner != null && owner.length > 0 && owner === sessionId
 }
 
 export function applyReport(state: TaskState, report: EvalReport): TaskState {
