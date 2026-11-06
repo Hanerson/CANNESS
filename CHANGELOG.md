@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **构建契约 v1**：`build_test_package` 在四层之外渲染 `build.sh`、`run_once.sh`、`main.cpp`、`golden.h`、`canness_tiling.h`，生成按 dtype 推导阈值的 `config.json`，并让 `manifest.json.files` 反映实际落盘清单（新增 `layers` / `buildContract` 字段）。kernel 入口固定为 `canness_kernel`（输入 → 输出 → tiling），tiling 统一用通用 `CannessTilingData`。
+- **`write_package_file`**：模型唯一可写的包内文件是 `golden.h`；占位实现判 `accuracy_fail`，摘要为 `golden not implemented`，`runRecord.params.golden` 记录 `placeholder` / `custom`。
+- **CANNLab 隧道健康检查**：`run_evaluation` 在连接前探测 helper 的 `/heartbeat` 并续约一次；隧道断开返回 `tunnel is down; reconnect from Settings → CANNESS`。
+
+### 变更
+
+- **`kernelTimeUs` 口径固定**：优先 `op_summary` 全部行的 `Task Duration(us)` 算术平均；只有聚合文件时取 `op_statistic` 的 `Avg` 列；两者都没有时 `status: "error"` 并列出搜索过的目录与 CSV。
+- **`fetch_remote_file` 收紧**：`remotePath` 必须为绝对路径，读取范围仅限 `outbox` 与当前 generation 的 `inbox/<generationId>`。
+- **移除 `bootstrap` / `bootstrapCommand` 与对应文档**：远端不再需要 inbox 消费者；评测由 `remote/runner.py` 执行包内构建契约。历史条目保留在 v0.1.1。
+
 ### 清理
 
 - **文档归位**：根 README、README.en.md、`plugin/README.md` 与 `docs/design/05` 里残留的 `watch.py` / `bootstrap` / `bootstrapCommand` / `msprof-mock` / SFTP 描述全部改为真实 runner 的说法；`docs/README.md` 把已作废的远端自举计划标记为历史，并登记构建契约与 PR 验收两份新文档。

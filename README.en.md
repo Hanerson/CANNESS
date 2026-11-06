@@ -45,14 +45,14 @@ CANNESS gives that loop to an agent, with sharp boundaries:
 | **CANNESS plugin** | Domain contract: spec, four-layer files, test package, evaluation report, knowledge base, iteration budget |
 | **Remote host** | Actually runs the compile, accuracy check, performance collection and msprof |
 
-Nothing is compiled locally, no CANN call is made locally, and no cloud API is involved. Evaluation happens on your own machine with the CANN toolchain; CANNESS only requires that it accepts SSH. Evaluation runs through `runner.py` uploaded to the host, and the test package must ship the build contract (see [9.1](#91-layout)).
+Nothing is compiled locally, no CANN call is made locally, and no cloud API is involved. Evaluation happens on a remote machine with the CANN toolchain (`bisheng` and `msprof` included), and CANNESS only requires that it accepts SSH. `run_evaluation` uploads the test package; `remote/runner.py` then runs the package's `build.sh`, `run_once.sh` and the real `msprof` (see [9.1](#91-layout)).
 
 ## 2. Features
 
 - **Spec-driven** — `submit_spec` validates field by field. A missing field fails with its path (`missing performance_target.metric`) and writes no half-baked state, so the model turns around and asks the user.
 - **Four-layer output** — `write_operator` writes `op_kernel`, `op_host`, `op_api` and `op_plugin` in one call.
-- **Self-contained test package** — `build_test_package` copies the four layers and adds a `manifest.json`; the remote side can compile it as-is.
-- **Plain SSH transport** — exec-channel upload (base64 tar) plus a remote runner and result polling over `ssh2`, with private-key or password authentication; the password lives in dsh's credential store.
+- **Self-contained test package** — `build_test_package` assembles the four layers, build contract (`build.sh` / `run_once.sh` / `main.cpp` / `golden.h` / `canness_tiling.h`), `config.json` and `manifest.json`; the remote side can compile and run it as-is.
+- **Plain SSH transport** — `exec` + base64 tar upload (no remote `sftp-server` needed) plus result polling over `ssh2`, with private-key or password authentication; the password lives in dsh's credential store.
 - **Budget and stop conditions** — valid iterations, compile retries, timeouts, performance regression streak, convergence and target met are judged independently.
 - **Automatic continuation** — `canness-loop` steers another round carrying the evaluation context from `agent/turn-stopping`, without the user pushing it.
 - **Performance analysis built in** — msprof-shaped `analysis` (bottleneck, MAC/MTE2/Scalar ratios, cube utilization) is parsed and fed straight into the retry prompt.
@@ -74,7 +74,8 @@ Nothing is compiled locally, no CANN call is made locally, and no cloud API is i
 │                                                                                  │
 │  canness-knowledge  ──► kb_search                                                │
 │  canness-generator  ──► submit_spec · write_operator · build_test_package        │
-│  canness-eval       ──► run_evaluation ──── exec ────► remote NPU host           │
+│                     ──► write_package_file (golden.h only)                       │
+│  canness-eval       ──► run_evaluation · fetch_remote_file ─ SSH exec ─► NPU     │
 │  canness-loop       ──► budget and stop policy (two event listeners)             │
 │  canness (client)   ──► Web settings card                                        │
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -86,8 +87,8 @@ Nothing is compiled locally, no CANN call is made locally, and no cloud API is i
 |---|---|---|---|
 | `canness` | `dsh-canness` | — | — (the anchor row for the browser half) |
 | `canness-knowledge` | `dsh-canness/knowledge` | `kb_search` | — |
-| `canness-generator` | `dsh-canness/generator` | `submit_spec`, `write_operator`, `build_test_package` | — |
-| `canness-eval` | `dsh-canness/eval` | `run_evaluation` | — |
+| `canness-generator` | `dsh-canness/generator` | `submit_spec`, `write_operator`, `build_test_package`, `write_package_file` | — |
+| `canness-eval` | `dsh-canness/eval` | `run_evaluation`, `fetch_remote_file` | — |
 | `canness-loop` | `dsh-canness/loop` | — | `agent/pre-step`, `agent/turn-stopping` |
 | `canness-remote` | `dsh-canness/remote-api` | — | — (HTTP routes on `webServer` for the reachability check and the CANNLab connection; see 9.4) |
 
@@ -123,8 +124,8 @@ flowchart LR
 2. `submit_spec` validates the spec, mints a `generationId` (e.g. `gen-1a2b3c4d`) and writes the state file.
 3. `kb_search` retrieves reference implementations and tiling hints by operator name.
 4. `write_operator` writes the four layers to `{workspace}/operators/<generationId>/`.
-5. `build_test_package` assembles `{workspace}/packages/<generationId>/` with a `manifest.json`.
-6. `run_evaluation` uploads to `{inbox}/<generationId>/`, polls `{outbox}/<generationId>/results.json` and returns the parsed report as the tool result.
+5. `build_test_package` assembles `{workspace}/packages/<generationId>/`: four layers + build contract + `config.json` + `manifest.json`; the model fills the accuracy formula with `write_package_file('golden.h', ...)` when needed.
+6. `run_evaluation` uploads to `{inbox}/<generationId>/`, where `runner.py` runs `build.sh` / `run_once.sh` / `msprof`, then polls `{outbox}/<generationId>/results.json` and returns the parsed report as the tool result.
 7. `canness-loop` decides whether to steer another round, carrying the failure context in an enhancement block.
 
 ## 5. Requirements
@@ -134,7 +135,7 @@ flowchart LR
 | Node.js | `>= 24.9.0` | Plugin runtime |
 | pnpm | `>= 10` | Tested with `11.28.5` |
 | dsh | `>= 0.2.0 < 0.3.0` | Reference version `0.2.1-rc.3` |
-| Remote host (optional) | Linux + sshd | Real CANN / msprof optional; not needed for the mock |
+| Remote host (optional) | Linux + sshd + NPU | Needs the CANN toolchain (`bisheng`, `msprof`); compile and evaluation happen only there |
 
 dsh may come from either source; both command forms are given below:
 
@@ -326,20 +327,44 @@ Returns `{ operatorDir }`. Fails with `submit_spec first` when no spec was submi
 
 ### `build_test_package`
 
-No parameters. Returns `{ packageDir }`. Copies the current generation's four layers and writes `manifest.json`:
+No parameters. Returns `{ packageDir }`. Copies the current generation's four layers and renders
+**build contract v1**: `build.sh`, `run_once.sh`, `main.cpp`, `golden.h`, `canness_tiling.h`, then
+writes `config.json` and `manifest.json`. `main.cpp` is generated from the spec's input/output count
+and dtypes; `build.sh` pins the soc version and bisheng flags; `config.json` derives `maxAbsErr`
+from the dtype (fp16 `2^-10`, bf16 `2^-7`, fp32 `2^-13`).
 
 ```json
 {
   "generationId": "gen-1a2b3c4d",
   "operatorName": "Add",
   "performanceTargetUs": 8,
-  "files": ["op_kernel/kernel.cpp", "op_host/host.cpp", "op_api/api.cpp", "op_plugin/plugin.py"]
+  "buildContract": "v1",
+  "layers": ["op_kernel/kernel.cpp", "op_host/host.cpp", "op_api/api.cpp", "op_plugin/plugin.py"],
+  "files": [
+    "build.sh", "canness_tiling.h", "config.json", "golden.h", "main.cpp",
+    "manifest.json", "op_api/api.cpp", "op_host/host.cpp", "op_kernel/kernel.cpp",
+    "op_plugin/plugin.py", "run_once.sh"
+  ]
 }
 ```
 
+`files` is the actual on-disk list (including `manifest.json` itself), stably sorted; `layers` keeps the four layers.
+
+### `write_package_file`
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | Only `golden.h` is accepted |
+| `content` | string | yes | Complete `golden.h` body |
+
+The only package file the model may own. It writes `operators/<generationId>/golden.h` (and the
+existing `packages/<generationId>/golden.h`), after which `build_test_package` should run again.
+The template starts with a placeholder: while `CANNESS_GOLDEN_PLACEHOLDER` remains, evaluation
+reports `accuracy_fail` with `golden not implemented: ...` and never fakes a pass.
+
 ### `run_evaluation`
 
-No parameters. Returns an evaluation report (see [9.2](#92-result-file)). These cases do **not** throw; they return a report with `status: "error"`: empty `host`, missing credentials, SSH connection failure, remote runner failure, budget exhausted. These cases throw: no `submit_spec` (`submit_spec first`), no `build_test_package` (`build_test_package first`).
+No parameters. Returns an evaluation report (see [9.2](#92-result-file)). These cases do **not** throw; they return a report with `status: "error"`: empty `host`, missing credentials, a down CANNLab tunnel, SSH connection failure, budget exhausted. These cases throw: no `submit_spec` (`submit_spec first`), no `build_test_package` (`build_test_package first`).
 
 ## 8. Configuration reference
 
@@ -423,6 +448,12 @@ Affects only the settings card's reachability check and the CANNLab connection; 
 {inbox}/{generationId}/op_host/host.cpp
 {inbox}/{generationId}/op_api/api.cpp
 {inbox}/{generationId}/op_plugin/plugin.py
+{inbox}/{generationId}/build.sh          # template-rendered: compile + link
+{inbox}/{generationId}/run_once.sh       # template-rendered: one run, CANNESS_RESULT
+{inbox}/{generationId}/main.cpp          # template-rendered: ACL host driver
+{inbox}/{generationId}/golden.h          # placeholder or model-supplied reference
+{inbox}/{generationId}/canness_tiling.h  # generic CannessTilingData + GET_TILING_DATA
+{inbox}/{generationId}/config.json       # dtype-derived maxAbsErr and tiling params
 {inbox}/{generationId}/manifest.json
 {inbox}/{generationId}/build.sh          # build contract v1: last stdout line prints the executable path
 {inbox}/{generationId}/run_once.sh       # build contract v1: prints CANNESS_RESULT {...}
@@ -430,11 +461,18 @@ Affects only the settings card's reachability check and the CANNLab connection; 
 {outbox}/{generationId}/results.json
 ```
 
-Each round deletes the previous `results.json`, uploads the package plus `remote/runner.py`, and in one SSH `exec` runs the package's `build.sh`, its `run_once.sh`, and the real `msprof`, then reads the result back.
+Each round deletes the previous `results.json` before polling, so a stale result is never read.
+`build.sh` / `run_once.sh` / `main.cpp` / `golden.h` are rendered by `build_test_package`; the model
+only fills the accuracy formula through `write_package_file('golden.h', ...)`. The kernel entry is
+fixed to `canness_kernel` (inputs, then outputs, then tiling).
 
-**The package must ship build contract v1.** A missing `build.sh` or `run_once.sh` is reported as `compile_fail` with the fixed summary `package does not implement build contract v1`; the runner never guesses a compile command. `kernelTimeUs` only ever comes from the CSVs under `mindstudio_profiler_output/`; a missing CSV is `status: "error"` and never falls back to the manifest target.
+After upload, `remote/runner.py` runs `bash build.sh`, `bash run_once.sh` and the real `msprof`,
+then derives `kernelTimeUs` as described in §9.3. **No inbox consumer process is involved.**
 
-> **Known gap:** `build_test_package` still emits only the four layer files and `manifest.json`, not these two scripts, so the real path currently always ends in `compile_fail`. The fix is described in [`docs/plans/2026-11-05-build-contract-skeleton.md`](docs/plans/2026-11-05-build-contract-skeleton.md).
+If the configured SSH endpoint is a CANNLab tunnel (`127.0.0.1:<helper port>`), `run_evaluation`
+probes the helper's `/heartbeat` and renews its idle timer before connecting. A dead tunnel returns
+`status: "error"` with `summary: "tunnel is down; reconnect from Settings → CANNESS"` instead of a
+generic SSH failure.
 
 ### 9.2 Result file
 
@@ -473,15 +511,32 @@ Each round deletes the previous `results.json`, uploads the package plus `remote
 | `compile` | `ok` boolean, `log` string (truncated to 2000 characters when it enters the enhancement block) |
 | `correctness.maxRelativeError` | Number or `null` |
 | `performance.kernelTimeUs` / `targetUs` | Number or `null` |
-| `analysis` | May be `null`; `source` is currently only `msprof`; `bottleneck` ∈ `cube`, `memory`, `scalar`, `unknown`; `op` may be `null` |
+| `analysis` | May be `null`; `source` is always `msprof`; `bottleneck` ∈ `cube`, `memory`, `scalar`, `unknown`; `op` may be `null` |
+| `runRecord` | Optional; `{ timestamp, host, params, toolchain, durationMs }`; `params.golden` names the reference source (`placeholder` / `custom`) |
 
 An invalid result does not throw: it produces `status: "error"` with `summary: "malformed result: <reason>"` so the loop keeps going instead of aborting.
 
-### 9.3 Real runner
+While `golden.h` is still the placeholder, the report is `status: "accuracy_fail"`,
+`correctness.ok = false`, `correctness.maxRelativeError` keeps the raw value, and `summary` is
+`golden not implemented: fill golden.h in the package, then re-run build_test_package and run_evaluation`.
 
-Evaluation runs [`plugin/remote/runner.py`](plugin/remote/runner.py) on the remote host, in a fixed order: run the package's `build.sh` → take the executable path → run `run_once.sh` for the `CANNESS_RESULT` line → profile with `msprof` for `<runs>` iterations → parse the CSVs under `mindstudio_profiler_output/` → write `results.json` (including `runRecord`).
+### 9.3 The real runner and its output
 
-`run_evaluation` uploads the runner under a uuid name next to `dirname(inbox)` and deletes it afterwards; `fetch_remote_file` pulls CSVs and logs back into the workspace. **There is no mock fallback**: a host without CANN can never produce a `pass`.
+The remote executor is [`plugin/remote/runner.py`](plugin/remote/runner.py); `run_evaluation`
+uploads it under a uuid name and removes it afterwards. It only trusts the package's build contract:
+
+1. `bash build.sh`, taking the **last stdout line** as the executable path; a missing script or a
+   missing executable is `compile_fail`;
+2. `bash run_once.sh` under the same `flock` and `ASCEND_VISIBLE_DEVICES=7`, parsing `CANNESS_RESULT`;
+3. `msprof --application="<exe> 100" --output=<pre-created dir>`;
+4. reading `mindstudio_profiler_output/*.csv`: the arithmetic mean of every `Task Duration(us)` row
+   in `op_summary`; if only aggregate files exist, the `Avg` column of `op_statistic`; if neither
+   exists, `status: "error"` with the searched directories and files, never a fake `pass`;
+5. writing `{outbox}/<generationId>/results.json` with a `runRecord`.
+
+`manifest.performanceTargetUs` only fills `performance.targetUs`; it never becomes `kernelTimeUs`.
+`fetch_remote_file` pulls CSVs and logs back, restricted to `outbox` and the current generation's
+`inbox/<generationId>`; `remotePath` must be absolute.
 
 ### 9.4 Connecting to CANNLab (free cloud NPU)
 
@@ -591,12 +646,12 @@ CANNESS/
 │   │   ├── index.ts               # bare-package-name entry (anchor for the browser half)
 │   │   ├── knowledge.ts           # kb_search
 │   │   ├── knowledge-search.ts    # file-level search
-│   │   ├── generator.ts           # submit_spec / write_operator / build_test_package
+│   │   ├── generator.ts           # submit_spec / write_operator / build_test_package / write_package_file
 │   │   ├── spec.ts                # spec validation
 │   │   ├── package-files.ts       # four-layer output and packaging
 │   │   ├── eval.ts                # run_evaluation
 │   │   ├── eval-run.ts            # upload → poll → parse
-│   │   ├── ssh2-transport.ts      # ssh2 exec-channel adapter
+│   │   ├── ssh2-transport.ts      # ssh2 transport adapter (exec + base64)
 │   │   ├── remote.ts              # RemoteFiles interface + in-memory double
 │   │   ├── report.ts              # report shape and parsing
 │   │   ├── analysis.ts            # msprof-shaped performance analysis
@@ -608,6 +663,7 @@ CANNESS/
 │   ├── tests/                     # Vitest unit tests
 │   ├── knowledge_base/            # knowledge entries
 │   ├── remote/runner.py           # real remote runner (build.sh → run_once.sh → msprof)
+│   ├── templates/build-contract/  # build.sh / run_once.sh / main.cpp / golden.h / tiling shim
 │   ├── scripts/build-client.mjs   # browser-half bundler
 │   ├── cordis.patch.yml           # bundle default config layer
 │   └── package.json
@@ -649,8 +705,8 @@ CANNESS/
 
 | Stage | Goal |
 |---|---|
-| v0.1 (current) | A complete loop for a single operator, switchable between mock and real host |
-| v0.2 | Real-host end-to-end acceptance; finer failure classification; failure-specific enhancement blocks |
+| v0.2 (current) | Build contract + real msprof evaluation; CANNLab tunnel integration |
+| Next | Real-host end-to-end acceptance; finer failure classification; failure-specific enhancement blocks |
 | v0.3 | Structured knowledge index; automatic injection of reference implementations and tiling templates |
 | Later | Parallel candidates, search, dashboard, more operator types |
 
@@ -674,11 +730,10 @@ It was not built. Run `pnpm build` in `plugin/`.
 
 **Q: `run_evaluation` waits until it times out.**
 
-Check `summary` first. `remote runner failed: …` carries the first 20 stderr lines, usually `build.sh` missing its toolchain or a missing `python3`; `timed out after …` means the runner never wrote `results.json` within `timeoutSec`, typically `msprof` hanging or an `outbox` that differs from where the runner writes.
-
-**Q: The report is `compile_fail` with `package does not implement build contract v1`.**
-
-The package is missing `build.sh` or `run_once.sh`. The runner will not guess a compile command — the package must ship both scripts (see [9.1](#91-layout)). `build_test_package` does not generate them yet; that is the known gap.
+Check `summary` first: `package does not implement build contract v1` means the package is missing
+`build.sh` / `run_once.sh`, so run `build_test_package` again; `tunnel is down` means the CANNLab
+forward died, so reconnect from the settings card. Otherwise pull
+`{outbox}/<generationId>/results.json` and the runner log back with `fetch_remote_file`.
 
 **Q: pnpm warns about unresolved peerDependencies.**
 

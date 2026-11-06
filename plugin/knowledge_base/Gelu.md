@@ -65,7 +65,7 @@ Cast(yLocal, t1, RoundMode::CAST_RINT, n);
 2. **编译 core type 必须是 `VecCore`**：`--cce-soc-core-type=VecCore`；`AiCore` / `VectorCore` / `AIC` / `AIV` 都不被接受，`--cce-aiv` 单独用会被静默忽略。
 3. **soc 版本**：实机 910B2 可以编译 `Ascend910B2` 或 `Ascend910B4`，但 core type 不解决就白搭。
 4. **tiling 必须放 device 内存**再传给 kernel；传 host 栈指针会报 `scalar instruction accesses an invalid GM address`。
-5. 编译依赖生成物 `DTYPE_X` / `GET_TILING_DATA` / `GeluTilingData`，裸 kernel 编译不过；验证时用 shim 头，见 [`AscendC_Compile_Run.md`](AscendC_Compile_Run.md)。
+5. 编译依赖生成物 `DTYPE_X` / `GET_TILING_DATA` / tiling 结构；测试包内的 `canness_tiling.h` 已提供通用 `CannessTilingData`。kernel 入口必须是 `canness_kernel`（输入 → 输出 → tiling），详见 [`AscendC_Compile_Run.md`](AscendC_Compile_Run.md)。
 
 ## 正确性验证
 

@@ -19,7 +19,7 @@ import {
 import { interactiveLogin, refreshAccessToken } from './oauth.js'
 import {
   createForwardHub, defaultCacheRoot, deleteForwardHub, ensureHelperRunning, ensureUnpacked, helperPaths,
-  startForward, startHelperKeepalive,
+  helperRequest, startForward, startHelperKeepalive,
 } from './helper.js'
 import { LOOPBACK, SSH_REMOTE_PORT, STATUS_RUNNING } from './constants.js'
 import type { CannlabEvent, CannlabStep, CannlabTarget } from './types.js'
@@ -199,6 +199,49 @@ let openTunnel: OpenTunnel | null = null
 /** @returns the live tunnel without changing it. */
 export function currentTunnel(): OpenTunnel | null {
   return openTunnel
+}
+
+/** Whether a configured SSH endpoint is the live CANNLab forward, not a real host. */
+export function usesCurrentTunnel(host: string, port: number): boolean {
+  const tunnel = openTunnel
+  return tunnel !== null && tunnel.target.host === host && tunnel.target.port === port
+}
+
+export type TunnelHealth = 'up' | 'down' | 'none'
+
+/**
+ * Probe the forwarding helper behind the live tunnel.
+ *
+ * `none` means no tunnel is open (a normal direct SSH host); `down` means the
+ * configured endpoint belongs to a tunnel whose helper no longer answers. The
+ * distinction matters: `down` is a reconnect-in-the-card problem, not an SSH
+ * authentication problem.
+ * @returns the tunnel state.
+ */
+export async function tunnelHealth(): Promise<TunnelHealth> {
+  const tunnel = openTunnel
+  if (tunnel === null) return 'none'
+  try {
+    await helperRequest(tunnel.helperPort, '/heartbeat')
+    return 'up'
+  } catch {
+    return 'down'
+  }
+}
+
+/**
+ * Renew the helper's idle timer once, before a long evaluation.
+ * @returns whether the heartbeat succeeded.
+ */
+export async function renewTunnel(): Promise<boolean> {
+  const tunnel = openTunnel
+  if (tunnel === null) return false
+  try {
+    await helperRequest(tunnel.helperPort, '/heartbeat')
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**

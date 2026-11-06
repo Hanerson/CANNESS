@@ -233,6 +233,16 @@ COLUMNS = {
     'cube': ('cubeutilization',),
 }
 
+# op_statistic has no per-run rows; its aggregate columns are named Avg/Min/Max.
+AVG_COLUMNS = (
+    'avg',
+    'avgtimeus',
+    'avgtaskdurationus',
+    'averagetimeus',
+    'averagetaskdurationus',
+    'avgdurationus',
+)
+
 
 def column_map(fieldnames: list[str]) -> dict[str, str]:
     mapping: dict[str, str] = {}
@@ -250,49 +260,89 @@ def row_value(row: dict, mapping: dict, key: str):
     return None if column is None else row.get(column)
 
 
-def profile_from_csv(outdir: Path, operator_name: str) -> dict | None:
-    root = outdir / CSV_DIR
-    if not root.is_dir():
-        return None
+def row_matches(row: dict, mapping: dict, operator_name: str) -> bool:
+    for key in ('opName', 'opType'):
+        value = row_value(row, mapping, key)
+        if isinstance(value, str) and (value == operator_name or value.startswith(operator_name)):
+            return True
+    return False
+
+
+def read_csv_rows(path: Path) -> tuple[list[dict], dict[str, str]]:
+    try:
+        with path.open('r', encoding='utf-8-sig', newline='') as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                return [], {}
+            return list(reader), column_map(list(reader.fieldnames))
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return [], {}
+
+
+def summary_durations(paths: list[Path], operator_name: str) -> tuple[list[float], list[dict], dict[str, str]]:
+    """Per-run rows: every Task Duration(us) of the operator (or all rows)."""
+    parsed: list[tuple[list[dict], dict[str, str], list[dict]]] = []
+    for path in paths:
+        file_rows, candidate = read_csv_rows(path)
+        if 'duration' not in candidate or not file_rows:
+            continue
+        matched = [row for row in file_rows if row_matches(row, candidate, operator_name)]
+        parsed.append((file_rows, candidate, matched))
+    # If the operator appears anywhere, never average another operator's rows
+    # just because one CSV did not contain a match.
+    any_match = any(matched for _rows, _mapping, matched in parsed)
     durations: list[float] = []
     rows: list[dict] = []
     mapping: dict[str, str] = {}
-    # Prefer op_summary; op_statistic and task_time repeat the same numbers, so
-    # averaging across families would double-count the same run.
-    paths = sorted(root.rglob('*.csv'))
-    lower = {path: path.name.lower() for path in paths}
-    ordered = (
-        [path for path in paths if 'op_summary' in lower[path]]
-        + [path for path in paths if 'op_statistic' in lower[path]]
-        + [path for path in paths if 'op_summary' not in lower[path] and 'op_statistic' not in lower[path]]
-    )
-    for path in ordered:
-        try:
-            with path.open('r', encoding='utf-8-sig', newline='') as handle:
-                reader = csv.DictReader(handle)
-                if reader.fieldnames is None:
-                    continue
-                candidate = column_map(list(reader.fieldnames))
-                if 'duration' not in candidate:
-                    continue
-                file_rows = list(reader)
-                if not file_rows:
-                    continue
-                names = [str(row_value(row, candidate, 'opName') or '') for row in file_rows]
-                matched = [row for row, name in zip(file_rows, names) if name == operator_name or name.startswith(operator_name)]
-                use = matched if matched else file_rows
-                for row in use:
-                    value = number(row_value(row, candidate, 'duration'))
-                    if value is not None:
-                        durations.append(value)
-                        rows.append(row)
-                if durations:
-                    mapping = candidate
-                    break
-        except (OSError, csv.Error, UnicodeDecodeError):
+    for file_rows, candidate, matched in parsed:
+        use = matched if any_match else file_rows
+        for row in use:
+            value = number(row_value(row, candidate, 'duration'))
+            if value is not None:
+                durations.append(value)
+                rows.append(row)
+        if durations and not mapping:
+            mapping = candidate
+    return durations, rows, mapping
+
+
+def statistic_durations(paths: list[Path], operator_name: str) -> tuple[list[float], list[dict], dict[str, str]]:
+    """Aggregate rows: only the Avg column, never Min/Max, never summed."""
+    parsed: list[tuple[list[dict], dict[str, str], list[dict], str]] = []
+    for path in paths:
+        file_rows, candidate = read_csv_rows(path)
+        if not file_rows:
             continue
-    if not durations:
-        return None
+        normalized = {normalized_header(name): name for name in file_rows[0] if name}
+        average_column = next((normalized[alias] for alias in AVG_COLUMNS if alias in normalized), None)
+        column = average_column or candidate.get('duration')
+        if column is None:
+            continue
+        matched = [row for row in file_rows if row_matches(row, candidate, operator_name)]
+        parsed.append((file_rows, candidate, matched, column))
+    any_match = any(matched for _rows, _mapping, matched, _column in parsed)
+    durations: list[float] = []
+    rows: list[dict] = []
+    mapping: dict[str, str] = {}
+    for file_rows, candidate, matched, column in parsed:
+        use = matched if any_match else file_rows
+        for row in use:
+            value = number(row.get(column))
+            if value is not None:
+                durations.append(value)
+                rows.append(row)
+        if durations and not mapping:
+            mapping = candidate
+    return durations, rows, mapping
+
+
+def build_profile(
+    durations: list[float],
+    rows: list[dict],
+    mapping: dict[str, str],
+    operator_name: str,
+    source_label: str,
+) -> dict:
     mean = sum(durations) / len(durations)
     first = rows[0]
     ratios = {
@@ -320,11 +370,39 @@ def profile_from_csv(outdir: Path, operator_name: str) -> dict | None:
         'cubeUtilizationPct': number(row_value(first, mapping, 'cube')),
     }
     summary = (
-        f'msprof op_summary: Task Duration avg {mean:.3f}us over {len(durations)} rows; '
+        f'msprof {source_label}: Task Duration avg {mean:.3f}us over {len(durations)} rows; '
         f'aic_mac_ratio {op["aicMacRatio"]}, aic_mte2_ratio {op["aicMte2Ratio"]}, '
         f'aic_scalar_ratio {op["aicScalarRatio"]}.'
     )
     return {'bottleneck': bottleneck, 'summary': summary, 'op': op}
+
+
+def profile_from_csv(outdir: Path, operator_name: str) -> tuple[dict | None, str]:
+    """Return (profile, error).
+
+    ``kernelTimeUs`` is the arithmetic mean of every ``Task Duration(us)`` row
+    in ``op_summary``. Only when no summary rows exist is the ``Avg`` column of
+    ``op_statistic`` used; mixing both families would count the same run twice.
+    """
+    root = outdir / CSV_DIR
+    if not root.is_dir():
+        return None, f'no CSV under {root} (mindstudio_profiler_output/ was not created)'
+    paths = sorted(root.rglob('*.csv'))
+    if not paths:
+        return None, f'no CSV under {root}'
+    summary_paths = [path for path in paths if 'op_summary' in path.name.lower()]
+    statistic_paths = [path for path in paths if 'op_statistic' in path.name.lower()]
+
+    durations, rows, mapping = summary_durations(summary_paths, operator_name)
+    if durations:
+        return build_profile(durations, rows, mapping, operator_name, 'op_summary'), ''
+
+    durations, rows, mapping = statistic_durations(statistic_paths, operator_name)
+    if durations:
+        return build_profile(durations, rows, mapping, operator_name, 'op_statistic (Avg Time)'), ''
+
+    searched = ', '.join(path.name for path in paths)
+    return None, f'no Task Duration rows in {CSV_DIR}/ (searched {root}: {searched})'
 
 
 def profile_executable(
@@ -344,11 +422,11 @@ def profile_executable(
     except subprocess.TimeoutExpired:
         return None, 'msprof timed out', f'msprof timed out after {args.msprof_timeout}s'
     log = truncate((done.stdout or '') + (done.stderr or ''))
-    profile = profile_from_csv(outdir, operator_name)
+    profile, error = profile_from_csv(outdir, operator_name)
     if profile is None:
         if done.returncode != 0:
             return None, f'msprof exited {done.returncode}: {first_line(done.stderr or done.stdout)}', log
-        return None, f'msprof produced no CSV under {CSV_DIR}/', log
+        return None, error, log
     return profile, '', log
 
 
@@ -392,12 +470,13 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     generation = str(manifest.get('generationId') or generation)
     target = number(manifest.get('performanceTargetUs'))
     operator_name = manifest.get('operatorName') if isinstance(manifest.get('operatorName'), str) else generation
+    params = run_params(manifest, config)
 
     build = package / 'build.sh'
     run_once = package / 'run_once.sh'
     if not build.is_file() or not run_once.is_file():
         report = make_report(generation, target, status='compile_fail', summary=CONTRACT_ERROR)
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
 
     env_prefix = shell_env_prefix(args.set_env, args.device)
@@ -406,7 +485,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     except subprocess.TimeoutExpired:
         report = make_report(generation, target, status='compile_fail',
                              summary=f'build.sh timed out after {args.build_timeout}s')
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
     compile_log = truncate((built.stdout or '') + (built.stderr or ''))
     if built.returncode != 0:
@@ -414,13 +493,13 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
             generation, target, status='compile_fail', compile_log=compile_log,
             summary=f'build.sh exited {built.returncode}: {first_line(built.stderr or built.stdout)}',
         )
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
     executable_text = last_nonempty_line(built.stdout or '')
     if executable_text == '':
         report = make_report(generation, target, status='compile_fail', compile_log=compile_log,
                              summary='build.sh did not print the executable path on its last stdout line')
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
     executable = local_path(executable_text)
     if not executable.is_absolute():
@@ -428,7 +507,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     if not executable.exists():
         report = make_report(generation, target, status='compile_fail', compile_log=compile_log,
                              summary=f'build.sh reported a missing executable: {executable}')
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
 
     try:
@@ -437,7 +516,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     except subprocess.TimeoutExpired:
         report = make_report(generation, target, status='error', compile_ok=True, compile_log=compile_log,
                              summary=f'run_once.sh timed out after {args.run_timeout}s')
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
     correctness_log = truncate((correctness_run.stdout or '') + (correctness_run.stderr or ''))
     result = parse_canness_result(correctness_run.stdout or '')
@@ -445,27 +524,35 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         report = make_report(generation, target, status='error', compile_ok=True,
                              compile_log=f'{compile_log}\n{correctness_log}'.strip(),
                              summary='run_once.sh did not print a CANNESS_RESULT line')
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
     bad_count = number(result.get('badCount'))
     total = number(result.get('total'))
     max_abs_err = number(result.get('maxAbsErr'))
     max_rel_err = number(result.get('maxRelErr'))
+    golden = result.get('golden') if isinstance(result.get('golden'), str) else None
+    if golden:
+        params['golden'] = golden
     if bad_count is None or max_abs_err is None:
         report = make_report(generation, target, status='error', compile_ok=True, compile_log=compile_log,
                              summary='run_once.sh printed CANNESS_RESULT without badCount / maxAbsErr')
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
     threshold = correctness_threshold(manifest, config)
     correctness_ok = int(bad_count) == 0 and max_abs_err <= threshold
     if not correctness_ok:
+        placeholder = golden == 'placeholder' or int(bad_count) < 0
+        summary = (
+            'golden not implemented: fill golden.h in the package, then re-run build_test_package and run_evaluation'
+            if placeholder else
+            f'correctness failed: badCount {int(bad_count)}/{int(total) if total is not None else "?"}, '
+            f'maxAbsErr {max_abs_err:g} > {threshold:g}'
+        )
         report = make_report(
             generation, target, status='accuracy_fail', compile_ok=True, compile_log=compile_log,
-            max_relative_error=max_rel_err,
-            summary=(f'correctness failed: badCount {int(bad_count)}/{int(total) if total is not None else "?"}, '
-                     f'maxAbsErr {max_abs_err:g} > {threshold:g}'),
+            max_relative_error=max_rel_err, summary=summary,
         )
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
 
     profile, perf_error, msprof_log = profile_executable(executable, package, args, env_prefix, str(operator_name))
@@ -476,7 +563,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
             correctness_ok=True, max_relative_error=max_rel_err,
             summary=perf_error,
         )
-        report['runRecord'] = record(started, run_params(manifest, config), args)
+        report['runRecord'] = record(started, params, args)
         return report
 
     kernel_time_us = profile['op']['taskDurationUs']
@@ -497,7 +584,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         correctness_ok=True, max_relative_error=max_rel_err, kernel_time_us=kernel_time_us,
         analysis=analysis, summary=summary,
     )
-    report['runRecord'] = record(started, run_params(manifest, config), args)
+    report['runRecord'] = record(started, params, args)
     return report
 
 

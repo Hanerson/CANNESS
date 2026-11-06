@@ -9,7 +9,7 @@
 | 第一次接触本项目 | 根目录 [README](../README.md) → [`design/05-plugin-architecture.md`](design/05-plugin-architecture.md) |
 | 要改插件代码 | [`design/05-plugin-architecture.md`](design/05-plugin-architecture.md) → [`plans/2026-10-29-dsh-canness-mvp.md`](plans/2026-10-29-dsh-canness-mvp.md) |
 | 要了解为什么这样分层 | `design/01` → `design/02` → `design/03` → `design/04` → `design/05` |
-| 要接远端评测主机 | [`design/05-plugin-architecture.md`](design/05-plugin-architecture.md) §5.3（含 §5.3.1 远端自举）→ 根目录 README 的「远端约定」 |
+| 要接远端评测主机 | [`design/05-plugin-architecture.md`](design/05-plugin-architecture.md) §5.3（含 §5.3.1 包内构建契约）→ 根目录 README 的「远端约定」 |
 
 ## design/ — 架构设计
 
@@ -31,7 +31,7 @@
 | [2026-10-30 SSH 凭据设计提案](plans/2026-10-30-canness-ssh-credentials-design.md) | SSH 密码认证与 Web 设置卡的设计取舍 |
 | [2026-10-30 SSH 密码认证实现计划](plans/2026-10-30-canness-ssh-password-auth.md) | 上一份提案的实现计划与偏差记录 |
 | ~~[2026-11-03 远端自举修复提示词](plans/2026-11-03-remote-bootstrap.md)~~ | **已作废**：`watch.py` / `bootstrap` 方案已删除，改为真实 runner。仅保留作历史记录 |
-| [2026-11-05 构建契约补齐（方案 B）](plans/2026-11-05-build-contract-skeleton.md) | 当前阻断项的设计：`build_test_package` 补出构建契约（骨架 + golden 插槽） |
+| [2026-11-05 构建契约补齐（方案 B）](plans/2026-11-05-build-contract-skeleton.md) | 已落地：`build_test_package` 补出构建契约（骨架 + golden 插槽） |
 | [2026-11-05 PR v0.2.0 验收意见](plans/2026-11-05-pr-v0.2.0-review.md) | 对外部 PR 的逐条修改指导（M1/M2/M3） |
 
 ## 约定

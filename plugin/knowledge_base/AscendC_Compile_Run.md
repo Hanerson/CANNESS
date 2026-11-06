@@ -38,6 +38,17 @@ bisheng -x cce -std=c++17 \
 - 链接需要 `-lascendcl -lruntime`，否则 `rtDevBinaryRegister` / `rtKernelLaunch` 未定义。
 - 910B2 和 910B4 都可选 `--cce-soc-version=Ascend910B2|Ascend910B4`。
 
+## 与插件构建契约的接口
+
+`build_test_package` 会把 `canness_tiling.h` 放进测试包，并作为 `-include` 传给 kernel 编译。
+新算子不需要自带 tiling 头：
+
+- kernel 入口固定为
+  `extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR in0, ..., GM_ADDR out0, ..., GM_ADDR tiling)`
+  （**全部输入 → 全部输出 → tiling**）；
+- tiling 用通用 `CannessTilingData { totalLength, blockLength, tileLength }`，
+  `GET_TILING_DATA` 由包内 shim 提供；`DTYPE_X` / `DTYPE_Y` 也由它定义。
+
 ## 裸 kernel 缺的三个生成物
 
 直接编译 `op_kernel/kernel.cpp` 会报：
@@ -48,7 +59,9 @@ use of undeclared identifier 'GET_TILING_DATA'
 unknown type name 'GeluTilingData'
 ```
 
-它们由 msopgen 的 tiling 头生成。最小 shim：
+它们由 msopgen 的 tiling 头生成。若 kernel 仍自带旧式 shim，注意两点：
+`GET_TILING_DATA` 用 `#ifndef` 守卫（包内 shim 先定义时不要重复定义），内部指针名不要用
+`t`（否则会和 `GET_TILING_DATA(t, tiling)` 的调用变量重名）：
 
 ```cpp
 // gelu_tiling.h
@@ -62,15 +75,17 @@ struct GeluTilingData {
     int64_t tileLength;
 };
 
+#ifndef GET_TILING_DATA
 #define GET_TILING_DATA(tilingData, tilingPtr)                    \
     GeluTilingData tilingData;                                    \
     do {                                                          \
-        __gm__ GeluTilingData *t =                                \
+        __gm__ GeluTilingData *canness_gm_tiling__ =              \
             reinterpret_cast<__gm__ GeluTilingData *>(tilingPtr); \
-        tilingData.totalLength = t->totalLength;                  \
-        tilingData.blockLength = t->blockLength;                  \
-        tilingData.tileLength = t->tileLength;                    \
+        tilingData.totalLength = canness_gm_tiling__->totalLength;\
+        tilingData.blockLength = canness_gm_tiling__->blockLength;\
+        tilingData.tileLength = canness_gm_tiling__->tileLength;  \
     } while (0)
+#endif
 ```
 
 注意：`__gm__` 结构体不能按值拷贝到 local，必须逐字段读。

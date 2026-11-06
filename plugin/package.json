@@ -32,7 +32,8 @@
     "src",
     "cordis.patch.yml",
     "knowledge_base",
-    "remote"
+    "remote",
+    "templates"
   ],
   "exports": {
     ".": "./lib/index.js",
