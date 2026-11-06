@@ -31,9 +31,16 @@ export function apply(ctx: Context, config: Config): void {
   const path = statePath(config.workspace)
   ctx.tools.register(defineTool({
     name: 'submit_spec',
-    description: 'Validate an operator spec and start a new generation.',
+    description: [
+      'Validate an operator spec and start a new generation.',
+      'Resubmitting for the same operator keeps the iteration budget: counters, the best time, and the',
+      'stall window carry over, so a new generation is a new artifact rather than a fresh allowance.',
+      'Pass reset: true to start the budget over deliberately.',
+      'A target_us larger than the previous spec\'s is recorded and reported as a relaxed target.',
+    ].join(' '),
     parameters: {
       spec: { type: 'json', required: true, description: 'Operator spec JSON from design doc 02 section 3.1' },
+      reset: { type: 'boolean', description: 'Restart the iteration budget instead of carrying it over.' },
     },
     output: {
       schema: {
@@ -42,6 +49,8 @@ export function apply(ctx: Context, config: Config): void {
         properties: {
           generationId: { type: 'string', required: true },
           operator_name: { type: 'string', required: true },
+          carriedOver: { type: 'boolean', required: true },
+          relaxedTargetFromUs: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
         },
       },
       render: (_args, value) => render(value),
@@ -49,8 +58,43 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args) {
       const spec = parseSpec(args.spec)
       const generationId = newGenerationId(randomUUID())
-      saveState(path, { ...emptyState(), generationId, spec })
-      return { generationId, operator_name: spec.operator_name }
+      const prior = loadState(path)
+      // The budget is per operator, not per generation id: resubmitting the same
+      // operator must not hand the loop a fresh allowance, or the stop
+      // conditions can never be reached (see issue 016).
+      const carriedOver = args.reset !== true
+        && prior.generationId !== null
+        && prior.spec !== null
+        && prior.spec.operator_name === spec.operator_name
+      const priorTarget = prior.spec?.performance_target.target_us
+      const relaxedTargetFromUs = carriedOver && priorTarget !== undefined
+        && spec.performance_target.target_us > priorTarget
+        ? priorTarget
+        : null
+      saveState(path, {
+        ...emptyState(),
+        ...carriedOver
+          ? {
+              validIterations: prior.validIterations,
+              compileRetries: prior.compileRetries,
+              timeouts: prior.timeouts,
+              negativeStreak: prior.negativeStreak,
+              bestKernelTimeUs: prior.bestKernelTimeUs,
+              previousPassKernelTimeUs: prior.previousPassKernelTimeUs,
+              lastPassKernelTimeUs: prior.lastPassKernelTimeUs,
+              recentKernelTimeUs: prior.recentKernelTimeUs ?? [],
+            }
+          : {},
+        generationId,
+        spec,
+        targetRelaxedUs: relaxedTargetFromUs,
+      })
+      return {
+        generationId,
+        operator_name: spec.operator_name,
+        carriedOver,
+        relaxedTargetFromUs,
+      }
     },
   }))
   ctx.tools.register(defineTool({

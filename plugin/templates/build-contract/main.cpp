@@ -30,6 +30,8 @@
 #define CANNESS_BLOCK_LENGTH {{BLOCK_LENGTH}}
 #define CANNESS_TILE_LENGTH {{TILE_LENGTH}}
 #define CANNESS_MAX_ABS_ERR {{MAX_ABS_ERR}}
+// Scratch bytes appended to the tiling buffer (issue 013); 0 by default.
+#define CANNESS_WORKSPACE_BYTES {{WORKSPACE_BYTES}}
 
 // Fixed kernel entry: every input, every output, then the tiling buffer.
 extern "C" __global__ __aicore__ void canness_kernel({{KERNEL_ARGS_DECL}});
@@ -209,13 +211,21 @@ int main() {
 
     // Tiling lives in device memory: a host stack pointer triggers
     // "scalar instruction accesses an invalid GM address".
+    // When the spec asks for scratch (launch.workspace_bytes > 0) the allocation
+    // grows by that many bytes and the kernel finds the area at
+    // (uint8_t *)tiling + sizeof(CannessTilingData) -- no extra kernel parameter,
+    // so existing kernels keep their signature (issue 013).
     CannessTilingData tiling_host = {};
     tiling_host.totalLength = static_cast<uint32_t>(CANNESS_TOTAL_ELEMENTS);
     tiling_host.blockLength = static_cast<uint32_t>(CANNESS_BLOCK_LENGTH);
     tiling_host.tileLength = CANNESS_TILE_LENGTH;
+    tiling_host.workspaceSize = static_cast<uint64_t>(CANNESS_WORKSPACE_BYTES);
+    const size_t tiling_bytes = sizeof(CannessTilingData) + static_cast<size_t>(CANNESS_WORKSPACE_BYTES);
     void* tiling_device = nullptr;
-    status = aclrtMalloc(&tiling_device, sizeof(CannessTilingData), ACL_MEM_MALLOC_HUGE_FIRST);
+    status = aclrtMalloc(&tiling_device, tiling_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
     if (status != ACL_SUCCESS) return fail("aclrtMalloc(tiling)", static_cast<int>(status));
+    // Only the descriptor comes from the host stack; the scratch tail stays as
+    // device memory and belongs to the kernel to initialise.
     status = aclrtMemcpy(tiling_device, sizeof(CannessTilingData), &tiling_host,
                          sizeof(CannessTilingData), ACL_MEMCPY_HOST_TO_DEVICE);
     if (status != ACL_SUCCESS) return fail("aclrtMemcpy(tiling)", static_cast<int>(status));

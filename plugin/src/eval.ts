@@ -11,7 +11,7 @@ import { connectRemote, type SftpOptions } from './ssh2-transport.js'
 import { renewTunnel, tunnelHealth, usesCurrentTunnel } from './cannlab/connect.js'
 import type { RemoteHost } from './remote.js'
 import { stoppedReport, type EvalReport } from './report.js'
-import { stopReason, type PolicyConfig } from './policy.js'
+import { stopReason, targetGap, type PolicyConfig, type StopReason, type TaskState } from './policy.js'
 
 export const name = 'canness-eval'
 export const inject = ['tools']
@@ -34,6 +34,12 @@ export interface Config {
   maxCompileRetries: Volatile<number>
   negativeStreakLimit: Volatile<number>
   convergenceThreshold: Volatile<number>
+  /** Rounds without real gain that stop the loop with a human decision. */
+  stallRounds: Volatile<number>
+  /** Smallest relative improvement that still counts as progress. */
+  stallGain: Volatile<number>
+  /** Gap to target at which a stall is worth a human decision. */
+  stallGap: Volatile<number>
 }
 
 export const Config = z.object({
@@ -51,6 +57,10 @@ export const Config = z.object({
   maxCompileRetries: z.number().required().volatile(),
   negativeStreakLimit: z.number().required().volatile(),
   convergenceThreshold: z.number().required().volatile(),
+  // Defaults keep an existing profile row working without the three new keys.
+  stallRounds: z.number().default(2).volatile(),
+  stallGain: z.number().default(0.03).volatile(),
+  stallGap: z.number().default(1.5).volatile(),
 })
 
 function emptyHostReport(generationId: string | null): EvalReport {
@@ -132,13 +142,46 @@ function snapshot(config: Config) {
   }
 }
 
+/**
+ * A volatile number, tolerating a config object that predates the key.
+ * @param value - the config field, present only once the schema gained it.
+ * @param fallback - policy default.
+ * @returns the configured number or the fallback.
+ */
+function numberOf(value: { get(): number } | undefined, fallback: number): number {
+  return typeof value?.get === 'function' ? value.get() : fallback
+}
+
 function policyOf(config: Config): PolicyConfig {
   return {
     maxIterations: config.maxIterations.get(),
     maxCompileRetries: config.maxCompileRetries.get(),
     negativeStreakLimit: config.negativeStreakLimit.get(),
     convergenceThreshold: config.convergenceThreshold.get(),
+    stallRounds: numberOf(config.stallRounds, 2),
+    stallGain: numberOf(config.stallGain, 0.03),
+    stallGap: numberOf(config.stallGap, 1.5),
   }
+}
+
+/**
+ * The stop sentence a human reads through the tool result.
+ *
+ * A stall is not the same event as a spent budget: the loop did not run out of
+ * attempts, it ran out of ideas, so the message has to say what the decision is
+ * instead of implying another tweak will do.
+ * @param state - the fold that produced the stop.
+ * @param reason - the stop condition that fired.
+ * @returns the report summary.
+ */
+function stoppedSummary(state: TaskState, reason: StopReason): string {
+  if (reason !== 'stalled') return reason
+  const gap = targetGap(state)
+  const recent = (state.recentKernelTimeUs ?? []).slice(-3)
+  const trend = recent.map(value => `${value.toFixed(1)}us`).join(' → ')
+  const distance = gap === null ? '' : `，仍差 ${gap.toFixed(2)} 倍`
+  return `stalled${distance}: no real gain over the last ${String(recent.length)} rounds (${trend}). `
+    + 'Stop tuning. Decide one of: change the algorithm, relax the target deliberately in a new spec with a reason, or stop the task.'
 }
 
 /** Private key when a path is configured, otherwise the credentials-seam password. */
@@ -351,7 +394,7 @@ export function apply(
       const localPackageDir = join(config.workspace, 'packages', state.generationId)
       if (!existsSync(localPackageDir)) throw new Error('build_test_package first')
       const reason = stopReason(state, policyOf(config))
-      if (reason) return fail(stoppedReport(state.generationId, reason))
+      if (reason) return fail(stoppedReport(state.generationId, stoppedSummary(state, reason)))
       const auth = await resolveAuth(ctx, cfg)
       if (auth.privateKey === undefined && auth.password === undefined) {
         return fail(missingCredentialsReport(state.generationId))
