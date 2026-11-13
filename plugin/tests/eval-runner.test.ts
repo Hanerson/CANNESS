@@ -317,7 +317,7 @@ test.skipIf(python === null)('set_env discovery prefers an explicit path, then t
   rmSync(version8)
   const [chosen, searched] = probe('', '')
   expect(chosen).toBeNull()
-  expect(searched.join(' ')).toContain('cann-*/set_env.sh')
+  expect(searched).toContain(join(home, 'Ascend', 'cann-*', 'set_env.sh'))
 })
 
 test.skipIf(python === null)('a missing CANN environment is visible in compile.log', () => {
