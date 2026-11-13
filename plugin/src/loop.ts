@@ -50,6 +50,7 @@ function sessionOf(payload: unknown): string | undefined {
 
 export function apply(ctx: Context, config: Config, now: () => number = Date.now): void {
   const path = join(config.workspace, '.canness', 'state.json')
+  let warnedUnclaimed = false
 
   /**
    * Both listeners share this guard. Driving a session requires three things at
@@ -62,7 +63,12 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
    */
   const steerable = (payload: unknown): ReturnType<typeof loadState> | undefined => {
     const state = loadState(path)
-    if (!ownsSession(state, sessionOf(payload))) return undefined
+    const session = sessionOf(payload)
+    if (session !== undefined && !state.ownerSessionId && state.lastReport !== null && !warnedUnclaimed) {
+      ctx.logger?.(name).warn('旧工作区的评测任务尚未认领。请在目标会话中重新运行 run_evaluation。')
+      warnedUnclaimed = true
+    }
+    if (!ownsSession(state, session)) return undefined
     if (state.pendingSteer !== true) return undefined
     if (!shouldSteer(state, config)) return undefined
     if ((state.steerCount ?? 0) >= (config.maxSteerPerReport ?? 3)) return undefined

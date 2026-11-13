@@ -585,6 +585,31 @@ test('turn-stopping steers once per owed retry, and only for the owning session'
   expect(steered).toHaveLength(2)
 })
 
+test('logs once for an unclaimed legacy task without steering either session', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
+  const warnings: string[] = []
+  const lp = { ...fakeCtx(), logger: () => ({ warn: (message: string) => warnings.push(message) }) }
+  const statePath = join(workspace, '.canness', 'state.json')
+  saveState(statePath, { ...emptyState(), lastReport: failReport('perf_fail'), pendingSteer: true })
+  loop.apply(lp as never, { workspace, ...policy })
+  const pre = lp.listeners.find(item => item.event === 'agent/pre-step')!
+  const stopping = lp.listeners.find(item => item.event === 'agent/turn-stopping')!
+  const enter = async () => ({ kind: 'enter' as const, messages: [] })
+  const sessionA = { agent: { session: { id: 'a' } } }
+  const steered: unknown[] = []
+  const sessionB = { agent: { session: { id: 'b' }, steer: (message: unknown) => steered.push(message) } }
+  expect((await pre.fn(sessionA, enter)).messages).toHaveLength(0)
+  stopping.fn(sessionB)
+  expect(steered).toHaveLength(0)
+  expect(warnings).toHaveLength(1)
+  expect(warnings[0]).toContain('run_evaluation')
+  expect(loadState(statePath).pendingSteer).toBe(true)
+  saveState(statePath, { ...loadState(statePath), ownerSessionId: 'b' })
+  stopping.fn(sessionB)
+  expect(steered).toHaveLength(1)
+  expect(warnings).toHaveLength(1)
+})
+
 test('automatic prompts obey the interval and per-report cap', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
   const lp = fakeCtx()

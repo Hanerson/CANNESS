@@ -291,8 +291,12 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
   const outputs = spec.output_specs
   const firstInput = inputs[0]!
   const firstOutput = outputs[0]!
-  for (const tensor of [...inputs, ...outputs]) cppDtype(tensor.dtype)
-  if (spec.accuracyMode === 'index-check' && outputs.some(tensor => !['int32', 'i32', 'int64', 'i64'].includes(normalizedDtype(tensor.dtype)))) {
+  for (const tensor of inputs) cppDtype(tensor.dtype)
+  const integerOutputs = outputs.map(tensor => {
+    const { enumerator } = cppDtype(tensor.dtype)
+    return enumerator === 'DType::I32' || enumerator === 'DType::I64'
+  })
+  if (spec.accuracyMode === 'index-check' && integerOutputs.includes(false)) {
     throw new Error('accuracyMode index-check requires integer output tensors')
   }
   const reference = firstInput ?? firstOutput
@@ -360,7 +364,8 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     TILE_LENGTH: String(tileLength),
     MAX_ABS_ERR: String(threshold),
     ACCURACY_MODE: spec.accuracyMode === 'index-check' ? '1' : '0',
-    INTEGER_OUTPUT: outputs.some(tensor => ['int32', 'i32', 'int64', 'i64'].includes(normalizedDtype(tensor.dtype))) ? '1' : '0',
+    INTEGER_OUTPUT: integerOutputs.includes(true) ? '1' : '0',
+    FLOAT_OUTPUT: integerOutputs.includes(false) ? '1' : '0',
     SHAPE_VALUES: shape.length ? shape.join(', ') : '0',
     SHAPE_RANK: String(shape.length),
     ATTR_ROWS: attrRows.length ? attrRows.join(',\n    ') : '{nullptr, GoldenAttrType::Number, 0.0, false, nullptr}',

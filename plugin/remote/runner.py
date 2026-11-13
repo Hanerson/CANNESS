@@ -118,13 +118,13 @@ def correctness_threshold(manifest: dict, config: dict) -> float:
     for source in (config, manifest):
         for key in ('maxAbsErr', 'max_abs_err', 'maxAbsError'):
             value = number(source.get(key))
-            if value is not None and value > 0:
+            if value is not None and value >= 0:
                 return value
         tolerance = source.get('tolerance')
         if isinstance(tolerance, dict):
             for key in ('maxAbsErr', 'max_abs_err', 'maxAbsError'):
                 value = number(tolerance.get(key))
-                if value is not None:
+                if value is not None and value >= 0:
                     return value
     return DEFAULT_MAX_ABS_ERR
 
@@ -420,12 +420,20 @@ def build_profile(
         values = [v for v in (number(row_value(row, mapping, key)) for row in rows) if v is not None]
         return sum(values) / len(values) if values else None
 
+    aic = {key: average_ratio(key) for key in ('mac', 'mte2', 'scalar')}
+    aiv_mte2 = average_ratio('aivMte2')
+    aiv_scalar = average_ratio('aivScalar')
     vector_task = 'VECTOR' in str(row_value(first, mapping, 'taskType') or '').upper()
+    # CANN 9.0 can label an AIV-only kernel AI_CORE. Positive AIV counters
+    # with no positive AIC counters identify that case without guessing from zeros.
+    aiv_only = not any((value or 0) > 0 for value in aic.values()) and (
+        (aiv_mte2 or 0) > 0 or (aiv_scalar or 0) > 0
+    )
     ratios = {
-        'mac': None if vector_task else average_ratio('mac'),
-        'mte2': average_ratio('aivMte2') if vector_task and 'aivMte2' in mapping else average_ratio('mte2'),
-        'scalar': average_ratio('aivScalar') if vector_task and 'aivScalar' in mapping else average_ratio('scalar'),
-    }
+        'mac': None,
+        'mte2': aiv_mte2 if aiv_mte2 is not None else aic['mte2'],
+        'scalar': aiv_scalar if aiv_scalar is not None else aic['scalar'],
+    } if vector_task or aiv_only else aic
     # Columns that exist but are filled with 0 mean the metrics were not
     # collected for this run (CANN 9.0.0 only writes them with the matching
     # --aic-metrics level). Treating those zeros as data made every AIV kernel

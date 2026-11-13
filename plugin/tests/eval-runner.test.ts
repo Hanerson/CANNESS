@@ -1,6 +1,6 @@
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { expect, test } from 'vitest'
@@ -86,12 +86,20 @@ function packageAt(options: { build?: boolean, runOnce?: boolean } = {}): { root
 }
 
 function runRunner(root: string, inbox: string, outbox: string, msprof: string, runs = 3) {
+  const bash = bashCommand()
+  const env = { ...process.env }
+  if (process.platform === 'win32') {
+    const bashDir = dirname(bash)
+    // Git for Windows also ships a launcher in bin; its Unix tools live in usr/bin.
+    const unixBin = existsSync(join(bashDir, 'cat.exe')) ? bashDir : resolve(bashDir, '../usr/bin')
+    if (existsSync(join(unixBin, 'cat.exe'))) env.PATH = [unixBin, env.PATH].filter(Boolean).join(delimiter)
+  }
   return spawnSync(python!, [
     runner, '--inbox', inbox, '--outbox', outbox,
     '--generation', 'gen-fixture001', '--once',
     '--set-env', '', '--lock', '', '--msprof', msprof, '--runs', String(runs),
-    '--bash', bashCommand(),
-  ], { encoding: 'utf8', env: process.env })
+    '--bash', bash,
+  ], { encoding: 'utf8', env })
 }
 
 function results(outbox: string): Record<string, any> {
@@ -173,6 +181,14 @@ test.skipIf(python === null)('the maxAbsErr budget comes from the package config
   expect(report.performance.kernelTimeUs).toBeNull()
 })
 
+test.skipIf(python === null)('an exact correctness threshold of zero is preserved', () => {
+  const { root, inbox, outbox } = packageAt()
+  const pkg = join(inbox, 'gen-fixture001')
+  writeFileSync(join(pkg, 'config.json'), JSON.stringify({ maxAbsErr: 0 }))
+  expect(runRunner(root, inbox, outbox, fakeMsprof(root, CSV)).status).toBe(0)
+  expect(results(outbox)).toMatchObject({ status: 'accuracy_fail', summary: expect.stringContaining('> 0') })
+})
+
 test.skipIf(python === null)('a multi-row op_summary is averaged, not first-row sampled', () => {
   const header = CSV.split('\n')[0]!
   const row = (duration: number) => `Gelu_v1,Gelu,AI_CORE,${String(duration)},0.5,16,0.12,0.71,0.09,18.4`
@@ -231,6 +247,18 @@ test.skipIf(python === null)('AIV metrics classify a vector task without using c
   const { root, inbox, outbox } = packageAt()
   expect(runRunner(root, inbox, outbox, fakeMsprof(root, csv)).status).toBe(0)
   expect(results(outbox).analysis).toMatchObject({ bottleneck: 'memory', op: { aicMacRatio: null, aicMte2Ratio: 0.71 } })
+})
+
+test.skipIf(python === null)('AI_CORE rows can carry AIV-only pipe metrics in CANN 9.0', () => {
+  const csv = [
+    'Op Name,Op Type,Task Type,Task Duration(us),aic_mac_ratio,aic_mte2_ratio,aic_scalar_ratio,aiv_mte2_ratio,aiv_scalar_ratio',
+    'Gelu_v1,Gelu,AI_CORE,226.657,0,0,0,0.111,0.943',
+  ].join('\n')
+  const { root, inbox, outbox } = packageAt()
+  expect(runRunner(root, inbox, outbox, fakeMsprof(root, csv)).status).toBe(0)
+  expect(results(outbox).analysis).toMatchObject({
+    bottleneck: 'scalar', op: { aicMacRatio: null, aicMte2Ratio: 0.111, aicScalarRatio: 0.943 },
+  })
 })
 
 test.skipIf(python === null)('op_statistic is only used when no op_summary rows exist', () => {

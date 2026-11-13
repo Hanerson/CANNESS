@@ -45,13 +45,15 @@
 #define CANNESS_MAX_ABS_ERR {{MAX_ABS_ERR}}
 #define CANNESS_INDEX_CHECK {{ACCURACY_MODE}}
 #define CANNESS_INTEGER_OUTPUT {{INTEGER_OUTPUT}}
+#define CANNESS_FLOAT_OUTPUT {{FLOAT_OUTPUT}}
 #define CANNESS_SHAPE_RANK {{SHAPE_RANK}}
 #define CANNESS_ATTR_COUNT {{ATTR_COUNT}}
 // Scratch bytes appended to the tiling buffer (issue 013); 0 by default.
 #define CANNESS_WORKSPACE_BYTES {{WORKSPACE_BYTES}}
 
-// Fixed kernel entry: every input, every output, then the tiling buffer.
-extern "C" __global__ __aicore__ void canness_kernel({{KERNEL_ARGS_DECL}});
+// Use CCE's [aicore] spelling directly. The kernel headers define the
+// __aicore__ macro but also introduce device globals, so keep them out of main.o.
+extern "C" __global__ [aicore] void canness_kernel({{KERNEL_ARGS_DECL}});
 
 enum class DType { F16, BF16, F32, I32, I64 };
 
@@ -379,6 +381,7 @@ int main(int argc, char** argv) {
                     }
 #endif
                 } else {
+#if CANNESS_FLOAT_OUTPUT
                     const float actual = load_value(outputs[output]->dtype,
                                                     outputs[output]->host.data(), element);
 #ifdef CANNESS_GOLDEN_WITH_CONTEXT
@@ -403,6 +406,7 @@ int main(int argc, char** argv) {
                     if (abs_error > max_abs) max_abs = abs_error;
                     if (rel_error > max_rel) max_rel = rel_error;
                     if (abs_error > CANNESS_MAX_ABS_ERR) ++bad;
+#endif
                 }
 #endif
             }

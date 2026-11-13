@@ -18,6 +18,20 @@ function spec(outputDtype: string, accuracyMode: 'elementwise' | 'index-check' =
   })
 }
 
+test('the host declaration uses only compiler-provided CCE qualifiers', () => {
+  const files = renderBuildContract(spec('int64'))
+  expect(files['main.cpp']).toContain('extern "C" __global__ [aicore] void canness_kernel(')
+  expect(files['main.cpp']).not.toContain('#include "kernel_operator.h"')
+})
+
+test('integer-only golden references do not require a float evaluator', () => {
+  const integer = renderBuildContract(spec('int64'))['main.cpp']!
+  const floating = renderBuildContract(spec('float32'))['main.cpp']!
+  expect(integer).toContain('#define CANNESS_FLOAT_OUTPUT 0')
+  expect(floating).toContain('#define CANNESS_FLOAT_OUTPUT 1')
+  expect(integer).toMatch(/#if CANNESS_FLOAT_OUTPUT\s+const float actual/)
+})
+
 test('integer outputs retain their byte width and exact comparison across reasonable shapes', () => {
   for (const [dtype, declaration] of [['int32', 'DType::I32'], ['I64', 'DType::I64']] as const) {
     const files = renderBuildContract(spec(dtype))
