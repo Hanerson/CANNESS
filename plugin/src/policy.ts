@@ -15,6 +15,8 @@ export interface PolicyConfig {
   stallGain?: number
   /** Gap to target, as `achieved / target`, at which a stall is worth a human. */
   stallGap?: number
+  /** Limit automatic prompts produced for one evaluation report. */
+  maxSteerPerReport?: number
 }
 
 /** How many recent kernel times the stall detector keeps. */
@@ -59,6 +61,14 @@ export interface TaskState {
    * never touched the operator — which is how 232 prompts landed in 36 minutes.
    */
   pendingSteer?: boolean
+  /** Automatic prompts issued for the current report, including pre-step notices. */
+  steerCount?: number
+  /** Unix milliseconds of the last automatic prompt. */
+  lastSteerAt?: number
+  /** Fingerprint of the package most recently built for this generation. */
+  packageHash?: string | null
+  /** Fingerprint sent to the runner in the most recent evaluation. */
+  lastEvaluatedHash?: string | null
   lastReport: EvalReport | null
 }
 
@@ -80,6 +90,10 @@ export function emptyState(): TaskState {
     targetRelaxedUs: null,
     ownerSessionId: null,
     pendingSteer: false,
+    steerCount: 0,
+    lastSteerAt: 0,
+    packageHash: null,
+    lastEvaluatedHash: null,
     lastReport: null,
   }
 }
@@ -277,5 +291,7 @@ export function enhancementBlock(state: TaskState, config: PolicyConfig = {
     ...(report.status === 'compile_fail'
       ? [`编译契约：kernel 入口必须是 extern "C" __global__ __aicore__ void canness_kernel(<输入…>, <输出…>, GM_ADDR tiling)，不要带 workspace 参数；签名不对会链接失败。`]
       : []),
+    ...((state.steerCount ?? 0) >= (config.maxSteerPerReport ?? 3)
+      ? [`本次报告已自动提示 ${String(state.steerCount)} 次，暂停自动续轮。`] : []),
   ].join('\n')
 }

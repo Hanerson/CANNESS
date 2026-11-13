@@ -8,6 +8,7 @@ import { runEvaluation } from './eval-run.js'
 import { loadState, saveState } from './state-file.js'
 import { registerProbeCommand, type TcpDial } from './probe.js'
 import { connectRemote, type SftpOptions } from './ssh2-transport.js'
+import { packageHash } from './package-files.js'
 import { renewTunnel, tunnelHealth, usesCurrentTunnel } from './cannlab/connect.js'
 import type { RemoteHost } from './remote.js'
 import { stoppedReport, type EvalReport } from './report.js'
@@ -35,6 +36,8 @@ export interface Config {
   outbox: Volatile<string>
   timeoutSec: Volatile<number>
   pollIntervalMs: Volatile<number>
+  /** Empty means the remote runner auto-detects CANN's set_env.sh. */
+  setEnv: Volatile<string>
   maxIterations: Volatile<number>
   maxCompileRetries: Volatile<number>
   negativeStreakLimit: Volatile<number>
@@ -58,6 +61,7 @@ export const Config = z.object({
   outbox: z.string().required().volatile(),
   timeoutSec: z.number().required().volatile(),
   pollIntervalMs: z.number().required().volatile(),
+  setEnv: z.string().default('').volatile(),
   maxIterations: z.number().required().volatile(),
   maxCompileRetries: z.number().required().volatile(),
   negativeStreakLimit: z.number().required().volatile(),
@@ -144,6 +148,7 @@ function snapshot(config: Config) {
     outbox: config.outbox.get(),
     timeoutSec: config.timeoutSec.get(),
     pollIntervalMs: config.pollIntervalMs.get(),
+    setEnv: config.setEnv?.get?.() ?? '',
   }
 }
 
@@ -294,10 +299,13 @@ export function apply(
       'Nothing is compiled locally: this Windows side has no CANN toolchain.',
       'A missing build.sh/run_once.sh is reported as compile_fail with "package does not implement build contract v1".',
       'A placeholder golden.h (write_package_file) returns accuracy_fail with "golden not implemented", never pass.',
+      'An unchanged package returns the previous report with duplicate:true without connecting; use force:true to remeasure.',
       'The result always carries workspace, packageDir and resultsPath, plus status / compile.log /',
       'correctness.maxRelativeError / performance.kernelTimeUs / analysis / summary.',
     ].join(' '),
-    parameters: {},
+    parameters: {
+      force: { type: 'boolean', description: 'Remeasure an unchanged package; recorded in runRecord.params.forced.' },
+    },
     output: {
       schema: {
         type: 'object',
@@ -344,6 +352,9 @@ export function apply(
                   source: { type: 'string', required: true, enum: ['msprof'] },
                   bottleneck: { type: 'string', required: true, enum: ['cube', 'memory', 'scalar', 'unknown'] },
                   summary: { type: 'string', required: true },
+                  achievedBandwidthGBps: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+                  rooflineUs: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+                  baselineUs: { oneOf: [{ type: 'number' }, { type: 'null' }] },
                   op: {
                     required: true,
                     oneOf: [
@@ -383,6 +394,7 @@ export function apply(
             },
           },
           summary: { type: 'string', required: true },
+          duplicate: { type: 'boolean' },
           workspace: { type: 'string', required: true },
           packageDir: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
           resultsPath: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
@@ -391,6 +403,7 @@ export function apply(
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(_args: unknown, exec?: ToolAgentContext) {
+      const force = (_args as { force?: boolean } | null)?.force === true
       const cfg = snapshot(config)
       const state = loadState(statePath)
       // The first evaluation claims the task for this session. Without an
@@ -402,6 +415,20 @@ export function apply(
       if (state.generationId == null) throw new Error('submit_spec first')
       const localPackageDir = join(config.workspace, 'packages', state.generationId)
       if (!existsSync(localPackageDir)) throw new Error('build_test_package first')
+      const manifest = JSON.parse(readFileSync(join(localPackageDir, 'manifest.json'), 'utf8')) as { packageHash?: string }
+      const currentHash = packageHash(localPackageDir)
+      if ((manifest.packageHash !== undefined && manifest.packageHash !== currentHash)
+          || (state.packageHash != null && state.packageHash !== currentHash)) {
+        throw new Error('package changed after build_test_package; rebuild the package before evaluation')
+      }
+      if (state.lastEvaluatedHash === currentHash && state.lastReport !== null && !force) {
+        saveState(statePath, { ...state, pendingSteer: false })
+        return fail({
+          ...state.lastReport,
+          duplicate: true,
+          summary: `duplicate package: same content as the last evaluation; previous result: ${state.lastReport.summary}`,
+        })
+      }
       const reason = stopReason(state, policyOf(config))
       if (reason) return fail(stoppedReport(state.generationId, stoppedSummary(state, reason)))
       const auth = await resolveAuth(ctx, cfg)
@@ -437,14 +464,19 @@ export function apply(
           outbox: cfg.outbox,
           timeoutMs: cfg.timeoutSec * 1000,
           intervalMs: cfg.pollIntervalMs,
+          setEnv: cfg.setEnv,
           state,
           config: policyOf(config),
         })
+        if (force && report.runRecord !== undefined) report.runRecord.params.forced = true
         saveState(statePath, {
           ...next,
+          lastEvaluatedHash: currentHash,
           ownerSessionId: owner ?? state.ownerSessionId ?? null,
           // One retry is owed for this report, and only for it.
           pendingSteer: true,
+          steerCount: 0,
+          lastSteerAt: 0,
         })
         return fail(report)
       } finally {

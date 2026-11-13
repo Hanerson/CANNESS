@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### 变更
+
+- 构建契约支持 `I32` / `I64` 真实缓冲与整数精确比较、`index-check` 精度模式、shape / attrs 的 `GoldenCtx`；未知 dtype 打包时拒绝（T-008/T-009）。
+- 性能采样默认 20 次，热身行不进入均值，实际采样次数写入 `runRecord`（T-010）。
+- 主机编译单元只引入共用 tiling 结构，链接不再使用 `--allow-multiple-definition`（T-011）。
+- manifest 记录契约指纹，上传前检查包哈希，远端先编译最小 `DataCopy` 自检（T-012）。
+- 自动续轮只驱动最近一次评测的所属会话，且一份报告只触发一次；旧 `state.json` 没有 `ownerSessionId` 时需在该会话重新评测以认领任务（T-001/T-002）。
+- 同包重复评测直接返回上一份报告并标记 `duplicate: true`；需要重测时传 `force: true`（T-004）。
+
+### 修复
+
+- 远端自动探测 CANN 的 `set_env.sh`，记录实际路径，缺失时在编译日志列出搜索路径（T-006）。
+
 ## [0.2.1] - 2026-11-06
 
 ### 新增

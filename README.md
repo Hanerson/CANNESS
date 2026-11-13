@@ -51,7 +51,7 @@ CANNESS 把这个循环交给智能体，但把边界划得很清楚：
 
 - **规格书驱动** —— `submit_spec` 逐字段校验；缺字段直接失败并给出字段路径，由模型回头追问用户，不写半成品状态。
 - **四层落盘** —— `write_operator` 一次写入 `op_kernel` / `op_host` / `op_api` / `op_plugin` 四个文件。
-- **测试包自包含** —— `build_test_package` 组装四层文件、构建契约（`build.sh` / `run_once.sh` / `main.cpp` / `golden.h` / `canness_tiling.h`）、`config.json` 与 `manifest.json`，远端拿到即可编译运行。
+- **测试包自包含** —— `build_test_package` 组装四层文件、构建契约（`build.sh` / `run_once.sh` / `main.cpp` / `golden.h` / `canness_tiling.h` / `canness_tiling_common.h`）、`config.json` 与 `manifest.json`，远端拿到即可编译运行。
 - **通用 SSH 传输** —— 基于 `ssh2` 的 `exec` + base64 tar 上传（不依赖远端 `sftp-server`）+ 结果轮询；私钥与密码两种认证，密码走 dsh 凭据存储。
 - **预算与停机** —— 有效迭代、编译重试、超时、性能连续变差、收敛、目标达成，六类条件独立判定。
 - **自动续轮** —— `canness-loop` 在 `agent/turn-stopping` 处 `steer` 一轮带评测上下文的增强块，不需要用户手动催。
@@ -315,6 +315,8 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 | `performance_target.metric` | 是 | 目前只接受 `kernel_time` |
 | `performance_target.target_us` | 是 | 有限正数 |
 | `tiling_hints` | 否 | 字符串或 `null` |
+| `attrs` | 否 | `number` / `boolean` / `string` 属性字典，原样传给 golden；契约不解释语义 |
+| `accuracyMode` | 否 | `elementwise`（默认）或 `index-check`（仅整数输出） |
 
 ### `write_operator`
 
@@ -332,10 +334,13 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 ### `build_test_package`
 
 无参数。返回 `{ packageDir }`。复制当前 generation 的四层文件，并渲染**构建契约 v1**：
-`build.sh`、`run_once.sh`、`main.cpp`、`golden.h`、`canness_tiling.h`，再写 `config.json` 与
+`build.sh`、`run_once.sh`、`main.cpp`、`golden.h`、`canness_tiling.h`、`canness_tiling_common.h`，再写 `config.json` 与
 `manifest.json`。`main.cpp` 按 spec 的输入/输出个数与 dtype 生成；`build.sh` 固化
 `soc_version` 与 bisheng 编译参数；`config.json` 按 dtype 给 `maxAbsErr`（fp16 `2^-10`、
-bf16 `2^-7`、fp32 `2^-13`）。
+bf16 `2^-7`、fp32 `2^-13`、整数 0）。未知 dtype 会明确报错。返回 `{ packageDir, contract }`；
+`contract` 记录模板修改时间、运行时 lib 哈希和插件版本。包内 `.contract-selfcheck/` 是最小
+`DataCopy` 编译自检，远端 runner 在正式 kernel 编译前执行。`run_evaluation` 上传前核对
+`manifest.packageHash`，手工改过的包需重新打包。
 
 ```json
 {
@@ -343,9 +348,10 @@ bf16 `2^-7`、fp32 `2^-13`）。
   "operatorName": "Add",
   "performanceTargetUs": 8,
   "buildContract": "v1",
+  "contract": { "schemaVersion": "v1", "templatesMtime": "...", "libHash": "sha256:...", "pluginVersion": "0.2.1" },
   "layers": ["op_kernel/kernel.cpp", "op_host/host.cpp", "op_api/api.cpp", "op_plugin/plugin.py"],
   "files": [
-    "build.sh", "canness_tiling.h", "config.json", "golden.h", "main.cpp",
+    ".contract-selfcheck/build.sh", "...", "build.sh", "canness_tiling.h", "canness_tiling_common.h", "config.json", "golden.h", "main.cpp",
     "manifest.json", "op_api/api.cpp", "op_host/host.cpp", "op_kernel/kernel.cpp",
     "op_plugin/plugin.py", "run_once.sh"
   ]
@@ -353,6 +359,9 @@ bf16 `2^-7`、fp32 `2^-13`）。
 ```
 
 `files` 是**实际落盘清单**（含 `manifest.json` 自身），排序稳定；`layers` 单独保留四层。
+上面的 `files` 以 `"..."` 省略自检目录中的其余文件，实际 manifest 会列出全部文件。
+
+浮点 `golden.h` 兼容旧签名 `float evaluate(int out, const float* const* in, int in_count, int64_t index)`。需要 shape / attrs 时定义 `CANNESS_GOLDEN_WITH_CONTEXT`，实现 `float evaluate(GoldenCtx, ...)`；整数逐元素输出实现 `int64_t evaluate_integer(GoldenCtx, ...)`；`index-check` 实现 `bool verify_index(GoldenCtx, ..., int64_t actual)`。`GoldenCtx` 提供输入 0 的 shape / rank、`attr_dim` / `attr_keepdim` 和全部属性。自定义 golden 可用 `CANNESS_REQUIRE_SHAPE(expr)` 把形状不符变成明确的精度失败。整数输出按真实 4 / 8 字节读回并精确比较。
 
 ### `write_package_file`
 
@@ -697,11 +706,13 @@ CANNESS/
 
 ### 当前限制
 
+- **续轮按 profile 生效**：`canness-loop` 的自动续轮影响同一 profile 内的会话；升级前请阅读 [CHANGELOG](CHANGELOG.md) 中的会话归属与按评测驱动变更。
+
 - **单轮单候选**：一次生成一个算子，没有并行候选、tiling 搜索、融合策略。
-- **只支持通用 SSH**：本地执行器、华为云、CANN Lab 等后端均已取消；远端怎么启动编译是主机侧的事。
+- **评测仍走 SSH**：CANNESS 设置卡可通过 CANNLab 官方端口转发建立 SSH 隧道；连接失效后需重新授权或打开隧道。
 - **知识库是文件级检索**：文件名匹配 + 正文截断，没有向量检索或结构化索引。
 - **没有 Dashboard**：迭代历史看会话日志与 `state.json`。
-- **真实主机验收未完成**：单元测试覆盖了协议与策略，但真实 SSH 主机 + 真实 CANN 工具链的端到端验证还没做。
+- **真机精度与性能验收待完成**：已在 CANNLab 真机验证最小包的编译与环境探测；整数 ArgMax 精度和多次采样仍需完成真实结果确认。
 
 ### 路线图
 

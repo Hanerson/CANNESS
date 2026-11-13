@@ -21,6 +21,7 @@ if [[ ! -x "$EXE" ]]; then
   exit 2
 fi
 
-# One correctness run. Accuracy status is in the CANNESS_RESULT JSON; a
-# non-zero badCount is a valid measurement, not a script failure.
-"$EXE"
+# One program invocation with five launches plus one warmup. The final launch
+# provides a steady-state wall-time estimate for the profiler sample budget.
+# Accuracy status is in the single CANNESS_RESULT JSON line.
+"$EXE" 5

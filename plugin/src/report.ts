@@ -26,6 +26,8 @@ export interface EvalReport {
   analysis: PerformanceAnalysis | null
   /** Present when the remote runner wrote it; older results omit it. */
   runRecord?: RunRecord
+  /** Local duplicate guard returned the previous report without using SSH. */
+  duplicate?: boolean
   summary: string
 }
 

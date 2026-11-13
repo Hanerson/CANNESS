@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { posix } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { join, posix } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { malformedReport, parseReport, stoppedReport, timeoutReport, type EvalReport } from './report.js'
 import { applyReport, stopReason, type PolicyConfig, type TaskState } from './policy.js'
 import { firstLines, shellQuote, waitForRemoteFile, type RemoteHost } from './remote.js'
+import { packageHash } from './package-files.js'
 
 /** Where `runner.py` sits relative to the built module (`lib/eval-run.js`). */
 const RUNNER_FROM_LIB = '../../remote/runner.py'
@@ -20,6 +21,7 @@ export interface RunInput {
   intervalMs: number
   state: TaskState
   config: PolicyConfig
+  setEnv?: string
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   /** Per-run temporary-name source; tests pin it so command strings are stable. */
@@ -50,12 +52,14 @@ export function runnerCommand(input: {
   outbox: string
   generationId: string
   timeoutSec: number
+  setEnv?: string
 }): string {
   const python = 'PY=$(command -v python3 || command -v python) || { echo "python3 not found on remote" >&2; exit 127; }; '
   const timeout = `if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout --kill-after=10s ${Math.max(1, Math.round(input.timeoutSec))}s"; else TIMEOUT=""; fi; `
   return `${python}${timeout}$TIMEOUT "$PY" ${shellQuote(input.runnerPath)}`
     + ` --inbox ${shellQuote(input.inbox)} --outbox ${shellQuote(input.outbox)}`
     + ` --generation ${shellQuote(input.generationId)} --once`
+    + (input.setEnv ? ` --set-env ${shellQuote(input.setEnv)}` : '')
 }
 
 function runnerFailedReport(generationId: string, detail: string): EvalReport {
@@ -80,6 +84,13 @@ function runnerFailedReport(generationId: string, detail: string): EvalReport {
 export async function runEvaluation(input: RunInput): Promise<{ report: EvalReport; state: TaskState }> {
   const reason = stopReason(input.state, input.config)
   if (reason) return { report: stoppedReport(input.generationId, reason), state: input.state }
+  const manifestPath = join(input.localPackageDir, 'manifest.json')
+  if (existsSync(manifestPath)) {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { packageHash?: string }
+    if (manifest.packageHash && manifest.packageHash !== packageHash(input.localPackageDir)) {
+      throw new Error('package changed after build_test_package; rebuild before upload')
+    }
+  }
   const remoteDir = `${input.inbox}/${input.generationId}`
   const resultPath = `${input.outbox}/${input.generationId}/results.json`
   const baseDir = posix.dirname(posix.normalize(input.inbox))
@@ -98,6 +109,7 @@ export async function runEvaluation(input: RunInput): Promise<{ report: EvalRepo
       outbox: input.outbox,
       generationId: input.generationId,
       timeoutSec: Math.round(input.timeoutMs / 1000),
+      setEnv: input.setEnv,
     }))
     if (started.code === 124) {
       const report = timeoutReport(input.generationId, Math.round(input.timeoutMs / 1000))

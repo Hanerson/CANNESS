@@ -51,7 +51,7 @@ Nothing is compiled locally, no CANN call is made locally, and no cloud API is i
 
 - **Spec-driven** — `submit_spec` validates field by field. A missing field fails with its path (`missing performance_target.metric`) and writes no half-baked state, so the model turns around and asks the user.
 - **Four-layer output** — `write_operator` writes `op_kernel`, `op_host`, `op_api` and `op_plugin` in one call.
-- **Self-contained test package** — `build_test_package` assembles the four layers, build contract (`build.sh` / `run_once.sh` / `main.cpp` / `golden.h` / `canness_tiling.h`), `config.json` and `manifest.json`; the remote side can compile and run it as-is.
+- **Self-contained test package** — `build_test_package` assembles the four layers, build contract (`build.sh` / `run_once.sh` / `main.cpp` / `golden.h` / `canness_tiling.h` / `canness_tiling_common.h`), `config.json` and `manifest.json`; the remote side can compile and run it as-is.
 - **Plain SSH transport** — `exec` + base64 tar upload (no remote `sftp-server` needed) plus result polling over `ssh2`, with private-key or password authentication; the password lives in dsh's credential store.
 - **Budget and stop conditions** — valid iterations, compile retries, timeouts, performance regression streak, convergence and target met are judged independently.
 - **Automatic continuation** — `canness-loop` steers another round carrying the evaluation context from `agent/turn-stopping`, without the user pushing it.
@@ -330,10 +330,11 @@ Returns `{ operatorDir }`. Fails with `submit_spec first` when no spec was submi
 ### `build_test_package`
 
 No parameters. Returns `{ packageDir }`. Copies the current generation's four layers and renders
-**build contract v1**: `build.sh`, `run_once.sh`, `main.cpp`, `golden.h`, `canness_tiling.h`, then
+**build contract v1**: `build.sh`, `run_once.sh`, `main.cpp`, `golden.h`, `canness_tiling.h`, `canness_tiling_common.h`, then
 writes `config.json` and `manifest.json`. `main.cpp` is generated from the spec's input/output count
 and dtypes; `build.sh` pins the soc version and bisheng flags; `config.json` derives `maxAbsErr`
 from the dtype (fp16 `2^-10`, bf16 `2^-7`, fp32 `2^-13`).
+Integer outputs use exact comparison with zero tolerance; unsupported dtypes fail during packaging. The spec may pass through `attrs` and select `accuracyMode: "index-check"` for integer index outputs. A custom `golden.h` can use `GoldenCtx` for shape and attributes, `evaluate_integer` for integer elementwise output, or `verify_index` to accept any correct maximum position. `CANNESS_REQUIRE_SHAPE` makes a mismatch an explicit accuracy failure. The returned `contract` fingerprint and `manifest.contract` identify the template modification time, runtime lib hash and plugin version. The runner compiles a minimal `DataCopy` self-check before the operator and verifies the package hash before upload. Profiling defaults to 20 measured runs and excludes warmup rows.
 
 ```json
 {
@@ -698,10 +699,10 @@ CANNESS/
 ### Current limitations
 
 - **One candidate per round** — no parallel exploration, tiling search, or fusion strategies.
-- **Plain SSH only** — local, Huawei Cloud and CANN Lab executors are gone; how the remote starts a build is the host's business.
+- **SSH evaluation** — the CANNLab settings card can open an official port-forward tunnel; reconnect when its authorization or tunnel expires.
 - **File-level knowledge base** — filename matching plus a body cap; no vector search or structured index.
 - **No dashboard** — iteration history lives in the session log and `state.json`.
-- **Real-host acceptance is outstanding** — unit tests cover protocol and policy, but the end-to-end run against a real SSH host with a real CANN toolchain has not been done.
+- **Real-host accuracy and profiling acceptance is outstanding** — minimal-package compilation and environment discovery have been checked on CANNLab; integer ArgMax accuracy and repeated sampling still need real measurements.
 
 ### Roadmap
 

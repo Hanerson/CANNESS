@@ -2,6 +2,11 @@
   "generationId": "gen-fixture001",
   "operatorName": "Gelu",
   "performanceTargetUs": 40,
+  "chip": "Ascend910B",
+  "tensorSpecs": {
+    "inputs": [{ "name": "x", "shape": ["32768"], "dtype": "float16" }],
+    "outputs": [{ "name": "y", "shape": ["32768"], "dtype": "float16" }]
+  },
   "params": {
     "blockDim": 16,
     "tileSize": 1024,

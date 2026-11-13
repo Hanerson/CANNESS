@@ -17,6 +17,9 @@ export interface PerformanceAnalysis {
   bottleneck: 'cube' | 'memory' | 'scalar' | 'unknown'
   summary: string
   op: MsprofOp | null
+  achievedBandwidthGBps?: number | null
+  rooflineUs?: number | null
+  baselineUs?: number | null
 }
 
 /** The only accepted origin: numbers came from an actual msprof run. */
@@ -63,5 +66,8 @@ export function parseAnalysis(raw: unknown): PerformanceAnalysis | null {
     bottleneck: raw.bottleneck as PerformanceAnalysis['bottleneck'],
     summary: text(raw.summary),
     op: parseOp(raw.op),
+    achievedBandwidthGBps: numOrNull(raw.achievedBandwidthGBps),
+    rooflineUs: numOrNull(raw.rooflineUs),
+    baselineUs: numOrNull(raw.baselineUs),
   }
 }

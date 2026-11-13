@@ -160,6 +160,14 @@ test('a fast-improving series far from target keeps going', () => {
   expect(isStalled(state, config)).toBe(false)
 })
 
+test('observed ArgMax series keeps improving until the final small-gain window', () => {
+  const observed = series([782, 781, 668, 398, 374, 350], 120)
+  expect(stopReason(observed, config)).toBeNull()
+  const plateau = series([782, 781, 668, 398, 374, 350, 349, 348], 120)
+  expect(stopReason(plateau, config)).toBe('stalled')
+  expect(shouldSteer(plateau, config)).toBe(false)
+})
+
 test('an identical repeated result also counts as no progress', () => {
   const state = series([350, 350, 350], 120)
   expect(isStalled(state, config)).toBe(true)

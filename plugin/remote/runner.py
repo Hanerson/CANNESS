@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import shlex
@@ -49,14 +50,20 @@ import time
 import uuid
 from pathlib import Path
 
-DEFAULT_SET_ENV = '/usr/local/Ascend/ascend-toolkit/set_env.sh'
+SYSTEM_SET_ENV = '/usr/local/Ascend/ascend-toolkit/set_env.sh'
 DEFAULT_LOCK = '/tmp/canness/davinci7.lock'
 DEFAULT_DEVICE = '7'
-DEFAULT_RUNS = 100
+DEFAULT_RUNS = 20
+PROFILE_BUDGET_US = 20_000
 DEFAULT_MAX_ABS_ERR = 1e-3
 CONTRACT_ERROR = 'package does not implement build contract v1'
 LOG_LIMIT = 20000
 CSV_DIR = 'mindstudio_profiler_output'
+# The published Ascend 910 memory hierarchy lists GM->UB at 1.2 TB/s.
+# This is for the original 910, not 910B. Unknown chips stay null until an
+# authoritative chip-specific bandwidth is available.
+# https://edu.hicomputing.huawei.com/cloud_resource/edu_public/courseReviewAttachment/1754290511519-Low_Bit_NPUs_and_CPUs_for_HPL_MxP--%E8%8E%B7%E5%A5%96%E8%AE%BA%E6%96%87%EF%BC%88%E8%96%9B%E4%BC%9F%E8%AF%9A%EF%BC%89.pdf
+PEAK_BW_GBPS = {'Ascend910': 1200.0}
 
 
 def truncate(text: str, limit: int = LOG_LIMIT) -> str:
@@ -92,10 +99,15 @@ def number(value) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            result = float(value)
+        except OverflowError:
+            return None
+        return result if math.isfinite(result) else None
     if isinstance(value, str):
         try:
-            return float(value.strip())
+            result = float(value.strip())
+            return result if math.isfinite(result) else None
         except ValueError:
             return None
     return None
@@ -106,7 +118,7 @@ def correctness_threshold(manifest: dict, config: dict) -> float:
     for source in (config, manifest):
         for key in ('maxAbsErr', 'max_abs_err', 'maxAbsError'):
             value = number(source.get(key))
-            if value is not None:
+            if value is not None and value > 0:
                 return value
         tolerance = source.get('tolerance')
         if isinstance(tolerance, dict):
@@ -127,6 +139,33 @@ def run_params(manifest: dict, config: dict) -> dict:
             if key in source and key not in params:
                 params[key] = source[key]
     return params
+
+
+def tensor_bytes(manifest: dict) -> int | None:
+    tensors = manifest.get('tensorSpecs')
+    if not isinstance(tensors, dict):
+        return None
+    sizes = {'float16': 2, 'fp16': 2, 'half': 2, 'bfloat16': 2, 'bf16': 2,
+             'float32': 4, 'fp32': 4, 'float': 4, 'int32': 4, 'i32': 4,
+             'int64': 8, 'i64': 8}
+    total = 0
+    for kind in ('inputs', 'outputs'):
+        group = tensors.get(kind)
+        if not isinstance(group, list):
+            return None
+        for tensor in group:
+            if not isinstance(tensor, dict) or not isinstance(tensor.get('shape'), list):
+                return None
+            size = sizes.get(str(tensor.get('dtype', '')).lower())
+            if size is None:
+                return None
+            elements = 1
+            for dim in tensor['shape']:
+                if not str(dim).isdigit() or int(dim) <= 0:
+                    return None
+                elements *= int(dim)
+            total += elements * size
+    return total
 
 
 def toolchain_version() -> str:
@@ -171,9 +210,37 @@ def local_path(text: str) -> Path:
     return Path(text)
 
 
-def shell_env_prefix(set_env: str, device: str) -> str:
+def discover_set_env(explicit: str, home: Path | None = None,
+                     toolkit_home: str | None = None) -> tuple[str | None, list[str]]:
+    """Choose an existing CANN environment script and retain the search trace."""
+    home = home or Path.home()
+    toolkit_home = toolkit_home if toolkit_home is not None else os.environ.get('ASCEND_TOOLKIT_HOME', '')
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    if toolkit_home:
+        candidates.append(Path(toolkit_home).expanduser() / 'set_env.sh')
+    candidates.append(home / 'Ascend' / 'ascend-toolkit' / 'set_env.sh')
+    versioned = list((home / 'Ascend').glob('cann-*/set_env.sh'))
+    def version_key(path: Path) -> tuple[int, ...]:
+        return tuple(int(part) for part in re.findall(r'\d+', path.parent.name))
+    candidates.extend(sorted(versioned, key=version_key, reverse=True))
+    candidates.append(Path(SYSTEM_SET_ENV))
+    searched: list[str] = []
+    for path in candidates:
+        name = str(path)
+        if name in searched:
+            continue
+        searched.append(name)
+        if path.is_file():
+            return name, searched
+    searched.insert(-1, str(home / 'Ascend' / 'cann-*' / 'set_env.sh'))
+    return None, searched
+
+
+def shell_env_prefix(set_env: str | None, device: str) -> str:
     prefix = ''
-    if set_env and Path(set_env).is_file():
+    if set_env:
         prefix += f'source {shlex.quote(set_env)}; '
     prefix += f'export ASCEND_VISIBLE_DEVICES={shlex.quote(device)}; '
     return prefix
@@ -231,6 +298,8 @@ COLUMNS = {
     'mte2': ('aicmte2ratio',),
     'scalar': ('aicscalarratio',),
     'cube': ('cubeutilization',),
+    'aivMte2': ('aivmte2ratio',),
+    'aivScalar': ('aivscalarratio',),
 }
 
 # op_statistic has no per-run rows; its aggregate columns are named Avg/Min/Max.
@@ -298,7 +367,7 @@ def summary_durations(paths: list[Path], operator_name: str) -> tuple[list[float
         use = matched if any_match else file_rows
         for row in use:
             value = number(row_value(row, candidate, 'duration'))
-            if value is not None:
+            if value is not None and value > 0:
                 durations.append(value)
                 rows.append(row)
         if durations and not mapping:
@@ -351,10 +420,11 @@ def build_profile(
         values = [v for v in (number(row_value(row, mapping, key)) for row in rows) if v is not None]
         return sum(values) / len(values) if values else None
 
+    vector_task = 'VECTOR' in str(row_value(first, mapping, 'taskType') or '').upper()
     ratios = {
-        'mac': average_ratio('mac'),
-        'mte2': average_ratio('mte2'),
-        'scalar': average_ratio('scalar'),
+        'mac': None if vector_task else average_ratio('mac'),
+        'mte2': average_ratio('aivMte2') if vector_task and 'aivMte2' in mapping else average_ratio('mte2'),
+        'scalar': average_ratio('aivScalar') if vector_task and 'aivScalar' in mapping else average_ratio('scalar'),
     }
     # Columns that exist but are filled with 0 mean the metrics were not
     # collected for this run (CANN 9.0.0 only writes them with the matching
@@ -381,15 +451,19 @@ def build_profile(
     }
     missing = '' if collected else ' aic-metrics were not collected for this run (all aic_* ratios are zero); no bottleneck can be named.'
     summary = (
-        f'msprof {source_label}: Task Duration avg {mean:.3f}us over {len(durations)} rows; '
+        f'msprof {source_label}: Task Duration avg {mean:.3f}us '
+        f'(min {min(durations):.3f}us, max {max(durations):.3f}us) over {len(durations)} rows; '
         f'aic_mac_ratio {op["aicMacRatio"]}, aic_mte2_ratio {op["aicMte2Ratio"]}, '
         f'aic_scalar_ratio {op["aicScalarRatio"]}.'
         f'{missing}'
     )
+    if len(durations) < 10:
+        summary += ' low_sample_count: fewer than 10 task-duration rows.'
     return {'bottleneck': bottleneck, 'summary': summary, 'op': op}
 
 
-def profile_from_csv(outdir: Path, operator_name: str) -> tuple[dict | None, str]:
+def profile_from_csv(outdir: Path, operator_name: str,
+                     warmup: int = 0) -> tuple[dict | None, str]:
     """Return (profile, error).
 
     ``kernelTimeUs`` is the arithmetic mean of every ``Task Duration(us)`` row
@@ -413,7 +487,12 @@ def profile_from_csv(outdir: Path, operator_name: str) -> tuple[dict | None, str
 
     durations, rows, mapping = summary_durations(summary_paths, operator_name)
     if durations:
-        return build_profile(durations, rows, mapping, operator_name, 'op_summary'), ''
+        excluded = min(warmup, max(0, len(durations) - 1))
+        profile = build_profile(durations[excluded:], rows[excluded:], mapping,
+                                operator_name, 'op_summary')
+        if excluded:
+            profile['summary'] += f' Excluded {excluded} warmup rows.'
+        return profile, ''
 
     durations, rows, mapping = statistic_durations(statistic_paths, operator_name)
     if durations:
@@ -429,18 +508,20 @@ def profile_executable(
     args: argparse.Namespace,
     env_prefix: str,
     operator_name: str,
+    runs: int,
 ) -> tuple[dict | None, str, str]:
     """Run msprof once over N application iterations and parse its CSV."""
     outdir = package / f'.msprof-{uuid.uuid4().hex}'
     outdir.mkdir(parents=True, exist_ok=True)
     msprof = args.msprof or shutil.which('msprof') or 'msprof'
-    argv = [bash_path(msprof), f'--application={bash_path(executable)} {args.runs}', f'--output={bash_path(outdir)}']
+    argv = [bash_path(msprof), f'--application={bash_path(executable)} {runs}',
+            f'--output={bash_path(outdir)}', '--aic-metrics=PipeUtilization']
     try:
         done = run_command(argv, env_prefix, args.msprof_timeout, cwd=package, lock=args.lock, bash_exe=args.bash)
     except subprocess.TimeoutExpired:
         return None, 'msprof timed out', f'msprof timed out after {args.msprof_timeout}s'
     log = truncate((done.stdout or '') + (done.stderr or ''))
-    profile, error = profile_from_csv(outdir, operator_name)
+    profile, error = profile_from_csv(outdir, operator_name, min(5, runs // 5))
     if profile is None:
         if done.returncode != 0:
             return None, f'msprof exited {done.returncode}: {first_line(done.stderr or done.stdout)}', log
@@ -489,6 +570,20 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     target = number(manifest.get('performanceTargetUs'))
     operator_name = manifest.get('operatorName') if isinstance(manifest.get('operatorName'), str) else generation
     params = run_params(manifest, config)
+    if args.runs < 1 or args.runs > 100_000:
+        report = make_report(generation, target, summary='--runs must be in 1..100000')
+        report['runRecord'] = record(started, params, args)
+        return report
+    # Older packages may not publish sampleUs; the target is only a fallback
+    # estimate. New packages replace this with the measured final launch time
+    # from run_once.sh before starting msprof.
+    estimated = max(1, int(PROFILE_BUDGET_US / target)) if target and target > 0 else args.runs
+    runs = min(args.runs, estimated)
+    params['runs'] = runs
+    params['requestedRuns'] = args.runs
+    params['samplingBasis'] = 'target-estimate' if target else 'requested'
+    selected_env, searched_env = discover_set_env(args.set_env)
+    params['setEnv'] = selected_env
 
     build = package / 'build.sh'
     run_once = package / 'run_once.sh'
@@ -497,7 +592,27 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         report['runRecord'] = record(started, params, args)
         return report
 
-    env_prefix = shell_env_prefix(args.set_env, args.device)
+    env_prefix = shell_env_prefix(selected_env, args.device)
+    env_warning = '' if selected_env else (
+        'set_env.sh not found; searched: ' + ', '.join(searched_env) + '; PATH may lack bisheng\n'
+    )
+    selfcheck = package / '.contract-selfcheck' / 'build.sh'
+    if selfcheck.is_file():
+        try:
+            checked = run_command([args.bash, bash_path(selfcheck)], env_prefix,
+                                  args.build_timeout, cwd=selfcheck.parent, bash_exe=args.bash)
+        except subprocess.TimeoutExpired:
+            report = make_report(generation, target, status='compile_fail',
+                                 summary='contract template itself broken: self-check timed out')
+            report['runRecord'] = record(started, params, args)
+            return report
+        if checked.returncode != 0:
+            diagnostic = truncate((checked.stdout or '') + (checked.stderr or ''))
+            report = make_report(generation, target, status='compile_fail',
+                                 compile_log=diagnostic,
+                                 summary='contract template itself broken: minimal kernel did not compile')
+            report['runRecord'] = record(started, params, args)
+            return report
     try:
         built = run_command([args.bash, bash_path(build)], env_prefix, args.build_timeout, cwd=package, bash_exe=args.bash)
     except subprocess.TimeoutExpired:
@@ -505,7 +620,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
                              summary=f'build.sh timed out after {args.build_timeout}s')
         report['runRecord'] = record(started, params, args)
         return report
-    compile_log = truncate((built.stdout or '') + (built.stderr or ''))
+    compile_log = truncate(env_warning + (built.stdout or '') + (built.stderr or ''))
     if built.returncode != 0:
         report = make_report(
             generation, target, status='compile_fail', compile_log=compile_log,
@@ -559,21 +674,32 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     threshold = correctness_threshold(manifest, config)
     correctness_ok = int(bad_count) == 0 and max_abs_err <= threshold
     if not correctness_ok:
-        placeholder = golden == 'placeholder' or int(bad_count) < 0
+        placeholder = golden == 'placeholder' or int(bad_count) == -1
+        shape_error = first_line(correctness_log.split('CANNESS_GOLDEN_ERROR ', 1)[-1]) if golden == 'shape_error' else ''
         summary = (
             'golden not implemented: fill golden.h in the package, then re-run build_test_package and run_evaluation'
             if placeholder else
+            f'golden validation failed: {shape_error or "shape assertion failed"}'
+            if golden == 'shape_error' else
             f'correctness failed: badCount {int(bad_count)}/{int(total) if total is not None else "?"}, '
             f'maxAbsErr {max_abs_err:g} > {threshold:g}'
         )
         report = make_report(
-            generation, target, status='accuracy_fail', compile_ok=True, compile_log=compile_log,
+            generation, target, status='accuracy_fail', compile_ok=True,
+            compile_log=f'{compile_log}\n{correctness_log}'.strip(),
             max_relative_error=max_rel_err, summary=summary,
         )
         report['runRecord'] = record(started, params, args)
         return report
 
-    profile, perf_error, msprof_log = profile_executable(executable, package, args, env_prefix, str(operator_name))
+    sample_us = number(result.get('sampleUs'))
+    if sample_us is not None and 0 < sample_us < float('inf'):
+        runs = min(args.runs, max(1, int(PROFILE_BUDGET_US / sample_us))) if sample_us > 1000 else args.runs
+        params['runs'] = runs
+        params['sampleUs'] = sample_us
+        params['samplingBasis'] = 'measured-launch-wall-time'
+
+    profile, perf_error, msprof_log = profile_executable(executable, package, args, env_prefix, str(operator_name), runs)
     if profile is None:
         report = make_report(
             generation, target, status='error', compile_ok=True,
@@ -585,11 +711,19 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         return report
 
     kernel_time_us = profile['op']['taskDurationUs']
+    byte_count = tensor_bytes(manifest)
+    achieved_bw = (byte_count / (kernel_time_us * 1000)
+                   if byte_count is not None and kernel_time_us > 0 else None)
+    peak_bw = PEAK_BW_GBPS.get(str(manifest.get('chip', '')))
+    roofline_us = byte_count / (peak_bw * 1000) if byte_count is not None and peak_bw else None
     analysis = {
         'source': 'msprof',
         'bottleneck': profile['bottleneck'],
         'summary': profile['summary'],
         'op': profile['op'],
+        'achievedBandwidthGBps': achieved_bw,
+        'rooflineUs': roofline_us,
+        'baselineUs': None,
     }
     if target is not None and kernel_time_us > target:
         status = 'perf_fail'
@@ -597,6 +731,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     else:
         status = 'pass'
         summary = f'kernel {kernel_time_us:.3f}us' + ('' if target is None else f' <= target {target:g}us')
+    summary += f'; measured={kernel_time_us:.3f}us, baseline=null, target={target if target is not None else "null"}us'
     report = make_report(
         generation, target, status=status, compile_ok=True, compile_log=compile_log,
         correctness_ok=True, max_relative_error=max_rel_err, kernel_time_us=kernel_time_us,
@@ -680,7 +815,8 @@ def main() -> int:
     parser.add_argument('--device', default=os.environ.get('CANNESS_ASCEND_VISIBLE_DEVICES', DEFAULT_DEVICE))
     parser.add_argument('--lock', default=os.environ.get('CANNESS_DAVINCI_LOCK', DEFAULT_LOCK),
                         help='flock file shared with other NPU jobs; empty disables locking')
-    parser.add_argument('--set-env', default=os.environ.get('CANNESS_SET_ENV', DEFAULT_SET_ENV))
+    parser.add_argument('--set-env', default=os.environ.get('CANNESS_SET_ENV', ''),
+                        help='explicit set_env.sh path (default: auto-detect)')
     parser.add_argument('--msprof', default=os.environ.get('CANNESS_MSPROF', 'msprof'))
     parser.add_argument('--bash', default=os.environ.get('CANNESS_BASH', 'bash'),
                         help='shell used to run package scripts (default: bash on PATH)')

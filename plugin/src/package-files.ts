@@ -1,6 +1,7 @@
 import {
   cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { dirname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OperatorSpec, TensorSpec } from './spec.js'
@@ -15,7 +16,7 @@ export const LAYER_FILES = {
 export type LayerName = keyof typeof LAYER_FILES
 
 /** Build contract v1 files rendered into every test package. */
-export const CONTRACT_FILES = ['build.sh', 'run_once.sh', 'main.cpp', 'golden.h', 'canness_tiling.h'] as const
+export const CONTRACT_FILES = ['build.sh', 'run_once.sh', 'main.cpp', 'golden.h', 'canness_tiling.h', 'canness_tiling_common.h'] as const
 
 /**
  * Kernel entry the build-contract `main.cpp` launches. It is fixed because the
@@ -79,6 +80,7 @@ const DEFAULT_TOTAL_ELEMENTS = 32768
 const DEFAULT_BLOCK_DIM = 16
 const DEFAULT_TILE_LENGTH = 1024
 const AGNOSTIC_THRESHOLD = 1e-3
+const CONTRACT_SCHEMA = 'v1'
 
 function writeRel(root: string, rel: string, body: string): void {
   const full = join(root, rel)
@@ -110,6 +112,7 @@ function normalizedDtype(dtype: string): string {
  */
 export function maxAbsErrForDtype(dtype: string): number {
   const name = normalizedDtype(dtype)
+  if (name === 'int64' || name === 'i64' || name === 'int32' || name === 'i32') return 0
   if (name === 'float16' || name === 'fp16' || name === 'half') return 2 ** -10
   if (name === 'bfloat16' || name === 'bf16') return 2 ** -7
   if (name === 'float32' || name === 'fp32' || name === 'float') return 2 ** -13
@@ -125,7 +128,21 @@ function cppDtype(dtype: string): CppDtype {
   const name = normalizedDtype(dtype)
   if (name === 'float16' || name === 'fp16' || name === 'half') return { cpp: 'half', enumerator: 'DType::F16' }
   if (name === 'bfloat16' || name === 'bf16') return { cpp: 'bfloat16_t', enumerator: 'DType::BF16' }
-  return { cpp: 'float', enumerator: 'DType::F32' }
+  if (name === 'float32' || name === 'fp32' || name === 'float') return { cpp: 'float', enumerator: 'DType::F32' }
+  if (name === 'int32' || name === 'i32') return { cpp: 'int32_t', enumerator: 'DType::I32' }
+  if (name === 'int64' || name === 'i64') return { cpp: 'int64_t', enumerator: 'DType::I64' }
+  throw new Error(`unsupported tensor dtype: ${dtype}`)
+}
+
+function cppString(value: string): string {
+  const bytes = Buffer.from(value, 'utf8')
+  const escaped = [...bytes].map(byte => {
+    if (byte === 34) return '\\"'
+    if (byte === 92) return '\\\\'
+    if (byte >= 32 && byte <= 126) return String.fromCharCode(byte)
+    return `\\${byte.toString(8).padStart(3, '0')}`
+  }).join('')
+  return `"${escaped}"`
 }
 
 /** Numeric element count when every dimension is a literal; null otherwise. */
@@ -184,6 +201,84 @@ function listFiles(root: string): string[] {
   return files.sort()
 }
 
+function hashFiles(root: string, files: string[]): string {
+  const hash = createHash('sha256')
+  for (const name of files) {
+    hash.update(name).update('\0').update(readFileSync(join(root, name))).update('\0')
+  }
+  return `sha256:${hash.digest('hex')}`
+}
+
+/** Record the files that actually generated this package, not a guessed tag. */
+export function contractFingerprint(): {
+  schemaVersion: string; templatesMtime: string; libHash: string; pluginVersion: string
+} {
+  const templates = buildContractTemplateDir()
+  const templateFiles = listFiles(templates)
+  const newest = Math.max(...templateFiles.map(name => statSync(join(templates, name)).mtimeMs))
+  const pluginRoot = fileURLToPath(new URL('../', import.meta.url))
+  const libDir = join(pluginRoot, 'lib')
+  const sourceDir = join(pluginRoot, 'src')
+  const root = existsSync(libDir) ? libDir : sourceDir
+  const files = listFiles(root).filter(name => name.endsWith(root === libDir ? '.js' : '.ts'))
+  const packageMeta = JSON.parse(readFileSync(join(pluginRoot, 'package.json'), 'utf8')) as { version?: string }
+  return {
+    schemaVersion: CONTRACT_SCHEMA,
+    templatesMtime: new Date(newest).toISOString(),
+    libHash: hashFiles(root, files),
+    pluginVersion: packageMeta.version ?? 'unknown',
+  }
+}
+
+function writeContractSelfCheck(dest: string, spec: OperatorSpec): void {
+  const probe: OperatorSpec = {
+    operator_name: 'CANNESSContractSelfCheck', operator_type: 'identity',
+    input_specs: [{ name: 'x', shape: ['16'], dtype: 'float16' }],
+    output_specs: [{ name: 'y', shape: ['16'], dtype: 'float16' }],
+    target_platform: spec.target_platform,
+    performance_target: { metric: 'kernel_time', target_us: 1000 },
+    tiling_hints: null,
+  }
+  const root = join(dest, '.contract-selfcheck')
+  mkdirSync(join(root, 'op_kernel'), { recursive: true })
+  const kernel = [
+    '#include "kernel_operator.h"',
+    'KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);',
+    'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR in0, GM_ADDR out0, GM_ADDR tiling) {',
+    '  (void)tiling;',
+    '  AscendC::GlobalTensor<half> x, y;',
+    '  x.SetGlobalBuffer((__gm__ half*)in0, 16);',
+    '  y.SetGlobalBuffer((__gm__ half*)out0, 16);',
+    '  AscendC::TPipe pipe;',
+    '  AscendC::TBuf<AscendC::TPosition::VECCALC> scratch;',
+    '  pipe.InitBuffer(scratch, 32);',
+    '  AscendC::LocalTensor<half> local = scratch.Get<half>();',
+    '  AscendC::DataCopy(local, x, 16);',
+    '  AscendC::DataCopy(y, local, 16);',
+    '}',
+  ].join('\n')
+  writeFileSync(join(root, 'op_kernel/kernel.cpp'), kernel)
+  for (const [name, body] of Object.entries(renderBuildContract(probe))) writeFileSync(join(root, name), body)
+}
+
+/** Stable package identity across file enumeration order and line endings. */
+export function packageHash(root: string): string {
+  const manifest = JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8')) as Record<string, unknown>
+  const { packageHash: _stored, ...metadata } = manifest
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical)
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonical(item)]))
+    }
+    return value
+  }
+  const files = listFiles(root).filter(name => name !== 'manifest.json')
+  const content = files.map(name => [name, readFileSync(join(root, name), 'utf8').replace(/\r\n?/g, '\n')])
+  return createHash('sha256').update(JSON.stringify(canonical({ metadata, content }))).digest('hex')
+}
+
 /**
  * Render the operator-independent build contract for one spec.
  *
@@ -196,6 +291,10 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
   const outputs = spec.output_specs
   const firstInput = inputs[0]!
   const firstOutput = outputs[0]!
+  for (const tensor of [...inputs, ...outputs]) cppDtype(tensor.dtype)
+  if (spec.accuracyMode === 'index-check' && outputs.some(tensor => !['int32', 'i32', 'int64', 'i64'].includes(normalizedDtype(tensor.dtype)))) {
+    throw new Error('accuracyMode index-check requires integer output tensors')
+  }
   const reference = firstInput ?? firstOutput
   const totalElements = elementCount(reference)
   // Launch geometry: the spec may pin blockDim (issue 006: the 16 default caps a
@@ -208,7 +307,23 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
   const tileLength = Math.min(DEFAULT_TILE_LENGTH, totalElements)
   const threshold = maxAbsErrForDtype(firstOutput.dtype || firstInput.dtype)
   const operatorName = safeCommentName(spec.operator_name)
-  const operatorString = spec.operator_name.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  const operatorString = cppString(spec.operator_name)
+  const attrs = Object.entries(spec.attrs ?? {})
+  const attrRows = attrs.map(([name, value]) => {
+    if (typeof value === 'string') return `{${cppString(name)}, GoldenAttrType::String, 0.0, false, ${cppString(value)}}`
+    if (typeof value === 'boolean') return `{${cppString(name)}, GoldenAttrType::Boolean, 0.0, ${value}, nullptr}`
+    return `{${cppString(name)}, GoldenAttrType::Number, ${value}, false, nullptr}`
+  })
+  const attrDim = spec.attrs?.dim
+  const attrKeepdim = spec.attrs?.keepdim
+  if (attrDim !== undefined && (typeof attrDim !== 'number' || !Number.isSafeInteger(attrDim))) {
+    throw new Error('attrs.dim must be a safe integer for GoldenCtx')
+  }
+  if (attrKeepdim !== undefined && !(typeof attrKeepdim === 'boolean' || attrKeepdim === 0 || attrKeepdim === 1)) {
+    throw new Error('attrs.keepdim must be boolean or 0/1 for GoldenCtx')
+  }
+  const shape = firstInput.shape.every(dimension => /^\d+$/.test(dimension.trim()))
+    ? firstInput.shape.map(dimension => Number(dimension)) : []
 
   const tensorSetup = [
     ...inputs.map((tensor, index) => `Tensor in${index} = make_tensor(${cppDtype(tensor.dtype).enumerator}, ${elementCount(tensor)}, true);`),
@@ -217,18 +332,18 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
   const inputList = `{ ${inputs.map((_tensor, index) => `&in${index}`).join(', ')} }`
   const outputList = `{ ${outputs.map((_tensor, index) => `&out${index}`).join(', ')} }`
   const kernelArgsDecl = [
-    ...inputs.map((_tensor, index) => `GM_ADDR in${index}`),
-    ...outputs.map((_tensor, index) => `GM_ADDR out${index}`),
-    'GM_ADDR tiling',
+    ...inputs.map((_tensor, index) => `CANNESS_GM_ADDR in${index}`),
+    ...outputs.map((_tensor, index) => `CANNESS_GM_ADDR out${index}`),
+    'CANNESS_GM_ADDR tiling',
   ].join(', ')
   // C-style casts, not static_cast: `GM_ADDR` expands to `__gm__ uint8_t*`, an
   // address space, and clang rejects `static_cast<void*, __gm__ uint8_t*>` with
   // "casts away qualifiers". The knowledge base already documents this pitfall
   // (AscendC_Compile_Run §5.5) but the generated main.cpp kept the other spelling.
   const kernelArgsCall = [
-    ...inputs.map((_tensor, index) => `(GM_ADDR)in${index}.device`),
-    ...outputs.map((_tensor, index) => `(GM_ADDR)out${index}.device`),
-    '(GM_ADDR)tiling_device',
+    ...inputs.map((_tensor, index) => `(CANNESS_GM_ADDR)in${index}.device`),
+    ...outputs.map((_tensor, index) => `(CANNESS_GM_ADDR)out${index}.device`),
+    '(CANNESS_GM_ADDR)tiling_device',
   ].join(', ')
 
   const values: Record<string, string> = {
@@ -244,6 +359,15 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     BLOCK_LENGTH: String(blockLength),
     TILE_LENGTH: String(tileLength),
     MAX_ABS_ERR: String(threshold),
+    ACCURACY_MODE: spec.accuracyMode === 'index-check' ? '1' : '0',
+    INTEGER_OUTPUT: outputs.some(tensor => ['int32', 'i32', 'int64', 'i64'].includes(normalizedDtype(tensor.dtype))) ? '1' : '0',
+    SHAPE_VALUES: shape.length ? shape.join(', ') : '0',
+    SHAPE_RANK: String(shape.length),
+    ATTR_ROWS: attrRows.length ? attrRows.join(',\n    ') : '{nullptr, GoldenAttrType::Number, 0.0, false, nullptr}',
+    ATTR_COUNT: String(attrs.length),
+    ATTR_DIM: attrDim === undefined ? '0' : String(attrDim),
+    ATTR_KEEPDIM: attrKeepdim === true || attrKeepdim === 1 ? '1' : '0',
+    INPUT_DTYPE_NAMES: inputs.map(tensor => cppString(tensor.dtype)).join(', '),
     WORKSPACE_BYTES: String(workspaceBytes),
     TENSOR_SETUP: tensorSetup,
     INPUT_LIST: inputList,
@@ -258,6 +382,7 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     'main.cpp': renderTemplate(templateBody('main.cpp'), values),
     'golden.h': goldenOverride ?? renderTemplate(templateBody('golden.h'), values),
     'canness_tiling.h': renderTemplate(templateBody('canness_tiling.h'), values),
+    'canness_tiling_common.h': renderTemplate(templateBody('canness_tiling_common.h'), values),
   }
 }
 
@@ -269,21 +394,26 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
   // toolchain problem instead of a contract problem.
   const entry = checkKernelEntry(readFileSync(join(src, 'op_kernel/kernel.cpp'), 'utf8'))
   if (!entry.ok) throw new Error(entry.reason)
+  // Validate and render before replacing an existing generated package. An
+  // unsupported dtype or malformed template must leave the last good package.
+  const goldenPath = join(src, 'golden.h')
+  const goldenOverride = existsSync(goldenPath) ? readFileSync(goldenPath, 'utf8') : undefined
+  const rendered = renderBuildContract(spec, goldenOverride)
+  const contract = contractFingerprint()
   rmSync(dest, { recursive: true, force: true })
   mkdirSync(dest, { recursive: true })
   cpSync(src, dest, { recursive: true })
 
   // write_package_file('golden.h', ...) writes the operator copy; it is the
   // model's only extension point and wins over the placeholder template.
-  const goldenPath = join(src, 'golden.h')
-  const goldenOverride = existsSync(goldenPath) ? readFileSync(goldenPath, 'utf8') : undefined
-  for (const [name, body] of Object.entries(renderBuildContract(spec, goldenOverride))) {
+  for (const [name, body] of Object.entries(rendered)) {
     writeFileSync(join(dest, name), body)
   }
+  writeContractSelfCheck(dest, spec)
 
   const threshold = maxAbsErrForDtype(spec.output_specs[0]?.dtype ?? spec.input_specs[0]!.dtype)
   const totalElements = elementCount(spec.input_specs[0] ?? spec.output_specs[0]!)
-  const blockDim = DEFAULT_BLOCK_DIM
+  const blockDim = spec.launch?.block_dim ?? DEFAULT_BLOCK_DIM
   const tileSize = Math.min(DEFAULT_TILE_LENGTH, totalElements)
   const config = {
     maxAbsErr: threshold,
@@ -301,13 +431,20 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
   writeFileSync(join(dest, 'config.json'), JSON.stringify(config, null, 2))
 
   const files = [...listFiles(dest), 'manifest.json'].sort()
-  writeFileSync(join(dest, 'manifest.json'), JSON.stringify({
+  const manifest = {
     generationId,
     operatorName: spec.operator_name,
     performanceTargetUs: spec.performance_target.target_us,
+    tensorSpecs: { inputs: spec.input_specs, outputs: spec.output_specs },
+    attrs: spec.attrs ?? {},
+    accuracyMode: spec.accuracyMode ?? 'elementwise',
+    chip: spec.target_platform.chip,
     buildContract: 'v1',
+    contract,
     layers: Object.values(LAYER_FILES),
     files,
-  }, null, 2))
+  }
+  writeFileSync(join(dest, 'manifest.json'), JSON.stringify(manifest, null, 2))
+  writeFileSync(join(dest, 'manifest.json'), JSON.stringify({ ...manifest, packageHash: packageHash(dest) }, null, 2))
   return dest
 }

@@ -7,9 +7,9 @@ cannbench 公开集的 20 个用例覆盖 1–5 维、dim ∈ {-1,0,1,2}、fp16/
 ## 契约要点（dsh-canness 构建契约 v1）
 
 - 入口：`extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR in, GM_ADDR out, GM_ADDR tiling)`；
-- 输出 dtype 声明为 int64，但**构建契约会把 int64 映射成 F32 缓冲**（`cppDtype()` 只认 f16/bf16，
-  其余一律 float）——kernel 必须把下标当 float 写回，否则按 float 解释会得到次正规数。
-  这是 issue 005，提交 cannbench 前必须改回真正的 int64；
+- 构建契约现已把 `int64` 输出映射到 8 字节 `I64` 缓冲，整数精度容差为 0；历史评测曾错误地按 F32 缓冲读取下标，因此下面的旧性能数字**不能当作新版精度通过的证据**；
+- `accuracyMode: "index-check"` 让 golden 检查返回下标是否指向最大值，允许并列时返回任一最大值位置；若目标接口严格要求 `torch.argmax` 的首个下标，kernel 仍必须实现首个下标语义；
+- `GoldenCtx` 提供输入 shape 和 `attrs.dim` / `attrs.keepdim`，不要把行长或归约维度写死；
 - `blockDim` 与 workspace 由 `spec.launch` 声明（issue 006 / 013 已实现）：
   ```json
   "launch": { "block_dim": 40, "workspace_bytes": 0 }

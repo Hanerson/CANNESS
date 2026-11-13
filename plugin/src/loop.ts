@@ -14,7 +14,11 @@ declare module '@deepseek-ai/dsh-llm' {
 export const name = 'canness-loop'
 export const inject = [] as const
 
-export interface Config extends PolicyConfig { workspace: string }
+export interface Config extends PolicyConfig {
+  workspace: string
+  minSteerIntervalMs?: number
+  maxSteerPerReport?: number
+}
 
 export const Config: z<Config> = z.object({
   workspace: z.string().required(),
@@ -26,6 +30,8 @@ export const Config: z<Config> = z.object({
   stallRounds: z.number().default(2),
   stallGain: z.number().default(0.03),
   stallGap: z.number().default(1.5),
+  minSteerIntervalMs: z.number().default(30_000),
+  maxSteerPerReport: z.number().default(3),
 })
 
 function notice(text: string) {
@@ -42,7 +48,7 @@ function sessionOf(payload: unknown): string | undefined {
   return typeof id === 'string' && id.length > 0 ? id : undefined
 }
 
-export function apply(ctx: Context, config: Config): void {
+export function apply(ctx: Context, config: Config, now: () => number = Date.now): void {
   const path = join(config.workspace, '.canness', 'state.json')
 
   /**
@@ -59,7 +65,19 @@ export function apply(ctx: Context, config: Config): void {
     if (!ownsSession(state, sessionOf(payload))) return undefined
     if (state.pendingSteer !== true) return undefined
     if (!shouldSteer(state, config)) return undefined
+    if ((state.steerCount ?? 0) >= (config.maxSteerPerReport ?? 3)) return undefined
+    const previous = state.lastSteerAt ?? 0
+    if (previous > 0 && now() - previous < (config.minSteerIntervalMs ?? 30_000)) return undefined
     return state
+  }
+
+  const consume = (state: ReturnType<typeof loadState>): void => {
+    saveState(path, {
+      ...state,
+      pendingSteer: false,
+      steerCount: (state.steerCount ?? 0) + 1,
+      lastSteerAt: now(),
+    })
   }
 
   ctx.on('agent/pre-step', async (payload, next) => {
@@ -75,7 +93,7 @@ export function apply(ctx: Context, config: Config): void {
     // The retry is owed once. Consuming it here keeps the next turn from
     // receiving the same sentence again; the turn-stopping steer below only
     // fires when this path did not.
-    saveState(path, { ...state, pendingSteer: false })
+    consume(state)
     return {
       kind: 'enter',
       ...(decision.startsRequestSeries ? { startsRequestSeries: true as const } : {}),
@@ -90,7 +108,7 @@ export function apply(ctx: Context, config: Config): void {
     if (agent === undefined || typeof agent.steer !== 'function') return
     // Consume before steering: a steer starts a turn, and that turn must not
     // find the same pending retry waiting for it.
-    saveState(path, { ...state, pendingSteer: false })
+    consume(state)
     agent.steer(notice(enhancementBlock(state, config)))
   })
 }

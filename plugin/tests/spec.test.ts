@@ -27,3 +27,19 @@ test('rejects a non-positive target', () => {
     performance_target: { metric: 'kernel_time', target_us: 0 },
   })).toThrow('missing performance_target.target_us')
 })
+
+test('preserves symbolic shapes but rejects invalid or overflowing numeric shapes', () => {
+  const withShape = (shape: string[]) => ({
+    ...valid, input_specs: [{ name: 'input', shape, dtype: 'float16' }],
+  })
+  expect(parseSpec(withShape(['B', '4096'])).input_specs[0]?.shape).toEqual(['B', '4096'])
+  for (const shape of [['0'], ['-1'], ['3.5'], ['1e3'], [''], ['9007199254740992'], ['100000000', '100000000']]) {
+    expect(() => parseSpec(withShape(shape))).toThrow('shape')
+  }
+})
+
+test('attributes reject nested, nonfinite and unsupported accuracy modes', () => {
+  expect(() => parseSpec({ ...valid, attrs: { dim: Number.NaN } })).toThrow('attrs.dim')
+  expect(() => parseSpec({ ...valid, attrs: { shape: [1, 2] } })).toThrow('attrs.shape')
+  expect(() => parseSpec({ ...valid, accuracyMode: 'always-pass' })).toThrow('accuracyMode')
+})

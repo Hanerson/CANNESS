@@ -13,6 +13,10 @@ export interface OperatorSpec {
   target_platform: { chip: string; soc_version?: string; cann_version?: string }
   performance_target: { metric: 'kernel_time'; target_us: number; reference?: string }
   tiling_hints: string | null
+  /** Operator attributes are passed through to the golden reference. */
+  attrs?: Record<string, number | boolean | string>
+  /** Index check accepts any correct argmax tie position. */
+  accuracyMode?: 'elementwise' | 'index-check'
   /**
    * Optional launch geometry. The build contract used to hardcode blockDim=16,
    * which caps a kernel at 40% of the AIV cores on a 40-core device (measured
@@ -36,6 +40,21 @@ function needTensor(value: unknown, path: string): TensorSpec {
   const shape = value.shape
   if (!Array.isArray(shape) || shape.some(item => typeof item !== 'string')) {
     throw new Error(`missing ${path}.shape`)
+  }
+  let literalElements = 1
+  let allLiteral = true
+  for (const dimension of shape) {
+    if (dimension.trim() === '' ||
+        /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(dimension.trim()) && !/^\d+$/.test(dimension.trim())) {
+      throw new Error(`${path}.shape must contain positive dimensions or nonempty symbols`)
+    }
+    if (!/^\d+$/.test(dimension.trim())) { allLiteral = false; continue }
+    const size = Number(dimension)
+    if (!Number.isSafeInteger(size) || size <= 0) throw new Error(`${path}.shape must contain positive safe dimensions`)
+    literalElements *= size
+  }
+  if (allLiteral && !Number.isSafeInteger(literalElements)) {
+    throw new Error(`${path}.shape element count exceeds safe integer range`)
   }
   const tensor: TensorSpec = {
     name: needString(value.name, `${path}.name`),
@@ -74,6 +93,24 @@ export function parseSpec(raw: unknown): OperatorSpec {
   if (typeof platform.soc_version === 'string') spec.target_platform.soc_version = platform.soc_version
   if (typeof platform.cann_version === 'string') spec.target_platform.cann_version = platform.cann_version
   if (typeof perf.reference === 'string') spec.performance_target.reference = perf.reference
+  if (raw.attrs !== undefined) {
+    if (!isRecord(raw.attrs)) throw new Error('attrs must be an object')
+    const attrs: Record<string, number | boolean | string> = {}
+    for (const [name, value] of Object.entries(raw.attrs)) {
+      if (name.length === 0 || !(
+        typeof value === 'string' || typeof value === 'boolean' ||
+        (typeof value === 'number' && Number.isFinite(value))
+      )) throw new Error(`attrs.${name} must be a finite number, boolean or string`)
+      attrs[name] = value
+    }
+    spec.attrs = attrs
+  }
+  if (raw.accuracyMode !== undefined) {
+    if (raw.accuracyMode !== 'elementwise' && raw.accuracyMode !== 'index-check') {
+      throw new Error('accuracyMode must be elementwise or index-check')
+    }
+    spec.accuracyMode = raw.accuracyMode
+  }
   // Optional launch geometry: a positive integer block_dim, clamped to the AIV
   // block count the launch API accepts, plus optional scratch bytes.
   const launch = isRecord(raw.launch) ? raw.launch : undefined

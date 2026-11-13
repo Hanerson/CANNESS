@@ -46,11 +46,15 @@ The CANNLab connection uses a separate credential: only the refresh token is per
 ## 4. 远端 / Remote
 
 `build_test_package` 在四层之外渲染**构建契约 v1**：`build.sh`、`run_once.sh`、`main.cpp`、
-`golden.h`、`canness_tiling.h`，并写 `config.json`（按 dtype 推导 `maxAbsErr`）与
+`golden.h`、`canness_tiling.h`、`canness_tiling_common.h`，并写 `config.json`（按 dtype 推导 `maxAbsErr`）与
 `manifest.json`（`files` 为实际落盘清单，`layers` 为四层）。`main.cpp` / `build.sh` 是算子
 无关的骨架；kernel 入口固定为 `canness_kernel`（输入 → 输出 → tiling）。模型只通过
 `write_package_file('golden.h', ...)` 填精度公式；占位实现会让评测返回 `accuracy_fail`
 与 `golden not implemented`，不会假通过。
+
+整数输出 `int32` / `int64` 按 4 / 8 字节分配并精确比较（容差 0）；未知 dtype 会在打包时明确报错。`accuracyMode: "index-check"` 要求整数输出，由自定义 `golden.h` 实现 `bool verify_index(GoldenCtx, int out, const float* const* in, int in_count, int64_t element, int64_t actual)`，用于允许并列最大值的任意正确位置。普通浮点 golden 保留旧版 `float evaluate(int out, const float* const* in, int in_count, int64_t element)`；需要形状和属性时，在自定义 `golden.h` 定义 `CANNESS_GOLDEN_WITH_CONTEXT` 并实现 `float evaluate(GoldenCtx, ...)`。整数逐元素模式实现 `int64_t evaluate_integer(GoldenCtx, ...)`。`GoldenCtx` 含输入 0 的 `shape` / `rank`、`attr_dim` / `attr_keepdim`、全部 `attrs` 的类型化数组，以及整数输入的原始字节缓冲；读取原始整数时按 `input_dtype_names` 用 `memcpy`，避免浮点精度损失及未对齐访问。`attrs` 由 spec 原样透传，契约不解释算子语义。`CANNESS_REQUIRE_SHAPE(expr)` 可使形状不符的 golden 显式失败。
+
+每个包含 `manifest.contract`（模板修改时间、运行时 lib 哈希、插件版本）和最小 `DataCopy` 编译自检。远端 runner 先编译自检，再编译实际 kernel；上传前核对 `manifest.packageHash`。性能默认采样 20 次，程序热身后只对最后结果做一次精度校验，msprof 统计会排除热身行；`runRecord.params.runs` 记录实际采样次数。
 
 ```bash
 # 远端手工复现（runner 由 run_evaluation 以 runner-<uuid>.py 上传到 dirname(inbox)）
@@ -64,7 +68,7 @@ python3 /tmp/canness/runner-<uuid>.py \
 隧道断开时返回 `status: "error"` 与 `tunnel is down; reconnect from Settings → CANNESS`。
 
 `build_test_package` renders build contract v1 on top of the four layers: `build.sh`,
-`run_once.sh`, `main.cpp`, `golden.h`, `canness_tiling.h`, plus `config.json` (dtype-derived
+`run_once.sh`, `main.cpp`, `golden.h`, `canness_tiling.h`, `canness_tiling_common.h`, plus `config.json` (dtype-derived
 `maxAbsErr`) and `manifest.json` (`files` = actual on-disk list, `layers` = the four layers).
 `main.cpp` / `build.sh` are operator-independent; the kernel entry is fixed to `canness_kernel`
 (inputs, then outputs, then tiling). The model only owns `golden.h` through
@@ -93,6 +97,13 @@ pnpm build    # tsc + esbuild → lib/
 ```
 
 `lib/` 是 dsh 实际加载的产物，改完源码必须重新 build。The profile links this directory, so `plugin add` is not needed again after the first install.
+
+| 改动位置 | 生效时机 | 备注 |
+|---|---|---|
+| `templates/build-contract/*` | 下一次 `build_test_package` | 每次从磁盘读取 |
+| `remote/runner.py` | 下一次 `run_evaluation` | 每次上传 |
+| `src/**.ts` / `lib/**.js` | `pnpm build` 后重启 dsh 或重载插件 | `lib/` 是运行期加载的产物 |
+| `knowledge_base/*` | 下一次 `kb_search` | 每次从磁盘读取 |
 
 ## 6. 许可 / License
 

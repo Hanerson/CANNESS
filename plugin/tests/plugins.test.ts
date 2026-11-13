@@ -10,7 +10,7 @@ import * as loop from '../src/loop.ts'
 import { emptyState, type PolicyConfig } from '../src/policy.ts'
 import { MemoryRemote, type RemoteHost } from '../src/remote.ts'
 import type { EvalReport } from '../src/report.ts'
-import { saveState } from '../src/state-file.ts'
+import { loadState, saveState } from '../src/state-file.ts'
 
 const vol = <T,>(value: T): Volatile<T> => ({ get: () => value })
 
@@ -194,9 +194,40 @@ test('run_evaluation claims the task for the calling session and owes exactly on
 
   // A later call from another session takes over the task rather than leaving
   // two sessions believing they own it.
-  await ctx.toolsRegistered[0]!.execute({}, { agent: { session: { id: 'session-b' } } })
+  await ctx.toolsRegistered[0]!.execute({ force: true }, { agent: { session: { id: 'session-b' } } })
   const taken = JSON.parse(readFileSync(statePath, 'utf8')) as { ownerSessionId?: string }
   expect(taken.ownerSessionId).toBe('session-b')
+})
+
+test('unchanged package reuses the report without SSH; changed code and force run again', async () => {
+  const ready = readyPackage()
+  const statePath = join(ready.workspace, '.canness', 'state.json')
+  const packageDir = join(ready.workspace, 'packages', ready.generationId)
+  writeFileSync(join(packageDir, 'op_kernel.cpp'), 'first')
+  const remote = new MemoryRemote()
+  const resultPath = `/out/${ready.generationId}/results.json`
+  remote.appearOnRead(resultPath, Buffer.from(JSON.stringify({
+    ...failReport('perf_fail'),
+    runRecord: { timestamp: '2026-11-06T10:00:00+0800', host: 'npu', params: {}, toolchain: 'CANN', durationMs: 1 },
+  })), 1)
+  let connections = 0
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(ready.workspace, { privateKeyPath: vol(join(ready.workspace, 'id_key')) }),
+    async () => { connections += 1; return remote })
+  const tool = ctx.toolsRegistered[0]!
+  await tool.execute({})
+  expect(connections).toBe(1)
+  const valid = loadState(statePath).validIterations
+  const duplicate = await tool.execute({}) as EvalReport
+  expect(duplicate).toMatchObject({ status: 'perf_fail', duplicate: true })
+  expect(connections).toBe(1)
+  expect(loadState(statePath)).toMatchObject({ validIterations: valid, pendingSteer: false })
+  writeFileSync(join(packageDir, 'op_kernel.cpp'), 'second')
+  await tool.execute({})
+  expect(connections).toBe(2)
+  const forced = await tool.execute({ force: true }) as EvalReport
+  expect(connections).toBe(3)
+  expect(forced.runRecord?.params.forced).toBe(true)
 })
 
 test('run_evaluation closes after a finished attempt and after an upload failure', async () => {
@@ -552,4 +583,46 @@ test('turn-stopping steers once per owed retry, and only for the owning session'
   })
   stopping.fn(agentFor('session-a'))
   expect(steered).toHaveLength(2)
+})
+
+test('automatic prompts obey the interval and per-report cap', () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
+  const lp = fakeCtx()
+  let now = 100_000
+  loop.apply(lp as never, { workspace, ...policy, minSteerIntervalMs: 30_000, maxSteerPerReport: 3 }, () => now)
+  const stopping = lp.listeners.find(item => item.event === 'agent/turn-stopping')!
+  const statePath = join(workspace, '.canness', 'state.json')
+  let count = 0
+  const payload = { agent: { session: { id: 'session-a' }, steer: () => { count += 1 } } }
+  const owed = () => saveState(statePath, {
+    ...loadState(statePath), pendingSteer: true,
+  })
+  saveState(statePath, {
+    ...emptyState(), ownerSessionId: 'session-a', pendingSteer: true, lastReport: failReport('perf_fail'),
+  })
+  stopping.fn(payload)
+  expect(count).toBe(1)
+  expect(loadState(statePath)).toMatchObject({ steerCount: 1, lastSteerAt: now, pendingSteer: false })
+  owed()
+  now += 29_999
+  stopping.fn(payload)
+  expect(count).toBe(1)
+  now += 1
+  stopping.fn(payload)
+  expect(count).toBe(2)
+  owed()
+  now += 30_000
+  stopping.fn(payload)
+  expect(count).toBe(3)
+  owed()
+  now += 30_000
+  stopping.fn(payload)
+  expect(count).toBe(3)
+  expect(loadState(statePath).pendingSteer).toBe(true)
+  // A new report resets the fuse, including the timestamp.
+  saveState(statePath, {
+    ...loadState(statePath), steerCount: 0, lastSteerAt: 0, pendingSteer: true,
+  })
+  stopping.fn(payload)
+  expect(count).toBe(4)
 })

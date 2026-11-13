@@ -5,7 +5,7 @@ import { expect, test } from 'vitest'
 import { newGenerationId } from '../src/ids.ts'
 import {
   buildContractTemplateDir, buildTestPackage, checkKernelEntry, CONTRACT_FILES, KERNEL_ENTRY, LAYER_FILES,
-  maxAbsErrForDtype, renderBuildContract, writeOperator,
+  maxAbsErrForDtype, packageHash, renderBuildContract, writeOperator,
 } from '../src/package-files.ts'
 import { parseSpec } from '../src/spec.ts'
 import { emptyState } from '../src/policy.ts'
@@ -125,7 +125,10 @@ test('the package carries every build contract file, rendered for the spec', () 
   expect(main).toContain('#define CANNESS_MAX_ABS_ERR 0.0009765625')
 
   const tiling = readFileSync(join(pkg, 'canness_tiling.h'), 'utf8')
-  expect(tiling).toContain('struct CannessTilingData')
+  const common = readFileSync(join(pkg, 'canness_tiling_common.h'), 'utf8')
+  expect(common).toContain('struct CannessTilingData')
+  expect(common).not.toContain('#include "kernel_operator.h"')
+  expect(tiling).toContain('#include "canness_tiling_common.h"')
   expect(tiling).toContain('using DTYPE_X = half;')
   expect(tiling).toContain('#ifndef GET_TILING_DATA')
 
@@ -137,6 +140,18 @@ test('manifest.files equals the files actually on disk', () => {
   const { pkg } = packageFor()
   const manifest = JSON.parse(readFileSync(join(pkg, 'manifest.json'), 'utf8'))
   expect(manifest.files).toEqual(diskFiles(pkg))
+})
+
+test('package hash is stable across rebuilds and line endings, but changes with code', () => {
+  const { workspace, pkg } = packageFor()
+  const first = packageHash(pkg)
+  expect(JSON.parse(readFileSync(join(pkg, 'manifest.json'), 'utf8')).packageHash).toBe(first)
+  expect(packageHash(buildTestPackage(workspace, 'gen-01234567', specFor('float16')))).toBe(first)
+  const kernel = join(pkg, 'op_kernel', 'kernel.cpp')
+  writeFileSync(kernel, readFileSync(kernel, 'utf8').replace(/\n/g, '\r\n'))
+  expect(packageHash(pkg)).toBe(first)
+  writeFileSync(kernel, `${readFileSync(kernel, 'utf8')}\n// changed\n`)
+  expect(packageHash(pkg)).not.toBe(first)
 })
 
 test('config.json derives maxAbsErr from the tensor dtype', () => {

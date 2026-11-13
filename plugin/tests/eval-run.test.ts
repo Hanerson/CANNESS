@@ -2,9 +2,10 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, test } from 'vitest'
-import { runEvaluation } from '../src/eval-run.ts'
+import { runEvaluation, runnerCommand } from '../src/eval-run.ts'
 import { emptyState, type PolicyConfig } from '../src/policy.ts'
 import { MemoryRemote } from '../src/remote.ts'
+import { packageHash } from '../src/package-files.ts'
 
 const config: PolicyConfig = {
   maxIterations: 10,
@@ -13,11 +14,29 @@ const config: PolicyConfig = {
   convergenceThreshold: 0.05,
 }
 
+test('runnerCommand forwards a configured set_env path safely', () => {
+  const command = runnerCommand({ runnerPath: '/tmp/runner.py', inbox: '/in', outbox: '/out', generationId: 'gen-1', timeoutSec: 10, setEnv: '/home/developer/Ascend/cann-9.0.0/set env.sh' })
+  expect(command).toContain("--set-env '/home/developer/Ascend/cann-9.0.0/set env.sh'")
+})
+
 function pack(): string {
   const dir = mkdtempSync(join(tmpdir(), 'canness-pkg-'))
   writeFileSync(join(dir, 'manifest.json'), '{}')
   return dir
 }
+
+test('a changed package is rejected before any remote upload', async () => {
+  const dir = pack()
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ packageHash: packageHash(dir) }))
+  writeFileSync(join(dir, 'main.cpp'), '// modified after package assembly')
+  const remote = new MemoryRemote()
+  await expect(runEvaluation({
+    files: remote, localPackageDir: dir, generationId: 'gen-drift',
+    inbox: '/in', outbox: '/out', timeoutMs: 1000, intervalMs: 1000,
+    state: emptyState(), config,
+  })).rejects.toThrow('package changed after build_test_package')
+  expect(remote.files.size).toBe(0)
+})
 
 test('uploads then parses a result that shows up later', async () => {
   const remote = new MemoryRemote()

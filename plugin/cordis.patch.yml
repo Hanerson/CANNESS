@@ -21,6 +21,7 @@
         outbox: /tmp/canness-a/outbox
         timeoutSec: 1800
         pollIntervalMs: 2000
+        setEnv: ""
         maxIterations: 10
         maxCompileRetries: 3
         negativeStreakLimit: 3

@@ -7,6 +7,7 @@
 #pragma once
 
 #include "kernel_operator.h"
+#include "canness_tiling_common.h"
 
 using DTYPE_X = {{DTYPE_X}};
 using DTYPE_Y = {{DTYPE_Y}};
@@ -17,13 +18,6 @@ using DTYPE_Y = {{DTYPE_Y}};
 // scratch area at
 //     (__gm__ uint8_t *)tiling + sizeof(CannessTilingData)
 // Kernels stay signature-compatible (issue 013); 0 means "no scratch".
-struct CannessTilingData {
-    uint32_t totalLength;
-    uint32_t blockLength;
-    int64_t tileLength;
-    uint64_t workspaceSize;
-};
-
 // A __gm__ struct cannot be copied to local memory as a value, so read field
 // by field. The internal pointer name is deliberately unlikely to collide with
 // the caller's tiling variable (`GET_TILING_DATA(t, tiling)` must work).

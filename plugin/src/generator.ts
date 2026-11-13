@@ -5,7 +5,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { newGenerationId } from './ids.js'
-import { buildTestPackage, checkKernelEntry, KERNEL_ENTRY, writeOperator } from './package-files.js'
+import { buildTestPackage, checkKernelEntry, contractFingerprint, KERNEL_ENTRY, packageHash, writeOperator } from './package-files.js'
 import { emptyState } from './policy.js'
 import { parseSpec } from './spec.js'
 import { loadState, saveState } from './state-file.js'
@@ -142,26 +142,41 @@ export function apply(ctx: Context, config: Config): void {
     name: 'build_test_package',
     description: [
       'Assemble the current generation into a build-contract-v1 package: the four operator layers plus',
-      'build.sh, run_once.sh, main.cpp, golden.h, canness_tiling.h, config.json and manifest.json.',
+      'build.sh, run_once.sh, main.cpp, golden.h, canness_tiling.h, canness_tiling_common.h, config.json and manifest.json.',
       'main.cpp/build.sh/run_once.sh/canness_tiling.h are rendered by the plugin and are operator-independent;',
       'the accuracy reference comes from golden.h (the model-owned extension point).',
       `The kernel entry must be void ${KERNEL_ENTRY}(<inputs>, <outputs>, GM_ADDR tiling); this tool refuses to`,
       'package a kernel that does not define it.',
       'manifest.json.files lists what actually landed on disk; manifest.json.layers lists the four layers.',
+      'Integer outputs use exact comparison; index-check mode calls golden::verify_index with the actual integer.',
+      'For shape and attrs, use GoldenCtx and CANNESS_GOLDEN_WITH_CONTEXT in golden.h.',
     ].join(' '),
     parameters: {},
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
-        properties: { packageDir: { type: 'string', required: true } },
+        properties: {
+          packageDir: { type: 'string', required: true },
+          contract: {
+            type: 'object', required: true, additionalProperties: false,
+            properties: {
+              schemaVersion: { type: 'string', required: true },
+              templatesMtime: { type: 'string', required: true },
+              libHash: { type: 'string', required: true },
+              pluginVersion: { type: 'string', required: true },
+            },
+          },
+        },
       },
       render: (_args, value) => render(value),
     },
     async execute() {
       const state = loadState(path)
       if (state.generationId == null || state.spec == null) throw new Error('submit_spec first')
-      return { packageDir: buildTestPackage(config.workspace, state.generationId, state.spec) }
+      const packageDir = buildTestPackage(config.workspace, state.generationId, state.spec)
+      saveState(path, { ...state, packageHash: packageHash(packageDir) })
+      return { packageDir, contract: contractFingerprint() }
     },
   }))
   ctx.tools.register(defineTool({

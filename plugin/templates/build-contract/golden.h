@@ -23,6 +23,8 @@
 
 #include <cmath>
 #include <cstdint>
+// CANNESS_REQUIRE_SHAPE(condition) is defined by main.cpp before this include.
+// A failed assertion becomes an explicit accuracy failure in the runner.
 
 #define CANNESS_GOLDEN_PLACEHOLDER 1
 
@@ -33,5 +35,19 @@ inline float evaluate(int out, const float* const* in, int in_count, int64_t ind
     (void)in_count;
     (void)index;
     return 0.0f;
+}
+// Integer outputs use exact comparison. Custom integer golden.h must implement
+// this overload; converting an int64 index through float would lose precision.
+inline int64_t evaluate_integer(GoldenCtx ctx, int out, const float* const* in,
+                                int in_count, int64_t index) {
+    (void)ctx; (void)out; (void)in; (void)in_count; (void)index;
+    return 0;
+}
+// index-check mode verifies a returned position against the source values.
+// A custom golden.h must implement this; ties can then accept any maximum.
+inline bool verify_index(GoldenCtx ctx, int out, const float* const* in,
+                         int in_count, int64_t index, int64_t actual) {
+    (void)ctx; (void)out; (void)in; (void)in_count; (void)index; (void)actual;
+    return false;
 }
 }  // namespace canness_golden
