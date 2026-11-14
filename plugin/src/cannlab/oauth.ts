@@ -15,7 +15,7 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { randomBytes } from 'node:crypto'
 import {
-  CALLBACK_GRACE_MS, CALLBACK_PORT, CALLBACK_URI, GITCODE_AUTHORIZE_URL, GITCODE_CLIENT_ID,
+  CALLBACK_PORT, CALLBACK_URI, GITCODE_AUTHORIZE_URL, GITCODE_CLIENT_ID,
   GITCODE_REFERER, GITCODE_TOKEN_URL, GITCODE_USER_URL, OAUTH_TIMEOUT_MS,
 } from './constants.js'
 import type { Fetcher } from './api.js'
@@ -132,47 +132,23 @@ function reply(response: ServerResponse, status: number, html: string): void {
   response.end(html)
 }
 
-/** Releases the listener of the previous successful sign-in, if still up. */
-let releaseLingering: (() => Promise<void>) | undefined
-
 /**
  * Listen for the one callback that carries an authorization code.
- * A failure stops the server at once. A success resolves immediately but keeps
- * the listener for `graceMs`, answering any further callback with "already
- * signed in" instead of a refused connection; a new attempt preempts it.
+ * The server stops as soon as it settles, on success or failure, so a second
+ * click never meets a busy port left behind by the first.
  * @param expectedState - the nonce this attempt issued.
  * @param timeoutMs - how long to wait.
  * @param signal - caller cancellation; the listener closes and the wait rejects.
- * @param graceMs - how long to keep answering after success.
  * @returns the authorization code.
  */
-async function waitForCode(
-  expectedState: string,
-  timeoutMs: number,
-  signal?: AbortSignal,
-  graceMs: number = CALLBACK_GRACE_MS,
-): Promise<string> {
-  // A previous sign-in may still be inside its post-success window; this
-  // attempt needs the fixed port, so it waits for the release and takes over.
-  const previous = releaseLingering
-  releaseLingering = undefined
-  if (previous !== undefined) await previous().catch(() => {})
-
-  return await new Promise<string>((resolve, reject) => {
+function waitForCode(expectedState: string, timeoutMs: number, signal?: AbortSignal): Promise<string> {
+  return new Promise((resolve, reject) => {
     let settled = false
-    let answered = false
     let timer: NodeJS.Timeout | undefined
-    let graceTimer: NodeJS.Timeout | undefined
     const server = createServer((request: IncomingMessage, response: ServerResponse) => {
       const requestUrl = new URL(request.url ?? '/', CALLBACK_URI)
       if (requestUrl.pathname !== new URL(CALLBACK_URI).pathname) {
         response.writeHead(404).end()
-        return
-      }
-      // Every callback after the successful one lands here: a reload of the
-      // tab, a restored session, or a second tab opened by a double click.
-      if (answered) {
-        reply(response, 200, callbackPage(true, '这次登录已经授权成功，可以关闭此页面。'))
         return
       }
       const failure = requestUrl.searchParams.get('error')
@@ -193,86 +169,35 @@ async function waitForCode(
         finish(new Error('oauth callback carried no code'))
         return
       }
-      answered = true
       reply(response, 200, callbackPage(true, '一次性授权码已经交给本机进程。'))
-      // The sign-in result must not wait for the window; only the listener does.
-      deliver(null, code)
-      holdOpen()
+      finish(null, code)
     })
 
-    /** Settle the promise once, without touching the listener. */
-    const deliver = (error: Error | null, code?: string): void => {
+    const finish = (error: Error | null, code?: string): void => {
       if (settled) return
       settled = true
       if (timer !== undefined) clearTimeout(timer)
       signal?.removeEventListener('abort', onAbort)
-      if (error === null) resolve(code ?? '')
-      else reject(error)
-    }
-
-    /** Close the listener and resolve once the port is really released. */
-    const close = (): Promise<void> => new Promise<void>((done) => {
-      if (graceTimer !== undefined) clearTimeout(graceTimer)
-      let finished = false
-      const once = (): void => {
-        if (finished) return
-        finished = true
-        done()
+      // The attempt settles only once the listener is really gone: a caller
+      // that immediately retries would otherwise see the fixed port as busy
+      // while the previous socket is still tearing down.
+      let done = false
+      let guard: NodeJS.Timeout | undefined
+      const settle = (): void => {
+        if (done) return
+        done = true
+        if (guard !== undefined) clearTimeout(guard)
+        if (error === null) resolve(code ?? '')
+        else reject(error)
       }
-      const guard = setTimeout(once, 500)
+      guard = setTimeout(settle, 500)
       guard.unref()
       try {
         server.closeAllConnections()
+        server.close(() => { settle() })
       } catch {
-        // No connection left to drop.
+        settle()
       }
-      try {
-        server.close(() => { once() })
-      } catch {
-        once()
-      }
-    })
-
-    /**
-     * A failure settles after the port is released, so a caller that retries
-     * immediately does not meet the fixed port as busy.
-     */
-    const finish = (error: Error | null, code?: string): void => {
-      if (settled) {
-        void close()
-        return
-      }
-      settled = true
-      if (timer !== undefined) clearTimeout(timer)
-      signal?.removeEventListener('abort', onAbort)
-      void close().then(() => {
-        if (error === null) resolve(code ?? '')
-        else reject(error)
-      })
-    }
-
-    /**
-     * After success the result is delivered at once, but the listener stays up
-     * for a short window so a reload or a restored tab gets an explanation
-     * instead of a refused connection.
-     */
-    const holdOpen = (): void => {
-      if (graceMs <= 0) {
-        void close()
-        return
-      }
-      let released = false
-      const release = async (): Promise<void> => {
-        if (released) return
-        released = true
-        await close()
-      }
-      graceTimer = setTimeout(() => {
-        releaseLingering = undefined
-        void release()
-      }, graceMs)
-      graceTimer.unref()
-      releaseLingering = release
     }
 
     /** A caller that walks away must free the fixed callback port at once. */
@@ -303,7 +228,6 @@ async function waitForCode(
  * @param hooks - progress reporting and browser launch.
  * @param timeoutMs - how long to wait for the callback.
  * @param signal - caller cancellation; the listener closes at once.
- * @param graceMs - how long the callback keeps answering after success.
  * @returns tokens plus the account name.
  */
 export async function interactiveLogin(
@@ -311,13 +235,12 @@ export async function interactiveLogin(
   hooks: LoginHooks,
   timeoutMs: number = OAUTH_TIMEOUT_MS,
   signal?: AbortSignal,
-  graceMs: number = CALLBACK_GRACE_MS,
 ): Promise<LoginResult> {
   const state = randomBytes(32).toString('hex')
   const authorizeUrl = buildAuthorizeUrl(state)
   // The listener is created before the browser opens, so the callback can
   // never arrive before we are ready for it.
-  const waiting = waitForCode(state, timeoutMs, signal, graceMs)
+  const waiting = waitForCode(state, timeoutMs, signal)
   hooks.onStep('login-required', 'GitCode authorization required.', authorizeUrl)
   hooks.onStep('login-awaiting', `Waiting for the browser callback on 127.0.0.1:${String(CALLBACK_PORT)}.`, authorizeUrl)
   const opened = await hooks.openBrowser(authorizeUrl)
