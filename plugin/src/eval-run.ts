@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { join, posix } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { malformedReport, parseReport, stoppedReport, timeoutReport, type EvalReport } from './report.js'
+import { malformedReport, parseReport, stoppedReport, timeoutReport, type EvalReport, type JsonValue } from './report.js'
 import { applyReport, stopReason, type PolicyConfig, type TaskState } from './policy.js'
 import { firstLines, shellQuote, waitForRemoteFile, type RemoteHost } from './remote.js'
 import { packageHash } from './package-files.js'
@@ -54,12 +54,28 @@ export function runnerCommand(input: {
   timeoutSec: number
   setEnv?: string
 }): string {
-  const python = 'PY=$(command -v python3 || command -v python) || { echo "python3 not found on remote" >&2; exit 127; }; '
   const timeout = `if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout --kill-after=10s ${Math.max(1, Math.round(input.timeoutSec))}s"; else TIMEOUT=""; fi; `
-  return `${python}${timeout}$TIMEOUT "$PY" ${shellQuote(input.runnerPath)}`
+  return `${findPython}${timeout}$TIMEOUT "$PY" ${shellQuote(input.runnerPath)}`
     + ` --inbox ${shellQuote(input.inbox)} --outbox ${shellQuote(input.outbox)}`
     + ` --generation ${shellQuote(input.generationId)} --once`
     + (input.setEnv ? ` --set-env ${shellQuote(input.setEnv)}` : '')
+}
+
+const findPython = 'PY=$(command -v python3 || command -v python) || { echo "python3 not found on remote" >&2; exit 127; }; '
+
+/** Run the runner's toolchain check from stdin, without creating remote files. */
+export async function preflightToolchain(files: RemoteHost, setEnv: string): Promise<JsonValue> {
+  const script = readFileSync(runnerScriptFile()).toString('base64')
+  const result = await files.exec(`${findPython}printf %s ${shellQuote(script)} | base64 -d | "$PY" - --preflight`
+    + (setEnv ? ` --set-env ${shellQuote(setEnv)}` : ''))
+  if (result.code !== 0) {
+    throw new Error(firstLines(result.stderr, 4) || `CANN toolchain probe exited with code ${result.code}`)
+  }
+  const facts = JSON.parse(result.stdout.trim().split(/\r?\n/u).at(-1) ?? '') as JsonValue
+  if (facts === null || typeof facts !== 'object' || Array.isArray(facts) || typeof facts.ready !== 'boolean') {
+    throw new Error('CANN toolchain probe returned malformed data')
+  }
+  return facts
 }
 
 function runnerFailedReport(generationId: string, detail: string): EvalReport {
@@ -81,9 +97,13 @@ function runnerFailedReport(generationId: string, detail: string): EvalReport {
  * under a uuid name, so concurrent evaluations cannot overwrite each other and
  * the package contract stays exactly what the generator produced.
  */
-export async function runEvaluation(input: RunInput): Promise<{ report: EvalReport; state: TaskState }> {
+export async function runEvaluation(input: RunInput): Promise<{
+  report: EvalReport
+  state: TaskState
+  resultWritten: boolean
+}> {
   const reason = stopReason(input.state, input.config)
-  if (reason) return { report: stoppedReport(input.generationId, reason), state: input.state }
+  if (reason) return { report: stoppedReport(input.generationId, reason), state: input.state, resultWritten: false }
   const manifestPath = join(input.localPackageDir, 'manifest.json')
   if (existsSync(manifestPath)) {
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { packageHash?: string }
@@ -113,13 +133,13 @@ export async function runEvaluation(input: RunInput): Promise<{ report: EvalRepo
     }))
     if (started.code === 124) {
       const report = timeoutReport(input.generationId, Math.round(input.timeoutMs / 1000))
-      return { report, state: applyReport(input.state, report) }
+      return { report, state: applyReport(input.state, report), resultWritten: false }
     }
     const early = await input.files.readFile(resultPath)
     if (early === null && started.code !== 0) {
       const detail = firstLines(started.stderr, 20) || firstLines(started.stdout, 20) || `exit ${started.code}`
       const report = runnerFailedReport(input.generationId, detail)
-      return { report, state: applyReport(input.state, report) }
+      return { report, state: applyReport(input.state, report), resultWritten: false }
     }
     const body = early ?? await waitForRemoteFile(input.files, resultPath, {
       timeoutMs: input.timeoutMs,
@@ -128,12 +148,12 @@ export async function runEvaluation(input: RunInput): Promise<{ report: EvalRepo
       sleep: input.sleep,
     })
     const report = parseReport(JSON.parse(Buffer.from(body).toString('utf8')))
-    return { report, state: applyReport(input.state, report) }
+    return { report, state: applyReport(input.state, report), resultWritten: true }
   } catch (error) {
     const report = error instanceof Error && error.message === 'timeout'
       ? timeoutReport(input.generationId, Math.round(input.timeoutMs / 1000))
       : malformedReport(input.generationId, error instanceof Error ? error.message : 'unknown')
-    return { report, state: applyReport(input.state, report) }
+    return { report, state: applyReport(input.state, report), resultWritten: false }
   } finally {
     // Best-effort: a stale temp script is harmless, a failed cleanup is not a
     // reason to lose the report above.

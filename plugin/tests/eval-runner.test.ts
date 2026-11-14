@@ -106,6 +106,25 @@ function results(outbox: string): Record<string, any> {
   return JSON.parse(readFileSync(join(outbox, 'gen-fixture001', 'results.json'), 'utf8'))
 }
 
+test.skipIf(python === null)('preflight sources the selected environment and reports available CANN tools', () => {
+  const root = mkdtempSync(join(tmpdir(), 'canness-preflight-'))
+  const choose = join(root, 'set_env.sh')
+  const home = root.replaceAll('\\', '/')
+  writeFileSync(join(root, 'version.cfg'), 'version=9.0.0\n')
+  writeFileSync(choose, [
+    `export ASCEND_TOOLKIT_HOME="${home}"`,
+    'export CANNESS_BISHENG=printf',
+    '',
+  ].join('\n'))
+  const done = spawnSync(python!, [
+    runner, '--preflight', '--bash', bashCommand(), '--set-env', choose, '--msprof', 'true',
+  ], { encoding: 'utf8' })
+  expect(done.status, done.stderr).toBe(0)
+  expect(JSON.parse(done.stdout), done.stdout).toMatchObject({
+    ready: true, toolchain: 'CANN 9.0.0', setEnv: choose, compiler: 'printf', msprof: 'true',
+  })
+})
+
 test.skipIf(python === null)('the report uses the msprof CSV number, not the manifest target', () => {
   const { root, inbox, outbox } = packageAt()
   const done = runRunner(root, inbox, outbox, fakeMsprof(root, CSV))
@@ -187,6 +206,39 @@ test.skipIf(python === null)('an exact correctness threshold of zero is preserve
   writeFileSync(join(pkg, 'config.json'), JSON.stringify({ maxAbsErr: 0 }))
   expect(runRunner(root, inbox, outbox, fakeMsprof(root, CSV)).status).toBe(0)
   expect(results(outbox)).toMatchObject({ status: 'accuracy_fail', summary: expect.stringContaining('> 0') })
+})
+
+test.skipIf(python === null)('per-element accuracy can pass with both diagnostic maxima over budget', () => {
+  const { root, inbox, outbox } = packageAt()
+  const pkg = join(inbox, 'gen-fixture001')
+  const inputValues = [{ name: 'x', values: ['nan', '+inf', '-inf'] }]
+  writeFileSync(join(pkg, 'config.json'), JSON.stringify({
+    maxAbsErr: 2 ** -10,
+    accuracyComparison: 'per-element',
+    params: { inputValues },
+  }))
+  const result = { comparison: 'per-element', maxAbsErr: 0.00195, maxRelErr: 1, badCount: 0, total: 8 }
+  const runOnce = join(pkg, 'run_once.sh')
+  const writeResult = (value: object) => {
+    rmSync(join(outbox, 'gen-fixture001', 'results.json'), { force: true })
+    writeFileSync(runOnce, `echo 'CANNESS_RESULT ${JSON.stringify(value)}'\n`)
+  }
+  writeResult(result)
+  expect(runRunner(root, inbox, outbox, fakeMsprof(root, CSV)).status).toBe(0)
+  expect(results(outbox)).toMatchObject({
+    status: 'pass',
+    correctness: { ok: true, maxRelativeError: 1 },
+    runRecord: { params: { inputValues } },
+  })
+
+  writeResult({ ...result, badCount: 1 })
+  expect(runRunner(root, inbox, outbox, fakeMsprof(root, CSV)).status).toBe(0)
+  expect(results(outbox)).toMatchObject({ status: 'accuracy_fail', summary: expect.stringContaining('badCount 1/8') })
+
+  const { comparison: _legacy, ...unmarked } = result
+  writeResult(unmarked)
+  expect(runRunner(root, inbox, outbox, fakeMsprof(root, CSV)).status).toBe(0)
+  expect(results(outbox)).toMatchObject({ status: 'error', summary: expect.stringContaining('per-element') })
 })
 
 test.skipIf(python === null)('a multi-row op_summary is averaged, not first-row sampled', () => {

@@ -7,7 +7,7 @@
 //
 // The program prints exactly one machine-readable line:
 //
-//   CANNESS_RESULT {"maxAbsErr":...,"maxRelErr":...,"badCount":...,"total":...,"golden":"..."}
+//   CANNESS_RESULT {"comparison":"per-element","maxAbsErr":...,"maxRelErr":...,"badCount":...,"total":...}
 //
 // A placeholder golden.h forces badCount to -1, which the remote runner maps to
 // `accuracy_fail` (never a pass).
@@ -21,10 +21,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
-#include "canness_tiling_common.h"
+#include "canness_tiling_host.h"
 // Available in every custom golden.h, including files that replace the whole
 // placeholder template. A mismatch becomes an explicit accuracy failure.
 #define CANNESS_REQUIRE_SHAPE(condition) do { \
@@ -42,7 +44,6 @@
 #define CANNESS_BLOCK_DIM {{BLOCK_DIM}}
 #define CANNESS_BLOCK_LENGTH {{BLOCK_LENGTH}}
 #define CANNESS_TILE_LENGTH {{TILE_LENGTH}}
-#define CANNESS_MAX_ABS_ERR {{MAX_ABS_ERR}}
 #define CANNESS_INDEX_CHECK {{ACCURACY_MODE}}
 #define CANNESS_INTEGER_OUTPUT {{INTEGER_OUTPUT}}
 #define CANNESS_FLOAT_OUTPUT {{FLOAT_OUTPUT}}
@@ -104,6 +105,7 @@ static uint16_t float_to_f16(float value) {
 static uint16_t float_to_bf16(float value) {
     uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
+    if (std::isnan(value)) return static_cast<uint16_t>((bits >> 16) | 0x0040u);
     const uint32_t rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
     return static_cast<uint16_t>(rounded >> 16);
 }
@@ -233,7 +235,8 @@ static GoldenCtx golden_context(const void* const* raw_inputs) {
     return ctx;
 }
 
-static Tensor make_tensor(DType dtype, int64_t elements, bool input) {
+static Tensor make_tensor(DType dtype, int64_t elements, bool input,
+                          std::initializer_list<float> samples = {}) {
     Tensor tensor;
     tensor.elements = elements;
     tensor.dtype = dtype;
@@ -242,8 +245,41 @@ static Tensor make_tensor(DType dtype, int64_t elements, bool input) {
         for (int64_t index = 0; index < elements; ++index) {
             store_value(dtype, tensor.host.data(), index, pattern_value(dtype, index));
         }
+        int64_t index = 0;
+        for (const float value : samples) store_value(dtype, tensor.host.data(), index++, value);
     }
     return tensor;
+}
+
+struct Tolerance {
+    double abs;
+    double rel;
+};
+
+static constexpr Tolerance output_tolerances[] = { {{OUTPUT_TOLERANCES}} };
+
+static bool float_matches(float actual, float expected, DType dtype, Tolerance tolerance,
+                          double& max_abs, double& max_rel, int64_t& nonfinite_mismatches) {
+    // Half an output ULP past the largest finite value rounds to infinity.
+    // Keep finite comparisons against the original float golden value.
+    if (std::isfinite(expected)) {
+        if (dtype == DType::F16 && std::fabs(expected) >= 65520.0f) {
+            expected = std::copysign(std::numeric_limits<float>::infinity(), expected);
+        } else if (dtype == DType::BF16 && std::fabs(expected) >= 0x1.ffp127f) {
+            expected = std::copysign(std::numeric_limits<float>::infinity(), expected);
+        }
+    }
+    if (!std::isfinite(actual) || !std::isfinite(expected)) {
+        const bool matches = actual == expected || (std::isnan(actual) && std::isnan(expected));
+        if (!matches) ++nonfinite_mismatches;
+        return matches;
+    }
+    const double abs_error = std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
+    const double denominator = std::fabs(static_cast<double>(expected));
+    const double rel_error = denominator > 0.0 ? abs_error / denominator : (abs_error > 0.0 ? 1.0 : 0.0);
+    max_abs = std::max(max_abs, abs_error);
+    max_rel = std::max(max_rel, rel_error);
+    return abs_error <= tolerance.abs || (denominator > 0.0 && rel_error <= tolerance.rel);
 }
 
 static int fail(const char* step, int code) {
@@ -303,15 +339,20 @@ int main(int argc, char** argv) {
     tiling_host.blockLength = static_cast<uint32_t>(CANNESS_BLOCK_LENGTH);
     tiling_host.tileLength = CANNESS_TILE_LENGTH;
     tiling_host.workspaceSize = static_cast<uint64_t>(CANNESS_WORKSPACE_BYTES);
-    const size_t tiling_bytes = sizeof(CannessTilingData) + static_cast<size_t>(CANNESS_WORKSPACE_BYTES);
+    const auto attr_buffer = cannessPackAttrs(canness_attrs, CANNESS_ATTR_COUNT);
+    const size_t attr_offset = cannessAttrOffset(tiling_host.workspaceSize);
+    const size_t tiling_bytes = attr_offset + attr_buffer.size();
     void* tiling_device = nullptr;
     status = aclrtMalloc(&tiling_device, tiling_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
     if (status != ACL_SUCCESS) return fail("aclrtMalloc(tiling)", static_cast<int>(status));
-    // Only the descriptor comes from the host stack; the scratch tail stays as
-    // device memory and belongs to the kernel to initialise.
+    // The descriptor and the table are copied individually; scratch belongs
+    // to the kernel and may be large.
     status = aclrtMemcpy(tiling_device, sizeof(CannessTilingData), &tiling_host,
                          sizeof(CannessTilingData), ACL_MEMCPY_HOST_TO_DEVICE);
     if (status != ACL_SUCCESS) return fail("aclrtMemcpy(tiling)", static_cast<int>(status));
+    status = aclrtMemcpy(static_cast<uint8_t*>(tiling_device) + attr_offset, attr_buffer.size(),
+                         attr_buffer.data(), attr_buffer.size(), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (status != ACL_SUCCESS) return fail("aclrtMemcpy(attributes)", static_cast<int>(status));
 
     double last_launch_us = 0.0;
     for (int iteration = 0; iteration < warmup + runs; ++iteration) {
@@ -348,6 +389,7 @@ int main(int argc, char** argv) {
     double max_rel = 0.0;
     int64_t bad = 0;
     int64_t total = 0;
+    int64_t nonfinite_mismatches = 0;
     bool golden_error = false;
     std::vector<const void*> raw_input_pointers(inputs.size(), nullptr);
     for (size_t index = 0; index < inputs.size(); ++index) {
@@ -393,19 +435,10 @@ int main(int argc, char** argv) {
                         static_cast<int>(output), input_pointers.data(),
                         static_cast<int>(inputs.size()), element);
 #endif
-                    if (!std::isfinite(actual) || !std::isfinite(expected)) {
-                        ++bad; max_abs = std::max(max_abs, CANNESS_MAX_ABS_ERR + 1.0); max_rel = 1.0;
-                        continue;
+                    if (!float_matches(actual, expected, outputs[output]->dtype, output_tolerances[output],
+                                       max_abs, max_rel, nonfinite_mismatches)) {
+                        ++bad;
                     }
-                    const double abs_error = std::fabs(static_cast<double>(actual) -
-                                                       static_cast<double>(expected));
-                    const double denominator = std::fabs(static_cast<double>(expected));
-                    const double rel_error = denominator > 0.0
-                        ? abs_error / denominator
-                        : (abs_error > 0.0 ? 1.0 : 0.0);
-                    if (abs_error > max_abs) max_abs = abs_error;
-                    if (rel_error > max_rel) max_rel = rel_error;
-                    if (abs_error > CANNESS_MAX_ABS_ERR) ++bad;
 #endif
                 }
 #endif
@@ -434,9 +467,9 @@ int main(int argc, char** argv) {
     aclFinalize();
 
     std::printf(
-        "CANNESS_RESULT {\"maxAbsErr\":%.9g,\"maxRelErr\":%.9g,"
-        "\"badCount\":%lld,\"total\":%lld,\"golden\":\"%s\",\"sampleUs\":%.9g}\n",
+        "CANNESS_RESULT {\"comparison\":\"per-element\",\"maxAbsErr\":%.9g,\"maxRelErr\":%.9g,"
+        "\"badCount\":%lld,\"total\":%lld,\"nonfiniteMismatches\":%lld,\"golden\":\"%s\",\"sampleUs\":%.9g}\n",
         max_abs, max_rel, static_cast<long long>(bad),
-        static_cast<long long>(total), golden, last_launch_us);
+        static_cast<long long>(total), static_cast<long long>(nonfinite_mismatches), golden, last_launch_us);
     return 0;
 }

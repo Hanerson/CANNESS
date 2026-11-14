@@ -168,8 +168,8 @@ def tensor_bytes(manifest: dict) -> int | None:
     return total
 
 
-def toolchain_version() -> str:
-    home = os.environ.get('ASCEND_TOOLKIT_HOME') or '/usr/local/Ascend/ascend-toolkit/latest'
+def toolchain_version(toolkit_home: str | None = None, compiler: str | None = None) -> str:
+    home = toolkit_home or os.environ.get('ASCEND_TOOLKIT_HOME') or '/usr/local/Ascend/ascend-toolkit/latest'
     version_cfg = Path(home) / 'version.cfg'
     try:
         if version_cfg.is_file():
@@ -180,7 +180,7 @@ def toolchain_version() -> str:
                         return f'CANN {value.strip()}'
     except OSError:
         pass
-    for exe in ('bisheng', 'ccec'):
+    for exe in (compiler,) if compiler else ('bisheng', 'ccec'):
         if shutil.which(exe) is None:
             continue
         try:
@@ -241,7 +241,7 @@ def discover_set_env(explicit: str, home: Path | None = None,
 def shell_env_prefix(set_env: str | None, device: str) -> str:
     prefix = ''
     if set_env:
-        prefix += f'source {shlex.quote(set_env)}; '
+        prefix += f'source {shlex.quote(bash_path(set_env))}; '
     prefix += f'export ASCEND_VISIBLE_DEVICES={shlex.quote(device)}; '
     return prefix
 
@@ -267,6 +267,42 @@ def run_command(
         errors='replace',
         timeout=timeout,
     )
+
+
+def preflight(args: argparse.Namespace) -> int:
+    """Inspect the environment selected for evaluation without running the package."""
+    selected, searched = discover_set_env(args.set_env)
+    issues = []
+    if args.set_env and not Path(args.set_env).expanduser().is_file():
+        issues.append(f'configured set_env.sh does not exist: {args.set_env}')
+    try:
+        command = (shell_env_prefix(selected, args.device)
+                   + 'printf "%s\\n%s\\n%s\\n" "$ASCEND_TOOLKIT_HOME" '
+                     '"$(command -v "${CANNESS_BISHENG:-bisheng}")" "$(command -v "$1")"')
+        inspected = subprocess.run(
+            [args.bash, '-c', command, 'canness', args.msprof],
+            capture_output=True, encoding='utf-8', errors='replace', timeout=10,
+        )
+        if inspected.returncode != 0:
+            raise ValueError(first_line(inspected.stderr) or f'exit {inspected.returncode}')
+        toolkit, compiler, profiler = inspected.stdout.splitlines()[-3:]
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        toolkit, compiler, profiler = '', '', ''
+        issues.append(f'CANN inspection failed: {error}')
+    if not compiler:
+        issues.append('bisheng is missing from the selected environment')
+    if not profiler:
+        issues.append('msprof is missing from the selected environment')
+    print(json.dumps({
+        'ready': not issues,
+        'toolchain': toolchain_version(str(local_path(toolkit)) if toolkit else None, compiler),
+        'setEnv': selected,
+        'searchedEnv': searched,
+        'compiler': compiler or None,
+        'msprof': profiler or None,
+        'issues': issues,
+    }))
+    return 0
 
 
 def parse_canness_result(stdout: str) -> dict | None:
@@ -671,26 +707,43 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     total = number(result.get('total'))
     max_abs_err = number(result.get('maxAbsErr'))
     max_rel_err = number(result.get('maxRelErr'))
+    nonfinite_mismatches = number(result.get('nonfiniteMismatches', 0))
     golden = result.get('golden') if isinstance(result.get('golden'), str) else None
     if golden:
         params['golden'] = golden
-    if bad_count is None or max_abs_err is None:
+    if bad_count is None or not bad_count.is_integer() or max_abs_err is None or max_abs_err < 0:
         report = make_report(generation, target, status='error', compile_ok=True, compile_log=compile_log,
                              summary='run_once.sh printed CANNESS_RESULT without badCount / maxAbsErr')
         report['runRecord'] = record(started, params, args)
         return report
+    per_element = config.get('accuracyComparison') == 'per-element'
+    if per_element:
+        if (result.get('comparison') != 'per-element' or max_rel_err is None or max_rel_err < 0
+                or total is None or not total.is_integer() or total <= 0 or bad_count > total
+                or nonfinite_mismatches is None or not nonfinite_mismatches.is_integer()
+                or not 0 <= nonfinite_mismatches <= total
+                or (bad_count >= 0 and nonfinite_mismatches > bad_count)):
+            report = make_report(generation, target, status='error', compile_ok=True, compile_log=compile_log,
+                                 summary='run_once.sh printed an invalid per-element accuracy result')
+            report['runRecord'] = record(started, params, args)
+            return report
+        params['nonfiniteMismatches'] = int(nonfinite_mismatches)
     threshold = correctness_threshold(manifest, config)
-    correctness_ok = int(bad_count) == 0 and max_abs_err <= threshold
+    correctness_ok = (bad_count == 0 and golden not in ('placeholder', 'shape_error')
+                      and (per_element or max_abs_err <= threshold))
     if not correctness_ok:
         placeholder = golden == 'placeholder' or int(bad_count) == -1
         shape_error = first_line(correctness_log.split('CANNESS_GOLDEN_ERROR ', 1)[-1]) if golden == 'shape_error' else ''
+        errors = (f'maxAbsErr {max_abs_err:g}, maxRelErr {max_rel_err:g}, '
+                  f'nonfinite mismatches {int(nonfinite_mismatches)}' if per_element else
+                  f'maxAbsErr {max_abs_err:g} > {threshold:g}' if max_abs_err > threshold else
+                  f'maxAbsErr {max_abs_err:g} (budget {threshold:g})')
         summary = (
             'golden not implemented: fill golden.h in the package, then re-run build_test_package and run_evaluation'
             if placeholder else
             f'golden validation failed: {shape_error or "shape assertion failed"}'
             if golden == 'shape_error' else
-            f'correctness failed: badCount {int(bad_count)}/{int(total) if total is not None else "?"}, '
-            f'maxAbsErr {max_abs_err:g} > {threshold:g}'
+            f'correctness failed: badCount {int(bad_count)}/{int(total) if total is not None else "?"}, {errors}'
         )
         report = make_report(
             generation, target, status='accuracy_fail', compile_ok=True,
@@ -813,8 +866,8 @@ def main() -> int:
         except (AttributeError, OSError):
             pass
     parser = argparse.ArgumentParser(description='CANNESS remote evaluation runner (build contract v1)')
-    parser.add_argument('--inbox', required=True)
-    parser.add_argument('--outbox', required=True)
+    parser.add_argument('--inbox')
+    parser.add_argument('--outbox')
     parser.add_argument('--generation', default='', help='only this generation (default: every pending manifest)')
     parser.add_argument('--once', action='store_true', help='scan once and exit (the default)')
     parser.add_argument('--loop', action='store_true', help='keep scanning until killed')
@@ -831,7 +884,12 @@ def main() -> int:
     parser.add_argument('--build-timeout', type=int, default=1800)
     parser.add_argument('--run-timeout', type=int, default=600)
     parser.add_argument('--msprof-timeout', type=int, default=1800)
+    parser.add_argument('--preflight', action='store_true', help='check the remote CANN toolchain without evaluating')
     args = parser.parse_args()
+    if args.preflight:
+        return preflight(args)
+    if args.inbox is None or args.outbox is None:
+        parser.error('--inbox and --outbox are required for evaluation')
 
     inbox = Path(args.inbox)
     outbox = Path(args.outbox)

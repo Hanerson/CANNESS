@@ -6,29 +6,27 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { newGenerationId } from './ids.js'
 import { buildTestPackage, checkKernelEntry, contractFingerprint, KERNEL_ENTRY, packageHash, writeOperator } from './package-files.js'
+import { parseProvenance } from './provenance.js'
 import { emptyState } from './policy.js'
 import { parseSpec } from './spec.js'
 import { loadState, saveState } from './state-file.js'
+import { exportSubmission } from './submission.js'
+import { resolveWorkspace, statePath } from './workspace.js'
 
 export const name = 'canness-generator'
 export const inject = ['tools']
 
-export interface Config { workspace: string }
+export interface Config { workspace?: string }
 
 export const Config: z<Config> = z.object({
-  workspace: z.string().required(),
+  workspace: z.string().default(''),
 })
-
-function statePath(workspace: string): string {
-  return join(workspace, '.canness', 'state.json')
-}
 
 function render(value: unknown): [{ type: 'text'; text: string }] {
   return [{ type: 'text', text: JSON.stringify(value) }]
 }
 
 export function apply(ctx: Context, config: Config): void {
-  const path = statePath(config.workspace)
   ctx.tools.register(defineTool({
     name: 'submit_spec',
     description: [
@@ -48,6 +46,7 @@ export function apply(ctx: Context, config: Config): void {
         additionalProperties: false,
         properties: {
           generationId: { type: 'string', required: true },
+          workspace: { type: 'string', required: true },
           operator_name: { type: 'string', required: true },
           carriedOver: { type: 'boolean', required: true },
           relaxedTargetFromUs: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
@@ -55,7 +54,9 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_args, value) => render(value),
     },
-    async execute(args) {
+    async execute(args, exec) {
+      const workspace = resolveWorkspace(config.workspace, exec)
+      const path = statePath(workspace)
       const spec = parseSpec(args.spec)
       const generationId = newGenerationId(randomUUID())
       const prior = loadState(path)
@@ -99,6 +100,7 @@ export function apply(ctx: Context, config: Config): void {
       })
       return {
         generationId,
+        workspace,
         operator_name: spec.operator_name,
         carriedOver,
         relaxedTargetFromUs,
@@ -112,12 +114,14 @@ export function apply(ctx: Context, config: Config): void {
       `The kernel entry point is fixed: op_kernel/kernel.cpp must define "extern \"C\" __global__ __aicore__ void ${KERNEL_ENTRY}(<inputs>, <outputs>, GM_ADDR tiling)" —`,
       'inputs first, then outputs, then the tiling pointer, and no workspace argument.',
       'The package\'s main.cpp calls that exact symbol, so any other name or parameter order fails to link.',
+      'Read launch.tile_length from GET_TILING_DATA(t, tiling). Read runtime attrs using CannessAttrs(tiling, t.workspaceSize).',
     ].join(' '),
     parameters: {
       kernel: { type: 'string', required: true, description: `op_kernel/kernel.cpp body; must define void ${KERNEL_ENTRY}(<inputs>, <outputs>, GM_ADDR tiling)` },
       host: { type: 'string', required: true, description: 'op_host/host.cpp body' },
       api: { type: 'string', required: true, description: 'op_api/api.cpp body' },
       plugin: { type: 'string', required: true, description: 'op_plugin/plugin.py body' },
+      provenance: { type: 'json', description: 'Per-layer source declaration keyed by kernel, host, api or plugin. Entries have kind generated, adapted_from or copied_from, and an optional source and sha256.' },
     },
     output: {
       schema: {
@@ -127,14 +131,15 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_args, value) => render(value),
     },
-    async execute(args) {
-      const state = loadState(path)
+    async execute(args, exec) {
+      const workspace = resolveWorkspace(config.workspace, exec)
+      const state = loadState(statePath(workspace))
       if (state.generationId == null || state.spec == null) throw new Error('submit_spec first')
       const entry = checkKernelEntry(args.kernel)
       if (!entry.ok) throw new Error(entry.reason)
-      const operatorDir = writeOperator(config.workspace, state.generationId, {
+      const operatorDir = writeOperator(workspace, state.generationId, {
         kernel: args.kernel, host: args.host, api: args.api, plugin: args.plugin,
-      })
+      }, parseProvenance(args.provenance))
       return { operatorDir }
     },
   }))
@@ -142,7 +147,7 @@ export function apply(ctx: Context, config: Config): void {
     name: 'build_test_package',
     description: [
       'Assemble the current generation into a build-contract-v1 package: the four operator layers plus',
-      'build.sh, run_once.sh, main.cpp, golden.h, canness_tiling.h, canness_tiling_common.h, config.json and manifest.json.',
+      'build.sh, run_once.sh, main.cpp, golden.h, the canness_tiling headers, config.json and manifest.json.',
       'main.cpp/build.sh/run_once.sh/canness_tiling.h are rendered by the plugin and are operator-independent;',
       'the accuracy reference comes from golden.h (the model-owned extension point).',
       `The kernel entry must be void ${KERNEL_ENTRY}(<inputs>, <outputs>, GM_ADDR tiling); this tool refuses to`,
@@ -171,12 +176,43 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_args, value) => render(value),
     },
-    async execute() {
+    async execute(_args, exec) {
+      const workspace = resolveWorkspace(config.workspace, exec)
+      const path = statePath(workspace)
       const state = loadState(path)
       if (state.generationId == null || state.spec == null) throw new Error('submit_spec first')
-      const packageDir = buildTestPackage(config.workspace, state.generationId, state.spec)
-      saveState(path, { ...state, packageHash: packageHash(packageDir) })
+      const packageDir = buildTestPackage(workspace, state.generationId, state.spec)
+      const hash = packageHash(packageDir)
+      const pendingStage = state.lastEvaluatedHash === hash && state.pendingStage == null ? null : 'run_evaluation'
+      saveState(path, { ...state, packageHash: hash, pendingStage })
       return { packageDir, contract: contractFingerprint() }
+    },
+  }))
+  ctx.tools.register(defineTool({
+    name: 'export_submission',
+    description: 'Export the current same-shape operator package as CANNBench direct-launch source and zip. Works offline. Use callable to match the official task signature, e.g. exp. Build and verify the wheel on the target NPU.',
+    parameters: {
+      callable: { type: 'string', description: 'Public Python callable name. Defaults to the operator name in the spec.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          sourceDir: { type: 'string', required: true },
+          archivePath: { type: 'string', required: true },
+          packageDir: { type: 'string', required: true },
+          callable: { type: 'string', required: true },
+          signature: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => render(value),
+    },
+    async execute(args, exec) {
+      const workspace = resolveWorkspace(config.workspace, exec)
+      const state = loadState(statePath(workspace))
+      if (state.generationId == null || state.spec == null) throw new Error('submit_spec first')
+      return exportSubmission(workspace, state.generationId, state.spec, args.callable)
     },
   }))
   ctx.tools.register(defineTool({
@@ -203,16 +239,17 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_args, value) => render(value),
     },
-    async execute(args) {
-      const state = loadState(path)
+    async execute(args, exec) {
+      const workspace = resolveWorkspace(config.workspace, exec)
+      const state = loadState(statePath(workspace))
       if (state.generationId == null || state.spec == null) throw new Error('submit_spec first')
       const normalized = args.path.trim().replace(/\\/g, '/').replace(/^\.\//, '')
       if (normalized !== 'golden.h') {
         throw new Error('write_package_file only accepts golden.h')
       }
       const body = args.content
-      const destinations = [join(config.workspace, 'operators', state.generationId, 'golden.h')]
-      const packageCopy = join(config.workspace, 'packages', state.generationId, 'golden.h')
+      const destinations = [join(workspace, 'operators', state.generationId, 'golden.h')]
+      const packageCopy = join(workspace, 'packages', state.generationId, 'golden.h')
       if (existsSync(dirname(packageCopy))) destinations.push(packageCopy)
       for (const destination of destinations) {
         mkdirSync(dirname(destination), { recursive: true })

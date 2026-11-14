@@ -102,6 +102,22 @@ test('writeOperator and buildTestPackage lay down the four layers and manifest',
   expect(readFileSync(join(pkg, 'op_plugin/plugin.py'), 'utf8')).toBe('P')
 })
 
+test('package attests layer content and links exact reuse to an earlier generation', () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-provenance-'))
+  const layers = { kernel: VALID_KERNEL, host: 'host', api: 'api', plugin: 'plugin' }
+  writeOperator(workspace, 'gen-01234567', layers)
+  writeOperator(workspace, 'gen-89abcdef', layers, {
+    kernel: { kind: 'adapted_from', source: 'KB example' },
+  })
+  const pkg = buildTestPackage(workspace, 'gen-89abcdef', specFor('float16'))
+  const manifest = JSON.parse(readFileSync(join(pkg, 'manifest.json'), 'utf8'))
+  expect(manifest.provenance['op_kernel/kernel.cpp']).toMatchObject({
+    sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    declared: { kind: 'adapted_from', source: 'KB example' },
+    similarity: { source: 'operators/gen-01234567/op_kernel/kernel.cpp', ratio: 1, exact: true },
+  })
+})
+
 test('the package carries every build contract file, rendered for the spec', () => {
   const { pkg } = packageFor(specFor('float16', 'Ascend910B4'))
   for (const name of CONTRACT_FILES) {
@@ -122,7 +138,7 @@ test('the package carries every build contract file, rendered for the spec', () 
   expect(main).toContain('Tensor in0 = make_tensor(DType::F16, 32768, true);')
   expect(main).toContain('Tensor in1 = make_tensor(DType::F16, 32768, true);')
   expect(main).toContain('Tensor out0 = make_tensor(DType::F16, 32768, false);')
-  expect(main).toContain('#define CANNESS_MAX_ABS_ERR 0.0009765625')
+  expect(main).toContain('output_tolerances[] = { {0.0009765625, 0.0009765625} }')
 
   const tiling = readFileSync(join(pkg, 'canness_tiling.h'), 'utf8')
   const common = readFileSync(join(pkg, 'canness_tiling_common.h'), 'utf8')
@@ -140,6 +156,25 @@ test('manifest.files equals the files actually on disk', () => {
   const { pkg } = packageFor()
   const manifest = JSON.parse(readFileSync(join(pkg, 'manifest.json'), 'utf8'))
   expect(manifest.files).toEqual(diskFiles(pkg))
+})
+
+test('an explicit tile length is shared by the driver and package metadata', () => {
+  const spec = { ...specFor('float16'), launch: { tile_length: 8192 } }
+  const { pkg } = packageFor(spec)
+  const config = JSON.parse(readFileSync(join(pkg, 'config.json'), 'utf8'))
+  expect(config).toMatchObject({ tileSize: 8192, params: { tileSize: 8192 } })
+  expect(readFileSync(join(pkg, 'main.cpp'), 'utf8')).toContain('#define CANNESS_TILE_LENGTH 8192')
+})
+
+test('the driver uploads device attributes from the same typed values as the golden reference', () => {
+  const spec = { ...specFor('float16'), attrs: { scale: 2.5, enabled: true, label: 'x\0叶' } }
+  const rendered = renderBuildContract(spec)
+  const main = rendered['main.cpp']!
+  expect(main).toContain('cannessPackAttrs(canness_attrs, CANNESS_ATTR_COUNT)')
+  expect(main).toContain('{"scale", GoldenAttrType::Number, 2.5, false, nullptr, 5, 0}')
+  expect(main).toContain('{"enabled", GoldenAttrType::Boolean, 0.0, true, nullptr, 7, 0}')
+  expect(main).toMatch(/GoldenAttrType::String, 0\.0, false, ".+", 5, 5\}/)
+  expect(rendered['canness_tiling.h']).toContain('class CannessAttrs')
 })
 
 test('package hash is stable across rebuilds and line endings, but changes with code', () => {
@@ -171,6 +206,26 @@ test('config.json derives maxAbsErr from the tensor dtype', () => {
   expect(maxAbsErrForDtype('bf16')).toBe(2 ** -7)
   expect(maxAbsErrForDtype('fp32')).toBe(2 ** -13)
   expect(maxAbsErrForDtype('mystery')).toBe(1e-3)
+})
+
+test('the generated driver gets output-specific tolerances and samples only on configured inputs', () => {
+  const base = specFor('float16')
+  const spec = parseSpec({
+    ...base,
+    input_specs: [{ ...base.input_specs[0], input_values: ['nan', '+inf', '-inf', -65504] }, base.input_specs[1]],
+    output_specs: [...base.output_specs, { ...base.output_specs[0], name: 'other', dtype: 'bf16' }],
+    accuracy: { absThreshold: 0 },
+  })
+  const { pkg } = packageFor(spec)
+  const main = readFileSync(join(pkg, 'main.cpp'), 'utf8')
+  expect(main).toContain('{0, 0.0009765625}, {0, 0.0078125}')
+  expect(main).toContain('make_tensor(DType::F16, 32768, true, { std::numeric_limits<float>::quiet_NaN(),')
+  expect(main).toContain('make_tensor(DType::F16, 32768, true);')
+  const config = JSON.parse(readFileSync(join(pkg, 'config.json'), 'utf8'))
+  expect(config).toMatchObject({
+    accuracyComparison: 'per-element',
+    params: { inputValues: [{ name: 'x', values: ['nan', '+inf', '-inf', -65504] }] },
+  })
 })
 
 test('a model-owned golden.h overrides the placeholder template', () => {

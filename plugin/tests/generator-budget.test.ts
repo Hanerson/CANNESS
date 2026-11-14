@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, test } from 'vitest'
@@ -7,7 +7,7 @@ import { loadState, saveState } from '../src/state-file.ts'
 
 function setup() {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-budget-'))
-  const tools: Array<{ name: string; execute(args: unknown): Promise<unknown> }> = []
+  const tools: Array<{ name: string; execute(args: unknown, context?: unknown): Promise<unknown> }> = []
   apply({ tools: { register(tool: typeof tools[number]) { tools.push(tool) } } } as never, { workspace })
   const submit = tools.find(tool => tool.name === 'submit_spec')!
   const path = join(workspace, '.canness', 'state.json')
@@ -51,4 +51,21 @@ test('relaxing the target is recorded in the result and state', async () => {
   const result = await submit.execute({ spec: spec('ArgMax', 400) })
   expect(result).toMatchObject({ carriedOver: true, relaxedTargetFromUs: 120 })
   expect(loadState(path).targetRelaxedUs).toBe(120)
+})
+
+test('a relative workspace is resolved from the dsh session and returned to the caller', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'canness-session-'))
+  const workspace = join(cwd, 'operators-workspace')
+  const { spec } = setup()
+  const tools: Array<{ name: string; execute(args: unknown, context?: unknown): Promise<unknown> }> = []
+  apply({ tools: { register(tool: typeof tools[number]) { tools.push(tool) } } } as never, {
+    workspace: 'operators-workspace',
+  })
+  const session = { agent: { session: { header: { cwd } } } }
+  const submit = tools.find(tool => tool.name === 'submit_spec')!
+  expect(await submit.execute({ spec: spec() }, session)).toMatchObject({ workspace })
+  expect(existsSync(join(workspace, '.canness', 'state.json'))).toBe(true)
+  const other = { agent: { session: { header: { cwd: mkdtempSync(join(tmpdir(), 'canness-session-')) } } } }
+  const build = tools.find(tool => tool.name === 'build_test_package')!
+  await expect(build.execute({}, other)).rejects.toThrow('submit_spec first')
 })

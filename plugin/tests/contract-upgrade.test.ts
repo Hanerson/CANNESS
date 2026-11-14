@@ -36,7 +36,7 @@ test('integer outputs retain their byte width and exact comparison across reason
   for (const [dtype, declaration] of [['int32', 'DType::I32'], ['I64', 'DType::I64']] as const) {
     const files = renderBuildContract(spec(dtype))
     expect(files['main.cpp']).toContain(`make_tensor(${declaration}, 3, false)`)
-    expect(files['main.cpp']).toContain('#define CANNESS_MAX_ABS_ERR 0')
+    expect(files['main.cpp']).toContain('output_tolerances[] = { {0, 0} }')
     expect(files['main.cpp']).toContain('actual != expected')
     expect(files['main.cpp']).toContain('canness_golden::evaluate_integer')
   }

@@ -10,15 +10,43 @@ struct CannessTilingData {
     int64_t tileLength;
     uint64_t workspaceSize;
 };
+static_assert(sizeof(CannessTilingData) == 24, "tiling descriptor layout changed");
 
-enum class GoldenAttrType { Number, Boolean, String };
+enum class GoldenAttrType : uint32_t { Number, Boolean, String, Missing };
 struct GoldenAttr {
     const char* name;
     GoldenAttrType type;
     double number;
     bool boolean;
     const char* string;
+    // Zero lengths let callers supply ordinary NUL-terminated C strings.
+    uint32_t nameLength = 0;
+    uint32_t stringLength = 0;
 };
+
+// GM payload stores fixed-width values and byte offsets, never host pointers.
+struct CannessAttrTable {
+    uint32_t count;
+    uint32_t reserved;
+};
+
+struct CannessDeviceAttr {
+    GoldenAttrType type;
+    uint32_t nameOffset;
+    uint32_t nameLength;
+    uint32_t textOffset;
+    uint32_t textLength;
+    float number;
+    int64_t integer;
+    uint64_t numberBits;  // original binary64 value, including signed zero
+    uint32_t hasInteger;
+    uint32_t boolean;
+};
+
+static_assert(sizeof(CannessAttrTable) == 8 && sizeof(CannessDeviceAttr) == 48,
+              "device attribute layout changed");
+
+constexpr uint64_t CANNESS_ATTR_ALIGNMENT = 64;
 
 struct GoldenCtx {
     const int64_t* shape;  // input 0; null when the spec is symbolic

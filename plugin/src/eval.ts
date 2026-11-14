@@ -1,18 +1,21 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path'
 import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { credentialRef, isCredentialRefName } from '@deepseek-ai/dsh-credentials'
-import { runEvaluation } from './eval-run.js'
+import { preflightToolchain, runEvaluation } from './eval-run.js'
 import { loadState, saveState } from './state-file.js'
 import { registerProbeCommand, type TcpDial } from './probe.js'
 import { connectRemote, type SftpOptions } from './ssh2-transport.js'
 import { packageHash } from './package-files.js'
-import { renewTunnel, tunnelHealth, usesCurrentTunnel } from './cannlab/connect.js'
+import { describeTunnelFailure, renewTunnel, tunnelHealth, usesCurrentTunnel } from './cannlab/connect.js'
+import { DEFAULT_TOKEN_REF } from './cannlab/constants.js'
+import { createTokenStore } from './cannlab/tokens.js'
 import type { RemoteHost } from './remote.js'
-import { stoppedReport, type EvalReport } from './report.js'
+import { stoppedReport, type EvalReport, type JsonValue } from './report.js'
 import { stopReason, targetGap, type PolicyConfig, type StopReason, type TaskState } from './policy.js'
+import { resolveWorkspace, statePath } from './workspace.js'
 
 export const name = 'canness-eval'
 export const inject = ['tools']
@@ -26,7 +29,7 @@ interface ToolAgentContext {
 // service refuses writes to non-volatile paths, and volatile references are
 // re-read per operation so a card save takes effect without a remount.
 export interface Config {
-  workspace: string
+  workspace?: string
   host: Volatile<string>
   port: Volatile<number>
   username: Volatile<string>
@@ -51,7 +54,7 @@ export interface Config {
 }
 
 export const Config = z.object({
-  workspace: z.string().required(),
+  workspace: z.string().default(''),
   host: z.string().required().volatile(),
   port: z.number().required().volatile(),
   username: z.string().required().volatile(),
@@ -72,7 +75,7 @@ export const Config = z.object({
   stallGap: z.number().default(1.5).volatile(),
 })
 
-function emptyHostReport(generationId: string | null): EvalReport {
+function unavailableReport(generationId: string | null, summary: string): EvalReport {
   return {
     generationId: generationId ?? 'unknown',
     status: 'error',
@@ -80,43 +83,7 @@ function emptyHostReport(generationId: string | null): EvalReport {
     correctness: { ok: false, maxRelativeError: null },
     performance: { kernelTimeUs: null, targetUs: null },
     analysis: null,
-    summary: 'ssh host is empty',
-  }
-}
-
-function missingCredentialsReport(generationId: string | null): EvalReport {
-  return {
-    generationId: generationId ?? 'unknown',
-    status: 'error',
-    compile: { ok: false, log: '' },
-    correctness: { ok: false, maxRelativeError: null },
-    performance: { kernelTimeUs: null, targetUs: null },
-    analysis: null,
-    summary: 'ssh credentials missing',
-  }
-}
-
-function connectFailedReport(generationId: string | null, detail: string): EvalReport {
-  return {
-    generationId: generationId ?? 'unknown',
-    status: 'error',
-    compile: { ok: false, log: '' },
-    correctness: { ok: false, maxRelativeError: null },
-    performance: { kernelTimeUs: null, targetUs: null },
-    analysis: null,
-    summary: `ssh connect failed: ${detail}`,
-  }
-}
-
-function tunnelDownReport(generationId: string | null): EvalReport {
-  return {
-    generationId: generationId ?? 'unknown',
-    status: 'error',
-    compile: { ok: false, log: '' },
-    correctness: { ok: false, maxRelativeError: null },
-    performance: { kernelTimeUs: null, targetUs: null },
-    analysis: null,
-    summary: 'tunnel is down; reconnect from Settings → CANNESS',
+    summary,
   }
 }
 
@@ -128,12 +95,16 @@ export interface TunnelProbe {
   matches(host: string, port: number): boolean
   health(): Promise<'up' | 'down' | 'none'>
   renew(): Promise<boolean>
+  describeFailure?(host: string, port: number, keyPath: string, ctx: Context): Promise<string | null>
 }
 
 const defaultTunnelProbe: TunnelProbe = {
   matches: usesCurrentTunnel,
   health: tunnelHealth,
   renew: renewTunnel,
+  describeFailure: (host, port, keyPath, ctx) => describeTunnelFailure(
+    host, port, keyPath, () => createTokenStore(ctx, DEFAULT_TOKEN_REF),
+  ),
 }
 
 /** One consistent read of the volatile fields, captured when an operation starts. */
@@ -204,20 +175,82 @@ async function resolveAuth(ctx: Context, cfg: ReturnType<typeof snapshot>): Prom
   return hit === undefined ? {} : { password: hit.value }
 }
 
-async function withRemoteHost<T>(
+type RemoteConnection = { files: RemoteHost } | { summary: string }
+
+async function openEvaluationRemote(
   ctx: Context,
   connect: (opts: SftpOptions) => Promise<RemoteHost>,
   cfg: ReturnType<typeof snapshot>,
-  run: (files: RemoteHost) => Promise<T>,
-): Promise<T> {
-  const auth = await resolveAuth(ctx, cfg)
-  if (auth.privateKey === undefined && auth.password === undefined) throw new Error('ssh credentials missing')
-  const files = await connect({ host: cfg.host, port: cfg.port, username: cfg.username, ...auth })
+  tunnel: TunnelProbe,
+): Promise<RemoteConnection> {
+  if (cfg.host === '') return { summary: 'ssh host is empty' }
+  const endpoint = `${cfg.host}:${cfg.port}`
+  const hint = async (): Promise<string | null> =>
+    await tunnel.describeFailure?.(cfg.host, cfg.port, cfg.privateKeyPath, ctx).catch(() => null) ?? null
+  let auth: Awaited<ReturnType<typeof resolveAuth>>
   try {
-    return await run(files)
-  } finally {
-    await files.close()
+    auth = await resolveAuth(ctx, cfg)
+  } catch (error) {
+    return { summary: `ssh credentials could not be read for ${endpoint}: ${errorMessage(error)}. Check Settings → CANNESS.` }
   }
+  if (auth.privateKey === undefined && auth.password === undefined) return { summary: 'ssh credentials missing' }
+  if (tunnel.matches(cfg.host, cfg.port)) {
+    const health = await tunnel.health().catch(() => 'down' as const)
+    if (health === 'down') {
+      return { summary: `CANNLab tunnel ${endpoint} is down. ${await hint() ?? 'Reconnect from Settings → CANNESS.'}` }
+    }
+    if (health === 'up') await tunnel.renew().catch(() => false)
+  }
+  try {
+    return { files: await connect({ host: cfg.host, port: cfg.port, username: cfg.username, ...auth }) }
+  } catch (error) {
+    const detail = errorMessage(error)
+    const diagnosed = await hint()
+    return { summary: `ssh connect failed for ${endpoint}: ${detail}. ${diagnosed ?? 'Check the SSH endpoint and credentials in Settings → CANNESS.'}` }
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'unknown error'
+}
+
+/** Return the current package fingerprint or reject edits made after packaging. */
+function checkPackageHash(packageDir: string, state: TaskState): string {
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as { packageHash?: string }
+  const hash = packageHash(packageDir)
+  if ((manifest.packageHash !== undefined && manifest.packageHash !== hash)
+      || (state.packageHash != null && state.packageHash !== hash)) {
+    throw new Error('package changed after build_test_package; rebuild the package before evaluation')
+  }
+  return hash
+}
+
+function inspectLocalPackage(packageDir: string | null, state: TaskState): { ok: boolean; issues: string[] } {
+  if (packageDir === null) return { ok: false, issues: ['submit_spec first'] }
+  if (!existsSync(packageDir)) return { ok: false, issues: ['build_test_package first'] }
+  const issues = ['manifest.json', 'config.json', 'build.sh', 'run_once.sh', 'main.cpp', 'golden.h']
+    .filter(name => !statSync(join(packageDir, name), { throwIfNoEntry: false })?.isFile())
+    .map(name => `missing ${name}`)
+  try {
+    if (!issues.includes('missing manifest.json')) checkPackageHash(packageDir, state)
+    if (!issues.includes('missing config.json')) JSON.parse(readFileSync(join(packageDir, 'config.json'), 'utf8'))
+    if (!issues.includes('missing golden.h') && /^\s*#\s*define\s+CANNESS_GOLDEN_PLACEHOLDER\b/mu
+      .test(readFileSync(join(packageDir, 'golden.h'), 'utf8'))) {
+      issues.push('golden not implemented; write golden.h using write_package_file and rebuild')
+    }
+  } catch (error) {
+    issues.push(errorMessage(error))
+  }
+  return { ok: issues.length === 0, issues }
+}
+
+interface PreflightValue {
+  generationId: string | null
+  workspace: string
+  packageDir: string | null
+  pendingStage: 'run_evaluation' | null
+  local: JsonValue
+  remote: JsonValue
 }
 
 /** Resolve a caller-supplied local path and keep it inside the workspace. */
@@ -260,6 +293,7 @@ type RunEvaluationValue = EvalReport & {
   workspace: string
   packageDir: string | null
   resultsPath: string | null
+  pendingStage: 'run_evaluation' | null
 }
 
 function withPaths(
@@ -267,12 +301,15 @@ function withPaths(
   workspace: string,
   generationId: string | null,
   outbox: string,
+  pendingStage: RunEvaluationValue['pendingStage'] = null,
+  hasResult = false,
 ): RunEvaluationValue {
   return {
     ...report,
     workspace,
     packageDir: generationId === null ? null : join(workspace, 'packages', generationId),
-    resultsPath: generationId === null ? null : posix.join(outbox, generationId, 'results.json'),
+    resultsPath: hasResult && generationId !== null ? posix.join(outbox, generationId, 'results.json') : null,
+    pendingStage,
   }
 }
 
@@ -285,23 +322,22 @@ export function apply(
 ): void {
   if (dial === undefined) registerProbeCommand(ctx)
   else registerProbeCommand(ctx, dial)
-  const statePath = join(config.workspace, '.canness', 'state.json')
-  const workspace = resolve(config.workspace)
   ctx.tools.register(defineTool({
     name: 'run_evaluation',
     description: [
       'Upload the current test package and evaluate it on the remote NPU host.',
       'Call order is fixed: submit_spec -> write_operator -> build_test_package -> run_evaluation;',
       'run_evaluation requires the package that build_test_package wrote under packages/<generationId>.',
-      `It uploads ${workspace}/packages/<generationId> to <inbox>/<generationId> over SSH exec (base64 tar, no SFTP),`,
+      'It uploads workspace/packages/<generationId> to <inbox>/<generationId> over SSH exec (base64 tar, no SFTP),',
       'then on the remote host runs the package\'s build.sh, its run_once.sh, and the real msprof',
-      '(100 iterations, CSV under mindstudio_profiler_output/), and reads <outbox>/<generationId>/results.json.',
+      '(CSV under mindstudio_profiler_output/), and reads <outbox>/<generationId>/results.json.',
       'Nothing is compiled locally: this Windows side has no CANN toolchain.',
       'A missing build.sh/run_once.sh is reported as compile_fail with "package does not implement build contract v1".',
       'A placeholder golden.h (write_package_file) returns accuracy_fail with "golden not implemented", never pass.',
       'An unchanged package returns the previous report with duplicate:true without connecting; use force:true to remeasure.',
       'The result always carries workspace, packageDir and resultsPath, plus status / compile.log /',
       'correctness.maxRelativeError / performance.kernelTimeUs / analysis / summary.',
+      'Connection and transport failures leave pendingStage:run_evaluation. Restore the connection and retry the same package.',
     ].join(' '),
     parameters: {
       force: { type: 'boolean', description: 'Remeasure an unchanged package; recorded in runRecord.params.forced.' },
@@ -398,6 +434,7 @@ export function apply(
           workspace: { type: 'string', required: true },
           packageDir: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
           resultsPath: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
+          pendingStage: { required: true, oneOf: [{ type: 'string', enum: ['run_evaluation'] }, { type: 'null' }] },
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -405,72 +442,65 @@ export function apply(
     async execute(_args: unknown, exec?: ToolAgentContext) {
       const force = (_args as { force?: boolean } | null)?.force === true
       const cfg = snapshot(config)
-      const state = loadState(statePath)
+      const workspace = resolveWorkspace(config.workspace, exec)
+      const stateFile = statePath(workspace)
+      const state = loadState(stateFile)
       // The first evaluation claims the task for this session. Without an
       // owner the loop stays quiet, which is what keeps one session's failure
       // from driving every other session in the profile.
       const owner = exec?.agent?.session?.id
-      const fail = (report: EvalReport): RunEvaluationValue => withPaths(report, workspace, state.generationId, cfg.outbox)
-      if (cfg.host === '') return fail(emptyHostReport(state.generationId))
+      const fail = (report: EvalReport): RunEvaluationValue =>
+        withPaths(report, workspace, state.generationId, cfg.outbox, state.pendingStage ?? null)
+      if (state.generationId === null && cfg.host === '') return fail(unavailableReport(null, 'ssh host is empty'))
       if (state.generationId == null) throw new Error('submit_spec first')
-      const localPackageDir = join(config.workspace, 'packages', state.generationId)
-      if (!existsSync(localPackageDir)) throw new Error('build_test_package first')
-      const manifest = JSON.parse(readFileSync(join(localPackageDir, 'manifest.json'), 'utf8')) as { packageHash?: string }
-      const currentHash = packageHash(localPackageDir)
-      if ((manifest.packageHash !== undefined && manifest.packageHash !== currentHash)
-          || (state.packageHash != null && state.packageHash !== currentHash)) {
-        throw new Error('package changed after build_test_package; rebuild the package before evaluation')
+      const localPackageDir = join(workspace, 'packages', state.generationId)
+      if (!existsSync(localPackageDir)) {
+        if (cfg.host === '') return fail(unavailableReport(state.generationId, 'ssh host is empty'))
+        throw new Error('build_test_package first')
       }
-      if (state.lastEvaluatedHash === currentHash && state.lastReport !== null && !force) {
-        saveState(statePath, { ...state, pendingSteer: false })
-        return fail({
+      const currentHash = checkPackageHash(localPackageDir, state)
+      if (state.lastEvaluatedHash === currentHash && state.lastReport !== null && state.pendingStage == null && !force) {
+        saveState(stateFile, { ...state, pendingSteer: false })
+        return withPaths({
           ...state.lastReport,
           duplicate: true,
           summary: `duplicate package: same content as the last evaluation; previous result: ${state.lastReport.summary}`,
-        })
+        }, workspace, state.generationId, cfg.outbox, null, state.lastReport.status !== 'timeout')
       }
       const reason = stopReason(state, policyOf(config))
       if (reason) return fail(stoppedReport(state.generationId, stoppedSummary(state, reason)))
-      const auth = await resolveAuth(ctx, cfg)
-      if (auth.privateKey === undefined && auth.password === undefined) {
-        return fail(missingCredentialsReport(state.generationId))
+      if (state.pendingStage == null || state.pendingSteer) {
+        saveState(stateFile, { ...state, pendingStage: 'run_evaluation', pendingSteer: false })
       }
-      // A CANNLab endpoint is 127.0.0.1:<helpers' local port>. Probe the
-      // helper first so a reaped tunnel reports "tunnel is down" instead of a
-      // generic SSH failure, then renew its idle timer for the long run ahead.
-      if (tunnel.matches(cfg.host, cfg.port)) {
-        const health = await tunnel.health().catch(() => 'down' as const)
-        if (health === 'down') return fail(tunnelDownReport(state.generationId))
-        if (health === 'up') await tunnel.renew().catch(() => false)
-      }
-      let files: RemoteHost
-      try {
-        files = await connect({ host: cfg.host, port: cfg.port, username: cfg.username, ...auth })
-      } catch (error) {
-        return fail(connectFailedReport(state.generationId, error instanceof Error ? error.message : 'unknown'))
-      }
-      let closed = false
-      const close = async () => {
-        if (closed) return
-        closed = true
-        await files.close()
-      }
-      try {
-        const { report, state: next } = await runEvaluation({
-          files,
-          localPackageDir,
-          generationId: state.generationId,
-          inbox: cfg.inbox,
-          outbox: cfg.outbox,
-          timeoutMs: cfg.timeoutSec * 1000,
-          intervalMs: cfg.pollIntervalMs,
-          setEnv: cfg.setEnv,
-          state,
-          config: policyOf(config),
-        })
-        if (force && report.runRecord !== undefined) report.runRecord.params.forced = true
-        saveState(statePath, {
+      const pending = (summary: string): RunEvaluationValue => withPaths(
+        unavailableReport(state.generationId, summary), workspace, state.generationId, cfg.outbox, 'run_evaluation',
+      )
+      const connection = await openEvaluationRemote(ctx, connect, cfg, tunnel)
+      if ('summary' in connection) return pending(connection.summary)
+      const { files } = connection
+      const outcome = await runEvaluation({
+        files,
+        localPackageDir,
+        generationId: state.generationId,
+        inbox: cfg.inbox,
+        outbox: cfg.outbox,
+        timeoutMs: cfg.timeoutSec * 1000,
+        intervalMs: cfg.pollIntervalMs,
+        setEnv: cfg.setEnv,
+        state,
+        config: policyOf(config),
+      }).catch(
+        error => `remote evaluation interrupted: ${errorMessage(error)}. Check the remote host and rerun run_evaluation.`,
+      ).finally(() => files.close().catch(() => {}))
+      if (typeof outcome === 'string') return pending(outcome)
+      const { report, state: next, resultWritten } = outcome
+      if (report.status === 'error' && !resultWritten) return pending(report.summary)
+      if (force && report.runRecord !== undefined) report.runRecord.params.forced = true
+      const latest = loadState(stateFile)
+      if (latest.generationId === state.generationId && latest.packageHash === state.packageHash) {
+        saveState(stateFile, {
           ...next,
+          pendingStage: null,
           lastEvaluatedHash: currentHash,
           ownerSessionId: owner ?? state.ownerSessionId ?? null,
           // One retry is owed for this report, and only for it.
@@ -478,9 +508,59 @@ export function apply(
           steerCount: 0,
           lastSteerAt: 0,
         })
-        return fail(report)
+      }
+      return withPaths(report, workspace, state.generationId, cfg.outbox, null, resultWritten)
+    },
+  }))
+  ctx.tools.register(defineTool({
+    name: 'preflight_evaluation',
+    description: [
+      'Check the current local package without compiling or consuming an evaluation attempt.',
+      'Pass remote:true to also check SSH and the CANN compiler, version, and profiler on the NPU host.',
+      'Use run_evaluation to resume a pending stage after fixing connectivity. Check CANNLab quota in the CANNLab console.',
+    ].join(' '),
+    parameters: {
+      remote: { type: 'boolean', description: 'Check the SSH endpoint and CANN toolchain as well as package files.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          generationId: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
+          workspace: { type: 'string', required: true },
+          packageDir: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
+          pendingStage: { required: true, oneOf: [{ type: 'string', enum: ['run_evaluation'] }, { type: 'null' }] },
+          local: { type: 'json', required: true },
+          remote: { type: 'json', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(args, exec?: ToolAgentContext): Promise<PreflightValue> {
+      const workspace = resolveWorkspace(config.workspace, exec)
+      const state = loadState(statePath(workspace))
+      const packageDir = state.generationId === null ? null : join(workspace, 'packages', state.generationId)
+      const local = inspectLocalPackage(packageDir, state)
+      const base = {
+        generationId: state.generationId, workspace, packageDir, local, pendingStage: state.pendingStage ?? null,
+      }
+      if (!args.remote) return { ...base, remote: null }
+      const cfg = snapshot(config)
+      const connection = await openEvaluationRemote(ctx, connect, cfg, tunnel)
+      const endpoint = `${cfg.host}:${cfg.port}`
+      const quota = 'Check available quota in the CANNLab console if using a CANNLab environment.'
+      if ('summary' in connection) {
+        return { ...base, remote: { endpoint, ssh: 'unavailable', summary: connection.summary, quota } }
+      }
+      const { files } = connection
+      try {
+        const cann = await preflightToolchain(files, cfg.setEnv)
+        return { ...base, remote: { endpoint, ssh: 'connected', cann, quota } }
+      } catch (error) {
+        return { ...base, remote: { endpoint, ssh: 'connected', cann: { ready: false, error: errorMessage(error) }, quota } }
       } finally {
-        await close()
+        await files.close().catch(() => {})
       }
     },
   }))
@@ -509,18 +589,22 @@ export function apply(
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    async execute(args) {
+    async execute(args, exec?: ToolAgentContext) {
       const cfg = snapshot(config)
       if (cfg.host === '') throw new Error('ssh host is empty')
-      const target = localTargetFor(config.workspace, args.remotePath, args.localPath)
+      const workspace = resolveWorkspace(config.workspace, exec)
+      const target = localTargetFor(workspace, args.remotePath, args.localPath)
       if (!posix.isAbsolute(args.remotePath)) {
         throw new Error('remotePath must be an absolute POSIX path')
       }
-      const state = loadState(statePath)
+      const state = loadState(statePath(workspace))
       if (!remoteTargetAllowed(args.remotePath, cfg.outbox, cfg.inbox, state.generationId)) {
         throw new Error('remotePath is outside the allowed remote directories (outbox and inbox/<generationId>)')
       }
-      const body = await withRemoteHost(ctx, connect, cfg, async files => files.readFile(args.remotePath))
+      const connection = await openEvaluationRemote(ctx, connect, cfg, tunnel)
+      if ('summary' in connection) throw new Error(connection.summary)
+      const { files } = connection
+      const body = await files.readFile(args.remotePath).finally(() => files.close().catch(() => {}))
       if (body === null) throw new Error(`remote file not found: ${args.remotePath}`)
       mkdirSync(dirname(target), { recursive: true })
       writeFileSync(target, body)

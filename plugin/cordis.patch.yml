@@ -7,12 +7,9 @@
         kbRoot: ./plugin/knowledge_base
     - id: canness-generator
       name: dsh-canness/generator
-      config:
-        workspace: ./canness-workspace
     - id: canness-eval
       name: dsh-canness/eval
       config:
-        workspace: ./canness-workspace
         host: ""
         port: 22
         username: ""
@@ -29,7 +26,6 @@
     - id: canness-loop
       name: dsh-canness/loop
       config:
-        workspace: ./canness-workspace
         maxIterations: 10
         maxCompileRetries: 3
         negativeStreakLimit: 3

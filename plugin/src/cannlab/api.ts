@@ -11,7 +11,7 @@ import {
 } from './constants.js'
 
 /** The subset of `fetch` these wrappers need, so tests can pass a fake. */
-export type Fetcher = (input: string, init?: { headers?: Record<string, string>, method?: string }) => Promise<{
+export type Fetcher = (input: string, init?: { headers?: Record<string, string>, method?: string, body?: string, signal?: AbortSignal }) => Promise<{
   ok: boolean
   status: number
   text(): Promise<string>
@@ -66,6 +66,22 @@ export async function callApi(fetcher: Fetcher, accessToken: string, path: strin
   const response = await fetcher(endpoint(path), { headers: { 'access-token': accessToken } })
   return readEnvelope(response, operation)
 }
+
+async function transition(fetcher: Fetcher, token: string, id: string, action: 'start' | 'stop', signal?: AbortSignal) {
+  const response = await fetcher(endpoint(`/instances/${action}`), {
+    method: 'POST',
+    headers: { 'access-token': token, 'content-type': 'application/json' },
+    body: JSON.stringify({ devEnvId: id, source: 'vscode' }),
+    signal,
+  })
+  await readEnvelope(response, `CANNLab ${action}`)
+}
+
+export const startInstance = (fetcher: Fetcher, token: string, id: string, signal?: AbortSignal) =>
+  transition(fetcher, token, id, 'start', signal)
+
+export const stopInstance = (fetcher: Fetcher, token: string, id: string, signal?: AbortSignal) =>
+  transition(fetcher, token, id, 'stop', signal)
 
 /** Coerce one raw list row, tolerating missing fields rather than throwing. */
 function toInstance(raw: unknown): CannlabInstance | null {

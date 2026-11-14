@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from 'vitest'
 import {
-  chooseInstance, getPrivateKey, listInstances, rewriteConnectUrl, usernameOf,
+  chooseInstance, getPrivateKey, listInstances, rewriteConnectUrl, startInstance, stopInstance, usernameOf,
   type Fetcher,
 } from '../src/cannlab/api.js'
 
@@ -55,6 +55,21 @@ describe('listInstances', () => {
     const fetcher = fakeFetcher(json({}, 500))
     await expect(listInstances(fetcher, 'token')).rejects.toThrow('HTTP 500')
   })
+})
+
+it('uses the Dev Space lifecycle actions for the selected instance', async () => {
+  const calls: Array<[string, Parameters<Fetcher>[1]]> = []
+  const fetcher: Fetcher = async (url, init) => {
+    calls.push([url, init])
+    return json({ error_code: '0000' })
+  }
+  await startInstance(fetcher, 'token', 'instance-id')
+  await stopInstance(fetcher, 'token', 'instance-id')
+  expect(calls.map(([url]) => new URL(url).pathname.split('/').at(-1))).toEqual(['start', 'stop'])
+  for (const [, init] of calls) {
+    expect(init?.method).toBe('POST')
+    expect(JSON.parse(init!.body!)).toEqual({ devEnvId: 'instance-id', source: 'vscode' })
+  }
 })
 
 describe('chooseInstance', () => {

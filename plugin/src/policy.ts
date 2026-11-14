@@ -69,6 +69,8 @@ export interface TaskState {
   packageHash?: string | null
   /** Fingerprint sent to the runner in the most recent evaluation. */
   lastEvaluatedHash?: string | null
+  /** A built package whose remote evaluation can resume without regenerating. */
+  pendingStage?: 'run_evaluation' | null
   lastReport: EvalReport | null
 }
 
@@ -94,6 +96,7 @@ export function emptyState(): TaskState {
     lastSteerAt: 0,
     packageHash: null,
     lastEvaluatedHash: null,
+    pendingStage: null,
     lastReport: null,
   }
 }

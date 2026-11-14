@@ -4,7 +4,8 @@ import {
 import { createHash } from 'node:crypto'
 import { dirname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { OperatorSpec, TensorSpec } from './spec.js'
+import { normalizedDtype, type FloatInputValue, type OperatorSpec, type TensorSpec } from './spec.js'
+import { lineOverlap, parseProvenance, sha256, type Origin } from './provenance.js'
 
 export const LAYER_FILES = {
   kernel: 'op_kernel/kernel.cpp',
@@ -16,7 +17,10 @@ export const LAYER_FILES = {
 export type LayerName = keyof typeof LAYER_FILES
 
 /** Build contract v1 files rendered into every test package. */
-export const CONTRACT_FILES = ['build.sh', 'run_once.sh', 'main.cpp', 'golden.h', 'canness_tiling.h', 'canness_tiling_common.h'] as const
+export const CONTRACT_FILES = [
+  'build.sh', 'run_once.sh', 'main.cpp', 'golden.h',
+  'canness_tiling.h', 'canness_tiling_common.h', 'canness_tiling_host.h',
+] as const
 
 /**
  * Kernel entry the build-contract `main.cpp` launches. It is fixed because the
@@ -88,10 +92,46 @@ function writeRel(root: string, rel: string, body: string): void {
   writeFileSync(full, body)
 }
 
-export function writeOperator(workspace: string, generationId: string, files: Record<LayerName, string>): string {
+const PROVENANCE_FILE = 'layer-origins.json'
+
+export function writeOperator(
+  workspace: string,
+  generationId: string,
+  files: Record<LayerName, string>,
+  provenance: Partial<Record<LayerName, Origin>> = {},
+): string {
   const root = join(workspace, 'operators', generationId)
   for (const key of Object.keys(LAYER_FILES) as LayerName[]) writeRel(root, LAYER_FILES[key], files[key])
+  writeRel(root, PROVENANCE_FILE, JSON.stringify(provenance, null, 2))
   return root
+}
+
+function layerProvenance(workspace: string, generationId: string, root: string) {
+  const metadataPath = join(root, PROVENANCE_FILE)
+  const declared = existsSync(metadataPath)
+    ? parseProvenance(JSON.parse(readFileSync(metadataPath, 'utf8'))) : {}
+  const operators = join(workspace, 'operators')
+  const previous = readdirSync(operators, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && /^gen-[a-f0-9]{8}$/i.test(entry.name) && entry.name !== generationId)
+    .map(entry => entry.name).sort()
+  return Object.fromEntries((Object.keys(LAYER_FILES) as LayerName[]).map(layer => {
+    const file = LAYER_FILES[layer]
+    const body = readFileSync(join(root, file))
+    const source = body.toString('utf8')
+    let similarity: { source: string; sha256: string; ratio: number; exact: boolean } | null = null
+    for (const id of previous) {
+      const candidate = join(operators, id, file)
+      if (!existsSync(candidate)) continue
+      const reference = readFileSync(candidate)
+      const exact = body.equals(reference)
+      const ratio = exact ? 1 : lineOverlap(source, reference.toString('utf8'))
+      if (ratio > (similarity?.ratio ?? 0) || exact && similarity?.exact !== true) {
+        similarity = { source: `operators/${id}/${file}`, sha256: sha256(reference), ratio, exact }
+      }
+      if (exact) break
+    }
+    return [file, { sha256: sha256(body), declared: declared[layer] ?? null, similarity }]
+  }))
 }
 
 /** Resolve the template directory from `lib/` first, then the `src/` test layout. */
@@ -99,10 +139,6 @@ export function buildContractTemplateDir(): string {
   const fromLib = fileURLToPath(new URL(`../../${TEMPLATE_RELATIVE}/`, import.meta.url))
   if (existsSync(fromLib)) return fromLib
   return fileURLToPath(new URL(`../${TEMPLATE_RELATIVE}/`, import.meta.url))
-}
-
-function normalizedDtype(dtype: string): string {
-  return dtype.toLowerCase().replace(/[^a-z0-9]/g, '')
 }
 
 /**
@@ -161,6 +197,44 @@ function numericElementCount(tensor: TensorSpec): number | null {
 /** Symbolic shapes fall back to the Gelu-sized 32768-element buffer. */
 function elementCount(tensor: TensorSpec): number {
   return numericElementCount(tensor) ?? DEFAULT_TOTAL_ELEMENTS
+}
+
+function outputTolerance(tensor: TensorSpec, accuracy: OperatorSpec['accuracy']): { abs: number; rel: number } {
+  const fallback = maxAbsErrForDtype(tensor.dtype)
+  if (fallback === 0) return { abs: 0, rel: 0 }
+  return { abs: accuracy?.absThreshold ?? fallback, rel: accuracy?.relThreshold ?? fallback }
+}
+
+function cppNumber(value: number): string {
+  if (Object.is(value, -0)) return '-0.0'
+  return Math.abs(value) > Number.MAX_SAFE_INTEGER ? value.toExponential() : String(value)
+}
+
+function cppFloatSample(value: FloatInputValue): string {
+  if (value === 'nan') return 'std::numeric_limits<float>::quiet_NaN()'
+  if (value === '+inf') return 'std::numeric_limits<float>::infinity()'
+  if (value === '-inf') return '-std::numeric_limits<float>::infinity()'
+  return `static_cast<float>(${cppNumber(value)})`
+}
+
+function inputSetup(tensor: TensorSpec, index: number): string {
+  const size = elementCount(tensor)
+  const values = tensor.input_values ?? []
+  if (values.length > size) throw new Error(`input_specs.${index}.input_values exceeds the tensor element count`)
+  const samples = values.length ? `, { ${values.map(cppFloatSample).join(', ')} }` : ''
+  return `Tensor in${index} = make_tensor(${cppDtype(tensor.dtype).enumerator}, ${size}, true${samples});`
+}
+
+export function launchGeometry(spec: OperatorSpec) {
+  const totalElements = elementCount(spec.input_specs[0] ?? spec.output_specs[0]!)
+  const blockDim = spec.launch?.block_dim ?? DEFAULT_BLOCK_DIM
+  return {
+    totalElements,
+    blockDim,
+    blockLength: Math.ceil(totalElements / blockDim),
+    tileSize: spec.launch?.tile_length ?? Math.min(DEFAULT_TILE_LENGTH, totalElements),
+    workspaceBytes: spec.launch?.workspace_bytes ?? 0,
+  }
 }
 
 function safeCommentName(value: string): string {
@@ -238,6 +312,7 @@ function writeContractSelfCheck(dest: string, spec: OperatorSpec): void {
     target_platform: spec.target_platform,
     performance_target: { metric: 'kernel_time', target_us: 1000 },
     tiling_hints: null,
+    attrs: { pattern: 'identity', scale: 1, enabled: true },
   }
   const root = join(dest, '.contract-selfcheck')
   mkdirSync(join(root, 'op_kernel'), { recursive: true })
@@ -245,7 +320,14 @@ function writeContractSelfCheck(dest: string, spec: OperatorSpec): void {
     '#include "kernel_operator.h"',
     'KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);',
     'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR in0, GM_ADDR out0, GM_ADDR tiling) {',
-    '  (void)tiling;',
+    '  GET_TILING_DATA(t, tiling);',
+    '  CannessAttrs attrs(tiling, t.workspaceSize);',
+    '  const auto pattern = attrs.get(0);',
+    '  const auto scale = attrs.get(1);',
+    '  const auto enabled = attrs.get(2);',
+    "  if (pattern.type != GoldenAttrType::String || attrs.text(pattern)[0] != 'i' ||",
+    '      scale.type != GoldenAttrType::Number || scale.number != 1.0f ||',
+    '      enabled.type != GoldenAttrType::Boolean || !enabled.boolean) return;',
     '  AscendC::GlobalTensor<half> x, y;',
     '  x.SetGlobalBuffer((__gm__ half*)in0, 16);',
     '  y.SetGlobalBuffer((__gm__ half*)out0, 16);',
@@ -299,24 +381,22 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
   if (spec.accuracyMode === 'index-check' && integerOutputs.includes(false)) {
     throw new Error('accuracyMode index-check requires integer output tensors')
   }
-  const reference = firstInput ?? firstOutput
-  const totalElements = elementCount(reference)
-  // Launch geometry: the spec may pin blockDim (issue 006: the 16 default caps a
-  // kernel at 40% of the AIV cores on a 40-core device, measured 1.96x).
-  const blockDim = spec.launch?.block_dim ?? DEFAULT_BLOCK_DIM
-  // Optional scratch space for the kernel, exposed as the tail of the tiling
-  // buffer (issue 013). 0 keeps the historical layout bit-for-bit.
-  const workspaceBytes = spec.launch?.workspace_bytes ?? 0
-  const blockLength = Math.max(1, Math.ceil(totalElements / blockDim))
-  const tileLength = Math.min(DEFAULT_TILE_LENGTH, totalElements)
-  const threshold = maxAbsErrForDtype(firstOutput.dtype || firstInput.dtype)
+  const { totalElements, blockDim, blockLength, tileSize, workspaceBytes } = launchGeometry(spec)
+  const tolerances = outputs.map(tensor => outputTolerance(tensor, spec.accuracy))
   const operatorName = safeCommentName(spec.operator_name)
   const operatorString = cppString(spec.operator_name)
   const attrs = Object.entries(spec.attrs ?? {})
+  for (const [name, rule] of Object.entries(spec.attrs_derived ?? {})) {
+    const base = spec.attrs?.[rule.source]
+    if (typeof base !== 'number') throw new Error(`derived attr ${name} requires a numeric source`)
+    attrs.push([name, base > 0 ? Math.log(base) : 1])
+  }
   const attrRows = attrs.map(([name, value]) => {
-    if (typeof value === 'string') return `{${cppString(name)}, GoldenAttrType::String, 0.0, false, ${cppString(value)}}`
-    if (typeof value === 'boolean') return `{${cppString(name)}, GoldenAttrType::Boolean, 0.0, ${value}, nullptr}`
-    return `{${cppString(name)}, GoldenAttrType::Number, ${value}, false, nullptr}`
+    const key = cppString(name)
+    const nameLength = Buffer.byteLength(name)
+    if (typeof value === 'string') return `{${key}, GoldenAttrType::String, 0.0, false, ${cppString(value)}, ${nameLength}, ${Buffer.byteLength(value)}}`
+    if (typeof value === 'boolean') return `{${key}, GoldenAttrType::Boolean, 0.0, ${value}, nullptr, ${nameLength}, 0}`
+    return `{${key}, GoldenAttrType::Number, ${cppNumber(value)}, false, nullptr, ${nameLength}, 0}`
   })
   const attrDim = spec.attrs?.dim
   const attrKeepdim = spec.attrs?.keepdim
@@ -330,7 +410,7 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     ? firstInput.shape.map(dimension => Number(dimension)) : []
 
   const tensorSetup = [
-    ...inputs.map((tensor, index) => `Tensor in${index} = make_tensor(${cppDtype(tensor.dtype).enumerator}, ${elementCount(tensor)}, true);`),
+    ...inputs.map(inputSetup),
     ...outputs.map((tensor, index) => `Tensor out${index} = make_tensor(${cppDtype(tensor.dtype).enumerator}, ${elementCount(tensor)}, false);`),
   ].join('\n    ')
   const inputList = `{ ${inputs.map((_tensor, index) => `&in${index}`).join(', ')} }`
@@ -361,8 +441,8 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     TOTAL_ELEMENTS: String(totalElements),
     BLOCK_DIM: String(blockDim),
     BLOCK_LENGTH: String(blockLength),
-    TILE_LENGTH: String(tileLength),
-    MAX_ABS_ERR: String(threshold),
+    TILE_LENGTH: String(tileSize),
+    OUTPUT_TOLERANCES: tolerances.map(({ abs, rel }) => `{${cppNumber(abs)}, ${cppNumber(rel)}}`).join(', '),
     ACCURACY_MODE: spec.accuracyMode === 'index-check' ? '1' : '0',
     INTEGER_OUTPUT: integerOutputs.includes(true) ? '1' : '0',
     FLOAT_OUTPUT: integerOutputs.includes(false) ? '1' : '0',
@@ -388,6 +468,7 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     'golden.h': goldenOverride ?? renderTemplate(templateBody('golden.h'), values),
     'canness_tiling.h': renderTemplate(templateBody('canness_tiling.h'), values),
     'canness_tiling_common.h': renderTemplate(templateBody('canness_tiling_common.h'), values),
+    'canness_tiling_host.h': renderTemplate(templateBody('canness_tiling_host.h'), values),
   }
 }
 
@@ -405,9 +486,11 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
   const goldenOverride = existsSync(goldenPath) ? readFileSync(goldenPath, 'utf8') : undefined
   const rendered = renderBuildContract(spec, goldenOverride)
   const contract = contractFingerprint()
+  const provenance = layerProvenance(workspace, generationId, src)
   rmSync(dest, { recursive: true, force: true })
   mkdirSync(dest, { recursive: true })
   cpSync(src, dest, { recursive: true })
+  rmSync(join(dest, PROVENANCE_FILE), { force: true })
 
   // write_package_file('golden.h', ...) writes the operator copy; it is the
   // model's only extension point and wins over the placeholder template.
@@ -416,12 +499,14 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
   }
   writeContractSelfCheck(dest, spec)
 
-  const threshold = maxAbsErrForDtype(spec.output_specs[0]?.dtype ?? spec.input_specs[0]!.dtype)
-  const totalElements = elementCount(spec.input_specs[0] ?? spec.output_specs[0]!)
-  const blockDim = spec.launch?.block_dim ?? DEFAULT_BLOCK_DIM
-  const tileSize = Math.min(DEFAULT_TILE_LENGTH, totalElements)
+  const tolerances = spec.output_specs.map(tensor => outputTolerance(tensor, spec.accuracy))
+  const inputValues = spec.input_specs.flatMap(tensor => tensor.input_values?.length
+    ? [{ name: tensor.name, values: tensor.input_values }]
+    : [])
+  const { totalElements, blockDim, blockLength, tileSize } = launchGeometry(spec)
   const config = {
-    maxAbsErr: threshold,
+    maxAbsErr: tolerances[0]!.abs,
+    accuracyComparison: 'per-element',
     dtype: spec.output_specs[0]?.dtype ?? spec.input_specs[0]!.dtype,
     socVersion: socVersion(spec),
     blockDim,
@@ -429,8 +514,14 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
     params: {
       blockDim,
       tileSize,
-      blockLength: Math.max(1, Math.ceil(totalElements / blockDim)),
+      blockLength,
       totalElements,
+      accuracy: spec.output_specs.map((tensor, index) => ({
+        name: tensor.name,
+        absThreshold: tolerances[index]!.abs,
+        relThreshold: tolerances[index]!.rel,
+      })),
+      ...(inputValues.length ? { inputValues } : {}),
     },
   }
   writeFileSync(join(dest, 'config.json'), JSON.stringify(config, null, 2))
@@ -447,6 +538,7 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
     buildContract: 'v1',
     contract,
     layers: Object.values(LAYER_FILES),
+    provenance,
     files,
   }
   writeFileSync(join(dest, 'manifest.json'), JSON.stringify(manifest, null, 2))

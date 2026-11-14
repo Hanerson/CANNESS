@@ -12,8 +12,9 @@ import { spawnSync } from 'node:child_process'
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { userInfo } from 'node:os'
 import { join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import {
-  chooseInstance, getConnectUrl, getInstance, getPrivateKey, listInstances, rewriteConnectUrl, usernameOf,
+  chooseInstance, getConnectUrl, getInstance, getPrivateKey, listInstances, rewriteConnectUrl, startInstance, usernameOf,
   type Fetcher,
 } from './api.js'
 import { interactiveLogin, refreshAccessToken } from './oauth.js'
@@ -24,7 +25,7 @@ import {
 import { LOOPBACK, SSH_REMOTE_PORT, STATUS_RUNNING } from './constants.js'
 import type { CannlabEvent, CannlabStep, CannlabTarget } from './types.js'
 import { dshHome, type TokenStore } from './tokens.js'
-import { attemptLogPath, startAttemptLog } from './connect-log.js'
+import { attemptLogPath, loggedTunnel, startAttemptLog } from './connect-log.js'
 
 /** Everything one connect attempt needs from its caller. */
 export interface ConnectOptions {
@@ -64,6 +65,8 @@ export interface OpenTunnel {
   helperPort: number
   /** GitCode account that authorized this tunnel, when a browser sign-in produced it. */
   account: string
+  /** Query the selected environment through the token store that opened it. */
+  environmentStatus?: () => Promise<number | null>
   /** Stop heartbeats and close the hub. Safe to call twice. */
   stop: () => Promise<void>
 }
@@ -221,12 +224,7 @@ export type TunnelHealth = 'up' | 'down' | 'none'
 export async function tunnelHealth(): Promise<TunnelHealth> {
   const tunnel = openTunnel
   if (tunnel === null) return 'none'
-  try {
-    await helperRequest(tunnel.helperPort, '/heartbeat')
-    return 'up'
-  } catch {
-    return 'down'
-  }
+  return await helperResponds(tunnel.helperPort) ? 'up' : 'down'
 }
 
 /**
@@ -236,12 +234,72 @@ export async function tunnelHealth(): Promise<TunnelHealth> {
 export async function renewTunnel(): Promise<boolean> {
   const tunnel = openTunnel
   if (tunnel === null) return false
+  return helperResponds(tunnel.helperPort)
+}
+
+async function helperResponds(port: number): Promise<boolean> {
   try {
-    await helperRequest(tunnel.helperPort, '/heartbeat')
+    await helperRequest(port, '/heartbeat', { signal: AbortSignal.timeout(2000) })
     return true
   } catch {
     return false
   }
+}
+
+/** Best-effort lookup for a failed forward. Never opens a browser or starts an instance. */
+export async function readEnvironmentStatus(
+  instanceId: string,
+  tokenStore: TokenStore,
+  fetcher: Fetcher = fetch,
+): Promise<number | null> {
+  try {
+    const prior = await tokenStore.read()
+    if (prior === undefined) return null
+    const signal = AbortSignal.timeout(5000)
+    const bounded: Fetcher = fetcher === fetch ? (url, init) => fetch(url, { ...init, signal }) : fetcher
+    const token = await refreshAccessToken(bounded, prior)
+    if (typeof token.refresh_token === 'string' && token.refresh_token !== '' && token.refresh_token !== prior) {
+      await tokenStore.write(token.refresh_token)
+    }
+    if (typeof token.access_token !== 'string' || token.access_token === '') return null
+    const instances = await listInstances(bounded, token.access_token)
+    const status = instances.find(instance => instance.id === instanceId)?.status
+    return status !== undefined && Number.isInteger(status) && status >= 0 ? status : null
+  } catch {
+    return null
+  }
+}
+
+/** Diagnose only endpoints established by this integration, including older logs. */
+export async function describeTunnelFailure(
+  host: string,
+  port: number,
+  keyPath: string,
+  tokenStore: () => TokenStore,
+): Promise<string | null> {
+  const active = usesCurrentTunnel(host, port) ? openTunnel : null
+  const logged = loggedTunnel(attemptLogPath(dshHome()), host, port, keyPath)
+  if (active === null && logged === null) return null
+  const helperPort = active?.helperPort ?? logged?.helperPort ?? null
+  const instanceId = active?.target.instanceId ?? logged!.instanceId
+  const name = active?.target.instance ?? logged!.name
+  const [helperUp, status] = await Promise.all([
+    helperPort === null ? null : helperResponds(helperPort),
+    active?.environmentStatus?.() ?? readEnvironmentStatus(instanceId, tokenStore()),
+  ])
+  const facts = [
+    ...(helperUp === true ? ['the helper answers but SSH through the forward failed']
+      : helperUp === false ? ['the forwarding helper is unresponsive'] : []),
+    ...(logged === null ? [] : [`last successful connection ${logged.connectedAt}`]),
+  ]
+  const detail = facts.length === 0 ? '' : ` (${facts.join(', ')})`
+  if (status !== null && status !== STATUS_RUNNING) {
+    return `CANNLab environment "${name}" is not running (status ${status})${detail}. Reconnect from Settings → CANNESS to start a stopped instance. Check quota in the CANNLab console if startup fails.`
+  }
+  const environment = status === STATUS_RUNNING
+    ? `CANNLab environment "${name}" is running`
+    : `CANNLab environment "${name}" could not be checked. Check its status and quota in the CANNLab console`
+  return `${environment}${detail}. Reconnect from Settings → CANNESS.`
 }
 
 /**
@@ -329,8 +387,30 @@ async function connectFlow(options: ConnectOptions, emit: ReturnType<typeof emit
   emit('listing-ok', instances.length === 0 ? 'warn' : 'info',
     `Found ${String(instances.length)} environment(s).`,
     instances.map(instance => `${instance.name} [status ${String(instance.status)}]`).join(', '))
-  const instance = chooseInstance(instances, selector)
-  emit('selecting', 'info', `Using environment "${instance.name}".`, `id ${instance.id} · devstage ${instance.devstageId}`)
+  let instance = selector === '' && instances.length === 1
+    ? instances[0]! : chooseInstance(instances, selector)
+  emit('selecting', 'info', `Using environment "${instance.name}".`,
+    `id ${instance.id} · devstage ${instance.devstageId} · status ${instance.status}`)
+  if (instance.status === 4) {
+    const deadline = AbortSignal.timeout(90_000)
+    const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline
+    const fetcher: Fetcher = (url, init) => options.fetcher(url, { ...init, signal })
+    const id = instance.id
+    emit('selecting', 'info', `Starting stopped CANNLab environment "${instance.name}".`)
+    try {
+      await startInstance(fetcher, accessToken, id, signal)
+      while (instance.status !== STATUS_RUNNING) {
+        await delay(2_000, undefined, { signal })
+        const current = (await listInstances(fetcher, accessToken)).find(item => item.id === id)
+        if (current) instance = current
+        emit('selecting', 'info', `Waiting for CANNLab environment (status ${instance.status}).`)
+      }
+    } catch (error) {
+      checkCancelled()
+      if (deadline.aborted) throw new Error('CANNLab did not start within 90 seconds. Check its status and quota in the console.')
+      throw new Error(`Could not start CANNLab. Check status and quota in the console. ${error instanceof Error ? error.message : ''}`)
+    }
+  }
   if (instance.status !== STATUS_RUNNING) {
     throw new Error(`environment "${instance.name}" is not running (status ${String(instance.status)}); start it in the CANNLab console`)
   }
@@ -407,6 +487,7 @@ async function connectFlow(options: ConnectOptions, emit: ReturnType<typeof emit
     devenvId: instance.devstageId,
     helperPort: running.port,
     account,
+    environmentStatus: () => readEnvironmentStatus(instance.id, options.tokenStore, options.fetcher),
     stop: async () => {
       if (stopped) return
       stopped = true

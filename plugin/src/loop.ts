@@ -1,9 +1,9 @@
-import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { enhancementBlock, ownsSession, shouldSteer, type PolicyConfig } from './policy.js'
 import { loadState, saveState } from './state-file.js'
+import { resolveWorkspace, statePath } from './workspace.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -15,13 +15,13 @@ export const name = 'canness-loop'
 export const inject = [] as const
 
 export interface Config extends PolicyConfig {
-  workspace: string
+  workspace?: string
   minSteerIntervalMs?: number
   maxSteerPerReport?: number
 }
 
 export const Config: z<Config> = z.object({
-  workspace: z.string().required(),
+  workspace: z.string().default(''),
   maxIterations: z.number().required(),
   maxCompileRetries: z.number().required(),
   negativeStreakLimit: z.number().required(),
@@ -49,7 +49,6 @@ function sessionOf(payload: unknown): string | undefined {
 }
 
 export function apply(ctx: Context, config: Config, now: () => number = Date.now): void {
-  const path = join(config.workspace, '.canness', 'state.json')
   let warnedUnclaimed = false
 
   /**
@@ -61,7 +60,7 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
    * @param payload - the event payload, which carries the agent.
    * @returns the state to steer with, or undefined to stay quiet.
    */
-  const steerable = (payload: unknown): ReturnType<typeof loadState> | undefined => {
+  const steerable = (payload: unknown, path: string): ReturnType<typeof loadState> | undefined => {
     const state = loadState(path)
     const session = sessionOf(payload)
     if (session !== undefined && !state.ownerSessionId && state.lastReport !== null && !warnedUnclaimed) {
@@ -77,7 +76,7 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
     return state
   }
 
-  const consume = (state: ReturnType<typeof loadState>): void => {
+  const consume = (path: string, state: ReturnType<typeof loadState>): void => {
     saveState(path, {
       ...state,
       pendingSteer: false,
@@ -89,7 +88,8 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
     if (decision.kind !== 'enter') return decision
-    const state = steerable(payload)
+    const path = statePath(resolveWorkspace(config.workspace, payload))
+    const state = steerable(payload, path)
     if (state === undefined) return decision
     const text = enhancementBlock(state, config)
     const already = decision.messages.some(message =>
@@ -99,7 +99,7 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
     // The retry is owed once. Consuming it here keeps the next turn from
     // receiving the same sentence again; the turn-stopping steer below only
     // fires when this path did not.
-    consume(state)
+    consume(path, state)
     return {
       kind: 'enter',
       ...(decision.startsRequestSeries ? { startsRequestSeries: true as const } : {}),
@@ -108,13 +108,14 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
   })
 
   ctx.on('agent/turn-stopping', (payload) => {
-    const state = steerable(payload)
+    const path = statePath(resolveWorkspace(config.workspace, payload))
+    const state = steerable(payload, path)
     if (state === undefined) return
     const agent = (payload as { agent?: { steer(message: unknown): void } }).agent
     if (agent === undefined || typeof agent.steer !== 'function') return
     // Consume before steering: a steer starts a turn, and that turn must not
     // find the same pending retry waiting for it.
-    consume(state)
+    consume(path, state)
     agent.steer(notice(enhancementBlock(state, config)))
   })
 }

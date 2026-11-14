@@ -4,18 +4,46 @@
 
 ## [Unreleased]
 
+（无）
+
+## [0.3.0] - 2026-11-14
+
+从「开发夹具」升级为「可交付流水线」：一条命令产出官方 CANNBench 格式算子包，
+并在真实 NPU 上完成构建、安装与官方精度评测。
+
+### 新增
+
+- **`export_submission`**：把当前同 shape 算子包导出为官方 `direct_launch` 工程（9 文件 source + `cannbench.zip` + `provenance.json`），离线可用；`callable` 参数对齐官方任务签名（如 `exp`）。模板位于 `templates/cannbench/`（`build.sh` / `setup.py` / `launch.cpp` / `operator.py`）。
+- **`preflight_evaluation`**：不消耗评测名额的体检。本地检查包完整性；`remote: true` 时再验 SSH、CANN 编译器、版本与 msprof，返回 `local.ok` / `ssh` / `cann.ready`。
+- **attrs 真正到达 kernel**：`CannessAttrs` + `canness_tiling_host.h` 属性表，算子运行时能读到 `base` / `scale` / `shift`（此前 attrs 只喂给 golden，kernel 完全看不到）。
+- **`launch.tile_length`**：tile 长度由 spec 决定并贯穿 `config` → `runRecord` → kernel tiling（此前固定 1024）。
+- **`accuracy { absThreshold, relThreshold }`**：逐元素「绝对 **或** 相对」判定。fp16 正确实现的绝对误差 1.95e-3 会超过 2^-10，旧判据必挂；新判据下 `maxRelErr 4.879e-4` 通过。
+- **`input_values`**：注入 NaN / ±Inf / ±65504 等边界值，报告里给出 `nonfiniteMismatches`。
+- **`interface { defaults, dtypes }` 与 `attrs_derived`**：导出包的 callable 默认值改由任务契约提供（不再误用测试属性）；`ln(base)` 这类派生量在 host 侧预折叠。
+- **来源溯源全链路**：`write_operator.provenance` → `operators/<gen>/layer-origins.json` → `manifest.provenance` → 导出 `provenance.json`，每文件 sha256，并记录与历史 generation 的行重合度。
+- **`workspace.ts`**：工作区由 cwd 派生（默认 `canness-workspace`），配置项可省略；`cordis.patch.yml` 不再钉死绝对路径。
+- **CANNLab 生命周期**：隧道断开时返回环境名、额度提示、上次成功连接时间、重连指引与 `pendingStage`；环境停机后可自动启动并恢复 SSH。
+
 ### 变更
 
-- 构建契约支持 `I32` / `I64` 真实缓冲与整数精确比较、`index-check` 精度模式、shape / attrs 的 `GoldenCtx`；未知 dtype 打包时拒绝（T-008/T-009）。
-- 性能采样默认 20 次，热身行不进入均值，实际采样次数写入 `runRecord`（T-010）。
-- 主机编译单元只引入共用 tiling 结构，链接不再使用 `--allow-multiple-definition`（T-011）。
-- manifest 记录契约指纹，上传前检查包哈希，远端先编译最小 `DataCopy` 自检（T-012）。
-- 自动续轮只驱动最近一次评测的所属会话，且一份报告只触发一次；旧 `state.json` 没有 `ownerSessionId` 时需在该会话重新评测以认领任务（T-001/T-002）。
-- 同包重复评测直接返回上一份报告并标记 `duplicate: true`；需要重测时传 `force: true`（T-004）。
+- `run_evaluation` 支持 `pendingStage` 断点续跑：传输失败后重试同一份包可接着上次阶段。
+- 远端指标采集区分 AIC / AIV：CANN 9.0 会把纯向量算子标成 `AI_CORE`，AIC 全零而 AIV 非零时改用 AIV 列归类。
+- 版本 `0.2.1` → `0.3.0`。
 
 ### 修复
 
-- 远端自动探测 CANN 的 `set_env.sh`，记录实际路径，缺失时在编译日志列出搜索路径（T-006）。
+- **fp16 精度误判**：绝对误差阈值会把正确实现判错（见上）。
+- **attrs 到不了 kernel**：`scale` / `shift` 现在真机生效，否则 golden 会差一个仿射变换、correctness 必挂。
+- **tile 固定 1024**、**特殊值不可测**、**工作区双真相**：分别由 `tile_length`、`input_values`、`workspace.ts` 修掉。
+
+### 验证
+
+- 单元测试 25 个文件 **208 项全绿**；`pnpm check`（host + client 双 tsconfig）、`pnpm build` 通过。
+- 真机闭环（`gen-2e1b3a97`，Ascend910 / CANN 9.0.0）：`pass`，`maxRelErr 4.879e-4`，`nonfiniteMismatches 0`，**49.872µs / 目标 50µs**，`bottleneck: scalar`，84.1 GB/s。
+- 导出包真机构建：`cann_bench-1.0.0-py3-none-linux_aarch64.whl`（49,438 B）→ `pip install` → `import` 通过；精度矩阵 17/17，后续同 wheel **51/51**（fp16 / fp32 / bf16）。
+- **官方 CANNBench（tasks-v2.1.0）Exp 精度评测：20/20 通过**，`pass_rate 1.0`，score 30（编译 5 + 运行 5 + 功能 20）；本轮为 `--no-perf`。
+- CANNLab 停机 → 自动启动 → SSH 恢复：真机验证通过。
+- 未验证：官方性能评分（`--no-perf`，当前 49.9µs 与参考实现 5.4µs 差约 9×，需双缓冲流水线）；loop 的停滞/续轮真机路径。
 
 ## [0.2.1] - 2026-11-06
 
@@ -35,6 +63,7 @@
 - **`kernelTimeUs` 口径固定**：优先 `op_summary` 全部行的 `Task Duration(us)` 算术平均；只有聚合文件时取 `op_statistic` 的 `Avg` 列；两者都没有时 `status: "error"` 并列出搜索过的目录与 CSV。
 - **`fetch_remote_file` 收紧**：`remotePath` 必须为绝对路径，读取范围仅限 `outbox` 与当前 generation 的 `inbox/<generationId>`。
 - **移除 `bootstrap` / `bootstrapCommand` 与对应文档**：远端不再需要 inbox 消费者；评测由 `remote/runner.py` 执行包内构建契约。历史条目保留在 v0.1.1。
+- **同批合入（原记录在 Unreleased，随 0.2.1 发布，此处补记）**：构建契约支持 `I32` / `I64` 真实缓冲与整数精确比较、`index-check` 精度模式、shape / attrs 的 `GoldenCtx`，未知 dtype 打包时拒绝（T-008/T-009）；性能采样默认 20 次、热身行不计入均值、实际次数写入 `runRecord`（T-010）；主机编译单元只引入共用 tiling 结构，链接不再使用 `--allow-multiple-definition`（T-011）；manifest 记录契约指纹、上传前校验包哈希、远端先编译最小 `DataCopy` 自检（T-012）；自动续轮只驱动最近一次评测的所属会话且一份报告只触发一次，旧 `state.json` 无 `ownerSessionId` 时需在该会话重新评测以认领（T-001/T-002）；同包重复评测返回上一份报告并标记 `duplicate: true`，`force: true` 可重测（T-004）；远端自动探测 `set_env.sh` 并记录实际路径，缺失时在编译日志列出搜索路径（T-006）。
 
 ### 清理
 

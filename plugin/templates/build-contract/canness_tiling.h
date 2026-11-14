@@ -13,9 +13,7 @@ using DTYPE_X = {{DTYPE_X}};
 using DTYPE_Y = {{DTYPE_Y}};
 
 // `workspaceSize` makes a scratch buffer available to the kernel WITHOUT adding
-// a parameter to canness_kernel: main.cpp allocates sizeof(CannessTilingData) +
-// workspaceSize bytes and passes the same pointer, so the kernel reaches the
-// scratch area at
+// a parameter to canness_kernel. The kernel reaches the scratch area at
 //     (__gm__ uint8_t *)tiling + sizeof(CannessTilingData)
 // Kernels stay signature-compatible (issue 013); 0 means "no scratch".
 // A __gm__ struct cannot be copied to local memory as a value, so read field
@@ -33,3 +31,48 @@ using DTYPE_Y = {{DTYPE_Y}};
         tilingData.workspaceSize = canness_gm_tiling__->workspaceSize;           \
     } while (0)
 #endif
+
+// The aligned attribute table follows scratch. Read GM fields individually
+// so neither the descriptor nor a record is copied across address spaces.
+class CannessAttrs {
+public:
+    __aicore__ inline CannessAttrs(GM_ADDR tiling, uint64_t workspaceBytes) {
+        const uint64_t end = sizeof(CannessTilingData) + workspaceBytes;
+        const uint64_t offset = (end + CANNESS_ATTR_ALIGNMENT - 1) & ~(CANNESS_ATTR_ALIGNMENT - 1);
+        base_ = tiling + offset;
+    }
+
+    __aicore__ inline uint32_t count() const {
+        return reinterpret_cast<__gm__ const CannessAttrTable*>(base_)->count;
+    }
+
+    __aicore__ inline CannessDeviceAttr get(uint32_t index) const {
+        CannessDeviceAttr result{};
+        result.type = GoldenAttrType::Missing;
+        if (index >= count()) return result;
+        __gm__ const CannessDeviceAttr* attr =
+            reinterpret_cast<__gm__ const CannessDeviceAttr*>(base_ + sizeof(CannessAttrTable)) + index;
+        result.type = attr->type;
+        result.nameOffset = attr->nameOffset;
+        result.nameLength = attr->nameLength;
+        result.textOffset = attr->textOffset;
+        result.textLength = attr->textLength;
+        result.number = attr->number;
+        result.integer = attr->integer;
+        result.numberBits = attr->numberBits;
+        result.hasInteger = attr->hasInteger;
+        result.boolean = attr->boolean;
+        return result;
+    }
+
+    __aicore__ inline __gm__ const uint8_t* name(const CannessDeviceAttr& attr) const {
+        return attr.nameOffset == 0 ? nullptr : base_ + attr.nameOffset;
+    }
+
+    __aicore__ inline __gm__ const uint8_t* text(const CannessDeviceAttr& attr) const {
+        return attr.textOffset == 0 ? nullptr : base_ + attr.textOffset;
+    }
+
+private:
+    GM_ADDR base_;
+};

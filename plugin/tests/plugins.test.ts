@@ -257,7 +257,9 @@ test('run_evaluation closes after a finished attempt and after an upload failure
   const failedCtx = fakeCtx()
   evalPlugin.apply(failedCtx as never, evalConfig(failed.workspace, { privateKeyPath: vol(join(failed.workspace, 'id_key')) }),
     async () => failedRemote.files)
-  await expect(failedCtx.toolsRegistered[0]!.execute({})).rejects.toThrow('upload failed')
+  await expect(failedCtx.toolsRegistered[0]!.execute({})).resolves.toMatchObject({
+    pendingStage: 'run_evaluation', status: 'error', summary: expect.stringContaining('upload failed'),
+  })
   expect(failedEvents).toEqual(['upload', 'close'])
 })
 
@@ -473,6 +475,80 @@ test('a live CANNLab tunnel is renewed once before connecting', async () => {
     })
   await ctx.toolsRegistered[0]!.execute({})
   expect(events).toEqual(['renew', 'connect'])
+})
+
+test('a stale CANNLab forward leaves the package ready to resume without spending budget', async () => {
+  const pkg = readyPackage()
+  const stateFile = join(pkg.workspace, '.canness', 'state.json')
+  const remote = new MemoryRemote()
+  remote.appearOnRead(`/out/${pkg.generationId}/results.json`, Buffer.from(JSON.stringify({
+    ...failReport('perf_fail'), generationId: pkg.generationId, summary: 'evaluation ran',
+  })), 1)
+  let reachable = false
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, {
+    host: vol('127.0.0.1'), port: vol(20022), privateKeyPath: vol(keyFile(pkg.workspace)),
+  }), async () => {
+    if (!reachable) throw new Error('connect ECONNREFUSED')
+    return remote
+  }, undefined, {
+    matches: () => true, health: async () => 'up', renew: async () => true,
+    describeFailure: async () => 'CANNLab environment Exp is stopped (status 4). Start it in the CANNLab console.',
+  })
+  const run = ctx.toolsRegistered.find(tool => tool.name === 'run_evaluation')!
+  const blocked = await run.execute({})
+  expect(blocked).toMatchObject({
+    status: 'error', pendingStage: 'run_evaluation', resultsPath: null,
+    summary: expect.stringMatching(/127\.0\.0\.1:20022.*stopped.*status 4/u),
+  })
+  expect(loadState(stateFile)).toMatchObject({
+    pendingStage: 'run_evaluation', lastEvaluatedHash: null, validIterations: 0, compileRetries: 0,
+  })
+  reachable = true
+  await expect(run.execute({})).resolves.toMatchObject({
+    status: 'perf_fail', summary: 'evaluation ran', pendingStage: null,
+  })
+  expect(loadState(stateFile)).toMatchObject({ pendingStage: null, validIterations: 1 })
+})
+
+test('preflight validates the local package without dialing or writing a result', async () => {
+  const pkg = readyPackage()
+  const ctx = fakeCtx()
+  let connected = false
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace), async () => {
+    connected = true
+    throw new Error('unexpected SSH')
+  })
+  const tool = ctx.toolsRegistered.find(tool => tool.name === 'preflight_evaluation')!
+  await expect(tool.execute({})).resolves.toMatchObject({
+    generationId: pkg.generationId, packageDir: join(pkg.workspace, 'packages', pkg.generationId),
+    local: { ok: false, issues: expect.arrayContaining(['missing build.sh', 'missing run_once.sh']) },
+    remote: null,
+  })
+  expect(connected).toBe(false)
+})
+
+test('remote preflight reads toolchain facts without uploading a package or consuming a run', async () => {
+  const pkg = readyPackage()
+  const remote = new MemoryRemote()
+  remote.execHandler = command => {
+    expect(command).toContain('--preflight')
+    return {
+      code: 0, stderr: '', stdout: JSON.stringify({
+        ready: true, toolchain: 'CANN 9.0.0', setEnv: '/opt/cann/set_env.sh', compiler: 'bisheng', msprof: '/bin/msprof',
+      }),
+    }
+  }
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }),
+    async () => remote)
+  const tool = ctx.toolsRegistered.find(tool => tool.name === 'preflight_evaluation')!
+  await expect(tool.execute({ remote: true })).resolves.toMatchObject({
+    remote: { ssh: 'connected', cann: { ready: true, toolchain: 'CANN 9.0.0' } },
+  })
+  expect(remote.execCalls).toHaveLength(1)
+  expect(remote.files.size).toBe(0)
+  expect(loadState(join(pkg.workspace, '.canness', 'state.json')).lastReport).toBeNull()
 })
 
 test('write_package_file owns golden.h and rejects every other path', async () => {

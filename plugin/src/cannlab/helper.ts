@@ -193,11 +193,12 @@ interface HelperReply {
 export async function helperRequest(
   port: number,
   path: string,
-  options: { method?: string, body?: string } = {},
+  options: { method?: string, body?: string, signal?: AbortSignal } = {},
 ): Promise<HelperReply> {
   const response = await fetch(`http://${LOOPBACK}:${String(port)}${path}`, {
     ...options.body === undefined ? {} : { body: options.body },
     ...options.method === undefined ? {} : { method: options.method },
+    ...options.signal === undefined ? {} : { signal: options.signal },
     ...options.body === undefined ? {} : { headers: { 'content-type': 'application/json' } },
   })
   const data = await response.json().catch(() => null) as HelperReply | null

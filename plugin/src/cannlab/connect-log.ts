@@ -7,7 +7,7 @@
  * and by anyone troubleshooting with them — without reproducing it.
  */
 
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { CannlabEvent } from './types.js'
 
@@ -52,4 +52,33 @@ export function startAttemptLog(path: string): {
 /** Path of the standard attempt log under a Harness home. */
 export function attemptLogPath(home: string): string {
   return join(home, 'canness', 'cannlab', 'last-connect.log')
+}
+
+/** Recover the last matching successful connection after a Harness restart. */
+export function loggedTunnel(
+  path: string,
+  host: string,
+  port: number,
+  keyPath: string,
+): { name: string; instanceId: string; helperPort: number | null; connectedAt: string } | null {
+  if (host !== '127.0.0.1' || keyPath === '') return null
+  let lines: string[]
+  try {
+    lines = readFileSync(path, 'utf8').split(/\r?\n/u)
+  } catch {
+    return null
+  }
+  const done = lines.findLast(line => line.endsWith(`@${host}:${port} via ${keyPath}`))
+    ?.match(/^(\S+) done\s+done Connected to "(.*)"\. :: /u)
+  const selected = lines.findLast(line => /^\S+ info\s+selecting /u.test(line))
+    ?.match(/ :: id (\S+) · devstage /u)
+  if (!done || !selected) return null
+  const helper = lines.findLast(line => /^\S+ info\s+helper-ready /u.test(line))
+    ?.match(/ :: 127\.0\.0\.1:(\d+) \(pid \d+\)$/u)
+  return {
+    name: done[2]!,
+    instanceId: selected[1]!,
+    helperPort: helper ? Number(helper[1]) : null,
+    connectedAt: done[1]!,
+  }
 }
