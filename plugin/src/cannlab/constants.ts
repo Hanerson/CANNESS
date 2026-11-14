@@ -36,6 +36,18 @@ export const CALLBACK_URI = `http://127.0.0.1:${String(CALLBACK_PORT)}${CALLBACK
 /** How long one interactive sign-in may wait for the browser callback. */
 export const OAUTH_TIMEOUT_MS = 5 * 60 * 1000
 
+/**
+ * How long the callback listener stays up after a successful sign-in.
+ *
+ * The tab GitCode redirected is still open on the user's machine. Closing the
+ * listener the instant the code arrives means a reload, a restored session or a
+ * second tab meets `ERR_CONNECTION_REFUSED` on a port that has nothing to do
+ * with them any more. For this window a repeat callback is answered with a page
+ * that says the sign-in already succeeded. A new sign-in preempts the window,
+ * so it never turns into "port 3000 is busy".
+ */
+export const CALLBACK_GRACE_MS = 20 * 1000
+
 /** CANNLab open API origin (a GitCode proxy in front of the Dev Container service). */
 export const CANNLAB_API_BASE = 'https://dev.gitcode.com/api/v1/proxy/vscode'
 

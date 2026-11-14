@@ -68,10 +68,53 @@ describe('interactiveLogin', () => {
     const result = await interactiveLogin(fetcher, {
       onStep: (step, _message, detail) => { steps.push(detail === undefined ? step : `${step}`) },
       openBrowser: callbackBrowser(),
-    }, 5000)
+    }, 5000, undefined, 0)
     expect(result).toEqual({ accessToken: 'at-123', refreshToken: 'rt-456', account: 'NPU Dev' })
     expect(steps).toEqual(['login-required', 'login-awaiting', 'login-exchange', 'login-ok'])
     expect(fetcher.calls.some(call => call.includes('grant_type=authorization_code'))).toBe(true)
+  })
+
+  it('keeps answering a repeated callback for a short while instead of refusing it', async () => {
+    const fetcher = gitcodeFetcher()
+    const callback = 'http://127.0.0.1:3000/extension/callback'
+    let state = ''
+    const result = await interactiveLogin(fetcher, {
+      onStep: (_step, _message, detail) => {
+        if (detail !== undefined && detail.startsWith('https://gitcode.com')) {
+          state = new URL(detail).searchParams.get('state') ?? ''
+        }
+      },
+      // Hand the browser the callback URL so the test can replay it later.
+      openBrowser: callbackBrowser(),
+    }, 5000, undefined, 2000)
+    expect(result.refreshToken).toBe('rt-456')
+
+    const callsAfterLogin = fetcher.calls.length
+    // What a reload, a restored tab or a second tab does: hit the same URL again.
+    const replay = await fetch(`${callback}?code=the-code&state=${state}`)
+    expect(replay.status).toBe(200)
+    expect(await replay.text()).toContain('已经授权成功')
+    // The replay must not reach the token endpoint a second time.
+    expect(fetcher.calls.length).toBe(callsAfterLogin)
+  })
+
+  it('a new sign-in takes the callback port over from the previous window', async () => {
+    // The first sign-in leaves its listener up for a long window.
+    await interactiveLogin(gitcodeFetcher(), {
+      onStep: () => {},
+      openBrowser: callbackBrowser(),
+    }, 5000, undefined, 60_000)
+
+    // A second sign-in within that window must not report the port as busy.
+    const controller = new AbortController()
+    const second = interactiveLogin(gitcodeFetcher(), {
+      onStep: () => {},
+      openBrowser: async () => {
+        setTimeout(() => { controller.abort() }, 20)
+        return true
+      },
+    }, 60_000, controller.signal, 0)
+    await expect(second).rejects.toThrow('cancelled')
   })
 
   it('refuses a callback that does not echo this attempt nonce', async () => {
@@ -79,7 +122,7 @@ describe('interactiveLogin', () => {
     await expect(interactiveLogin(fetcher, {
       onStep: () => {},
       openBrowser: callbackBrowser(params => { params.set('state', 'forged') }),
-    }, 5000)).rejects.toThrow('state check')
+    }, 5000, undefined, 0)).rejects.toThrow('state check')
     // The forged call must never reach the token endpoint.
     expect(fetcher.calls).toEqual([])
   })
@@ -91,7 +134,7 @@ describe('interactiveLogin', () => {
       await expect(interactiveLogin(gitcodeFetcher(), {
         onStep: () => {},
         openBrowser: async () => true,
-      }, 5000)).rejects.toThrow('port 3000 is busy')
+      }, 5000, undefined, 0)).rejects.toThrow('port 3000 is busy')
     } finally {
       await new Promise<void>(resolve => { blocker.close(() => { resolve() }) })
     }
@@ -106,7 +149,7 @@ describe('interactiveLogin', () => {
         setTimeout(() => { controller.abort() }, 10)
         return true
       },
-    }, 60_000, controller.signal)
+    }, 60_000, controller.signal, 0)
     await expect(pending).rejects.toThrow('cancelled')
 
     // The next attempt must be able to bind the fixed port straight away.
@@ -114,7 +157,7 @@ describe('interactiveLogin', () => {
     const retry = interactiveLogin(gitcodeFetcher(), {
       onStep: () => {},
       openBrowser: async () => true,
-    }, 60_000, second.signal)
+    }, 60_000, second.signal, 0)
     setTimeout(() => { second.abort() }, 20)
     await expect(retry).rejects.toThrow('cancelled')
   })
