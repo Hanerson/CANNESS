@@ -224,8 +224,8 @@ convergenceThreshold: 0.05
 
 ### 5.4 知识库 → 服务 + 检索工具 + 上下文注入
 
-- **载体**：知识库模块封装 `knowledge_base/` 目录（结构沿用 02 文档 §5.1），MVP 用文件级检索（关键词 + 算子类型索引），SQLite/向量库留到 Phase 3（04 文档 §7.2 本就暂缓）。
-- **检索**：`kb_search` 工具（模型主动查）。
+- **载体**：结构化 Markdown 条目存放于 `knowledge_base/entries/`，根目录笔记用于兼容查询。
+- **检索**：agent 主动调用 `kb_search`，可按算子、检索词和适用条件返回带出处的条目。条目格式、查询兼容性和排序规则见[知识库与 kb_search](06-knowledge-base.md)。
 - **注入**：`agent/pre-step` waterfall 监听器按任务阶段自动注入芯片规格表、当前算子类型的 tiling 模板（被动知识），与主动检索互补——即 03 文档的 Prompt 增强策略，载体从"拼 prompt 字符串"变为"注入上下文块"。
 
 ### 5.5 留痕与恢复

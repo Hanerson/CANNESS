@@ -1,6 +1,10 @@
 # Dependencies
 node_modules/
 
+#knowledgeBases
+
+ref/
+
 # Build output (regenerate with `pnpm build` in plugin/)
 lib/
 *.tsbuildinfo

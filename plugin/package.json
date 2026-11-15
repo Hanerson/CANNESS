@@ -30,6 +30,7 @@
   "files": [
     "lib",
     "src",
+    "scripts/validate-knowledge.mjs",
     "cordis.patch.yml",
     "knowledge_base",
     "remote",
@@ -59,6 +60,7 @@
   },
   "scripts": {
     "test": "vitest run",
+    "kb:validate": "node scripts/validate-knowledge.mjs",
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "prepack": "pnpm build"

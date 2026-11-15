@@ -122,7 +122,7 @@ flowchart LR
 
 1. 用户提出需求：「Add，float16，910B，kernel_time ≤ 8us」。
 2. `submit_spec` 校验规格书，生成 `generationId`（形如 `gen-1a2b3c4d`）并写状态文件。
-3. `kb_search` 按算子名检索知识库，拿回参考实现与 tiling 提示。
+3. `kb_search` 按算子名或任务关键词检索，拿回适用于当前条件的知识条目。
 4. `write_operator` 把四层文件写到 `{workspace}/operators/<generationId>/`。
 5. `build_test_package` 组装 `{workspace}/packages/<generationId>/`：四层 + 构建契约 + `config.json` + `manifest.json`；模型需要时用 `write_package_file('golden.h', ...)` 填精度公式。
 6. `run_evaluation` 上传到 `{inbox}/<generationId>/`，由远端 `runner.py` 执行 `build.sh` / `run_once.sh` / `msprof`，轮询 `{outbox}/<generationId>/results.json`，解析为评估报告作为工具结果返回。
@@ -274,11 +274,7 @@ dsh --profile canness-web --dump-config | grep -A 8 "== dsh-canness"
 
 ### `kb_search`
 
-| 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `operator_name` | string | 是 | 算子名，例如 `Add` |
-
-返回匹配条目的正文合并文本，上限 8000 字符。匹配方式是**文件名包含**（忽略大小写），例如 `Add.md`。没有命中时返回 `no knowledge entry for <name>`。
+至少传入 `operator_name` 和 `query` 中的一项。可再传入 `hardware`、`dtype`、`layout`、`cann_version`、`kind` 和 `limit`。只传算子名时返回兼容文本，其他调用返回含证据和来源的结构化命中。详见[知识库设计](docs/design/06-knowledge-base.md)和[条目填充指南](docs/knowledge-base-authoring.md)。
 
 ### `submit_spec`
 

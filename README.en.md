@@ -122,7 +122,7 @@ flowchart LR
 
 1. The user states a need: “Add, float16, 910B, kernel_time ≤ 8us”.
 2. `submit_spec` validates the spec, mints a `generationId` (e.g. `gen-1a2b3c4d`) and writes the state file.
-3. `kb_search` retrieves reference implementations and tiling hints by operator name.
+3. `kb_search` retrieves applicable knowledge by operator name or task keywords.
 4. `write_operator` writes the four layers to `{workspace}/operators/<generationId>/`.
 5. `build_test_package` assembles `{workspace}/packages/<generationId>/`: four layers + build contract + `config.json` + `manifest.json`; the model fills the accuracy formula with `write_package_file('golden.h', ...)` when needed.
 6. `run_evaluation` uploads to `{inbox}/<generationId>/`, where `runner.py` runs `build.sh` / `run_once.sh` / `msprof`, then polls `{outbox}/<generationId>/results.json` and returns the parsed report as the tool result.
@@ -274,11 +274,7 @@ After starting, **Settings → CANNESS** should show the settings card; asking t
 
 ### `kb_search`
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `operator_name` | string | yes | Operator name, e.g. `Add` |
-
-Returns the concatenated bodies of matching entries, capped at 8000 characters. Matching is a **case-insensitive filename substring** test, e.g. `Add.md`. A miss returns `no knowledge entry for <name>`.
+Supply at least one of `operator_name` and `query`. Optional fields include `hardware`, `dtype`, `layout`, `cann_version`, `kind`, and `limit`. An operator-name-only call returns compatibility text. Other calls return structured hits with evidence and source references. See the [knowledge base design](docs/design/06-knowledge-base.md) and [authoring guide](docs/knowledge-base-authoring.md).
 
 ### `submit_spec`
 

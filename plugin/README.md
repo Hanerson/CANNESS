@@ -28,7 +28,7 @@ Only `dsh-base + dsh-canness` (for example a profile named `canness`) has no app
 
 | Tool | Purpose |
 |---|---|
-| `kb_search` | 按算子名检索知识库 / search the knowledge base by operator name |
+| `kb_search` | 按算子、关键词和适用条件查询 / search by operator, keywords, and applicability |
 | `submit_spec` | 校验规格书并开启新一轮 / validate a spec and start a generation |
 | `write_operator` | 写入 kernel / host / api / plugin 四层文件 |
 | `build_test_package` | 组装四层 + 构建契约 + `config.json` / `manifest.json` / assemble the build-contract package |
@@ -146,7 +146,9 @@ pnpm build    # tsc + esbuild → lib/
 | `templates/build-contract/*` | 下一次 `build_test_package` | 每次从磁盘读取 |
 | `remote/runner.py` | 下一次 `run_evaluation` | 每次上传 |
 | `src/**.ts` / `lib/**.js` | `pnpm build` 后重启 dsh 或重载插件 | `lib/` 是运行期加载的产物 |
-| `knowledge_base/*` | 下一次 `kb_search` | 每次从磁盘读取 |
+| `knowledge_base/entries/*.md`、`knowledge_base/*.md` | 下一次 `kb_search` | 每次从磁盘读取 |
+
+维护知识库条目请参阅[知识库设计](../docs/design/06-knowledge-base.md)和[填充指南](../docs/knowledge-base-authoring.md)。在插件源码目录运行 `npm run kb:validate` 可离线检查结构化条目。
 
 ## 6. 许可 / License
 
