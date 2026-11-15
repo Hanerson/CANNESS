@@ -4,7 +4,7 @@ date: 2026-11-05
 status: 实施方案（待评审，未动手）
 relates_to:
   - "../design/05-plugin-architecture.md §5.3"
-  - "REPORT-A.md（任务 A：评测链路真实化）"
+  - "../reports/2026-11-05-evaluation-pipeline.md（任务 A：评测链路真实化）"
 ---
 
 # 构建契约补齐实施方案（方案 B：骨架 + 插槽）

@@ -1,7 +1,7 @@
 # 转交任务：CANNESS 结构化知识库条目生产
 
 > 交接人：Hanerson ｜ 接手：知识库小组 ｜ 起稿：2026-11-15
-> 相关文档：[设计说明](../docs/design/06-knowledge-base.md) ｜ [编写指南](../docs/knowledge-base-authoring.md) ｜ [示范条目](../plugin/knowledge_base/entries/argmax-950pr-stale-build-not-recompiled.md)
+> 相关文档：[设计说明](../docs/design/06-knowledge-base.md) ｜ [编写指南](../docs/guides/knowledge-base-authoring.md) ｜ [示范条目](../plugin/knowledge_base/entries/argmax-950pr-stale-build-not-recompiled.md)
 
 ## 1. 为什么做这件事
 
@@ -17,7 +17,7 @@
 | 材料 | 位置 | 说明 |
 |---|---|---|
 | 参考提交包 | `ref/season1-950PR/season1-950PR-top1/`、`.../top2/` | 每个算子一个 ZIP（含「隐藏」变体）。`ref/` 已被 `.gitignore` 忽略，**不进仓库** |
-| 编写指南 | [docs/knowledge-base-authoring.md](../docs/knowledge-base-authoring.md) | 四步法：盘点证据 → 拆可检索结论 → 按模板写 → 离线验收 |
+| 编写指南 | [docs/guides/knowledge-base-authoring.md](../docs/guides/knowledge-base-authoring.md) | 四步法：盘点证据 → 拆可检索结论 → 按模板写 → 离线验收 |
 | 字段与检索规则 | [docs/design/06-knowledge-base.md](../docs/design/06-knowledge-base.md) | 字段约束、排序规则、预算 |
 | 示范条目 | `plugin/knowledge_base/entries/argmax-950pr-stale-build-not-recompiled.md` | 照这个结构写 |
 | 校验器 | `cd plugin && npm run kb:validate` | 与运行时同一个解析器 |

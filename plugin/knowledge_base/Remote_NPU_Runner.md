@@ -26,8 +26,7 @@
 ```
 
 - 远端临时文件一律带 uuid，并发评测不会互相覆盖。
-- `/dev/davinci7` 是唯一映射的设备；任何 NPU 操作前先抢锁：
-  `flock /tmp/canness/davinci7.lock -c '<command>'`（runner 自动加锁，`--lock ''` 可关闭）。
+- `7` 是 runner 的默认设备编号，实际映射取决于部署。可用 `CANNESS_ASCEND_VISIBLE_DEVICES` 或 `--device` 设置；运行和采样在有 `flock` 时共享配置的锁。
 - 登录信息只放在本地配置 / 凭据存储，**不得写入仓库**。
 
 ## 2. 测试包契约（v1）
@@ -58,7 +57,7 @@
 `golden not implemented: fill golden.h in the package, then re-run build_test_package and run_evaluation`，
 `maxRelativeError` 保留原始数值，`runRecord.params.golden` 记录来源。
 
-正确性阈值：`maxAbsErr` 上限从包内 `config.json` 的 `maxAbsErr` / `tolerance.maxAbsErr`（或 `manifest.json` 的同名字段）读取，缺省 `1e-3`。runner **不会**自己编造阈值，也不会在缺少脚本时猜编译命令：
+当前构建契约以 `config.json` 配置逐元素精度检查。浮点元素满足绝对或相对误差阈值即可，整数比较保持精确。旧包使用包内 `maxAbsErr` 阈值，缺省 `1e-3`。构建失败常见于：
 
 - 缺 `build.sh` 或 `run_once.sh` → `compile_fail`，摘要固定为
   `package does not implement build contract v1`。
@@ -81,10 +80,10 @@ timeout --kill-after=10s 1800s "$PY" /tmp/canness-a/runner-<uuid>.py \
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--runs` | `100` | 传给 `msprof` 的应用迭代次数（`--application="<exe> 100"`） |
+| `--runs` | `20` | 请求的应用迭代次数，慢用例可缩减，实际次数见 `runRecord.params.runs` |
 | `--device` | `7` | 导出为 `ASCEND_VISIBLE_DEVICES` |
 | `--lock` | `/tmp/canness/davinci7.lock` | `run_once.sh` 与 `msprof` 的 flock 文件；空字符串关闭 |
-| `--set-env` | `/usr/local/Ascend/ascend-toolkit/set_env.sh` | 存在才 source |
+| `--set-env` | 环境变量或自动探测 | 指定 CANN `set_env.sh`，对应评测插件的 `setEnv` |
 | `--msprof` | `msprof` | 可换成绝对路径 |
 | `--bash` | `bash` | 跑包内脚本的 shell（Windows 本地做 fixture 测试时用绝对路径指向 Git Bash） |
 
@@ -126,14 +125,14 @@ Received exit code 127 while establishing SFTP session
 runner 预建输出目录后执行：
 
 ```bash
-msprof --application="<exe> 100" --output=<预建目录>
+msprof --application="<exe> <实际迭代次数>" --output=<预建目录>
 ```
 
 - CSV 统一从 `<输出目录>/mindstudio_profiler_output/` 下递归查找。
 - 控制台出现 `no summary data` 属正常；只有 **CSV 缺失 / 没有时长行**才是错误：
   `results.json` 的 `status` 为 `error`，`kernelTimeUs` 为 `null`，绝不写成 pass。
 - **`kernelTimeUs` 口径**：优先读 `op_summary_*.csv`，按 `Op Name`（或 `Op Type`）匹配
-  `operatorName`，取该算子**全部行**的 `Task Duration(us)` 算术平均；匹配不到就取文件全部行。
+  `operatorName`，取匹配行的有效 `Task Duration(us)`，排除热身行后求平均；匹配不到就取可用行。
   只有完全没有 `op_summary` 行时才读 `op_statistic_*.csv` 的 `Avg` 列（聚合值，不与其他文件
   混算）。两者都没有 → `status: error`，摘要列出搜过的目录与 CSV 文件名。
   `analysis.summary` 写明来源与参与平均的行数（如 `op_summary ... over 3 rows`）。
@@ -145,8 +144,8 @@ msprof --application="<exe> 100" --output=<预建目录>
 1. 上传四层代码 + 构建契约 + config.json + manifest.json（exec + base64 tar）
 2. 远端 bash build.sh，取最后一行 stdout 作为 exe
 3. 远端 flock + bash run_once.sh，解析 CANNESS_RESULT（含 golden 来源）
-4. 远端 flock + msprof --application="<exe> 100" --output=<预建目录>
-5. 读 CSV：op_summary 全部行求平均；只有聚合文件时取 op_statistic 的 Avg
+4. 远端 flock + msprof，按实际迭代次数采样
+5. 读 CSV：op_summary 有效采样行求平均；只有聚合文件时取 op_statistic 的 Avg
 6. 写 outbox/<gen>/results.json（含 runRecord.params.golden）
 7. run_evaluation 轮询并解析 results.json
 ```
