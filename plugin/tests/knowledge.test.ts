@@ -17,9 +17,16 @@ test('caps the body at 8000 characters', () => {
   expect(searchKnowledge(root, 'Add').length).toBeLessThanOrEqual(8000)
 })
 
-test('ArgMax and WholeReduce knowledge entries are discoverable', () => {
+test('operator-name lookups prefer a structured entry over the legacy notes', () => {
   const root = new URL('../knowledge_base/', import.meta.url)
-  expect(searchKnowledge(root, 'ArgMax')).toContain('WholeReduce')
+  // ArgMax has a structured entry, so the compatibility text is the entry:
+  // metadata, sources and body, not the old note that happened to mention
+  // WholeReduce.
+  const argmax = searchKnowledge(root, 'ArgMax')
+  expect(argmax).toContain('argmax-950pr-stale-build-not-recompiled')
+  expect(argmax).toContain('rm -rf build dist')
+  expect(argmax).not.toContain('repeatTimes')
+  // WholeReduce has no structured entry, so the fallback still serves the note.
   expect(searchKnowledge(root, 'WholeReduce')).toContain('repeatTimes')
   expect(searchKnowledge(root, 'WholeReduce')).toContain('64')
 })
