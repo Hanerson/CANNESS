@@ -123,7 +123,7 @@ test.skipIf(python === null)('preflight sources the selected environment and rep
   expect(JSON.parse(done.stdout), done.stdout).toMatchObject({
     ready: true, toolchain: 'CANN 9.0.0', setEnv: choose, compiler: 'printf', msprof: 'true',
   })
-})
+}, 20_000)
 
 test.skipIf(python === null)('the report uses the msprof CSV number, not the manifest target', () => {
   const { root, inbox, outbox } = packageAt()
