@@ -7,6 +7,7 @@
 - [安装与配置](guides/setup.md)涵盖构建、dsh profile、工作区路径和连接设置。
 - [远端评测](guides/remote-evaluation.md)说明预检、runner、性能口径、断线恢复和常见故障。
 - [知识库填充](guides/knowledge-base-authoring.md)提供条目模板和从 `ref/` 提取证据的流程。
+- [知识库条目索引](reference/knowledge-base-index.md)按算子列出全部条目的一句话结论、类型与证据等级。
 - [工具与算子规格参考](reference/tools.md)列出工具、构建 ABI、精度检查和 CANNBench 导出条件。
 - [profile 配置参考](reference/configuration.md)列出插件行、默认值和预算规则。
 
