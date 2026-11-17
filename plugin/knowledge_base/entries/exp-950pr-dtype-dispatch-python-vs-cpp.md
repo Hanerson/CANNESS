@@ -15,7 +15,7 @@
       "sha256": "e14713e4518ffa1386d29d1afda3485ba502ae386dc9ce154da7aaf932cf8ed1"
     },
     {
-      "ref": "ref/season1-950PR/season1-950PR-top1/Exp.zip!cann_bench/exp/dispatcher.py#L38-L44",
+      "ref": "ref/season1-950PR/season1-950PR-top1/Exp.zip!cann_bench/exp/dispatcher.py#L22-L44",
       "sha256": "e14713e4518ffa1386d29d1afda3485ba502ae386dc9ce154da7aaf932cf8ed1"
     },
     {
@@ -24,6 +24,10 @@
     },
     {
       "ref": "ref/season1-950PR/season1-950PR-top2/Exp.zip!csrc/ops/exp/op_plugin/exp_plugin.cpp#L82-L87",
+      "sha256": "8b8d687f77eff5d2886de0be98fdb39549f8f43bc70694cb8ebc96ade2b31ffa"
+    },
+    {
+      "ref": "ref/season1-950PR/season1-950PR-top2/Exp.zip!csrc/ops/exp/op_kernel/exp_kernel.cpp#L188-L200",
       "sha256": "8b8d687f77eff5d2886de0be98fdb39549f8f43bc70694cb8ebc96ade2b31ffa"
     }
   ]

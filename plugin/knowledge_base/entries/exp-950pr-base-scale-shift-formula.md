@@ -12,19 +12,19 @@
   "sources": [
     {
       "ref": "https://gitcode.com/cann/cann-bench/blob/53ea611a1b88da922b82812f2721dd0b2fa33476/tasks/level1/exp/desc.md#L21-L41",
-      "sha256": "d0838f790d60cf92d636a3bc16e8b3b3dd967ac27460b3dc7c5d3d122e476209"
+      "sha256": "ac76a9d0b711934727c0e0e66a0baf6d9d022cc12fe0de1c4b54c851a141c90c"
     },
     {
       "ref": "https://gitcode.com/cann/cann-bench/blob/53ea611a1b88da922b82812f2721dd0b2fa33476/tasks/level1/exp/desc.md#L74-L80",
-      "sha256": "d0838f790d60cf92d636a3bc16e8b3b3dd967ac27460b3dc7c5d3d122e476209"
+      "sha256": "ac76a9d0b711934727c0e0e66a0baf6d9d022cc12fe0de1c4b54c851a141c90c"
     },
     {
       "ref": "https://gitcode.com/cann/cann-bench/blob/53ea611a1b88da922b82812f2721dd0b2fa33476/tasks/level1/exp/golden.py#L54-L57",
-      "sha256": "2c98c2f3e508616841c066ab66a2ee69465d8edfb72e3e8d8294ecc9e1cf0659"
+      "sha256": "3549ad7ddd315c58d6c4ab4a526ffd802c168ce61b4396a62aefc63aed1c27f3"
     },
     {
       "ref": "https://gitcode.com/cann/cann-bench/blob/53ea611a1b88da922b82812f2721dd0b2fa33476/tasks/level1/exp/proto.yaml#L15-L31",
-      "sha256": "fb59ee9dd31199548780c57019c28d71500712ea51880929425eb6379eab59d3"
+      "sha256": "2d6a11ffcb7dcc9d5f2b2f899ffae55fd9de9750bad468c9efde20314807e981"
     }
   ]
 }
