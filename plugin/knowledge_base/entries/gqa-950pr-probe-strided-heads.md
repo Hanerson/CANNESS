@@ -25,6 +25,6 @@
 
 **适用条件**：GQA 的 probe/性能用例（`checks/probe.py`）在 `strided=True` 时；或候选实现接收来自 slice 的非标准 head stride 输入时。
 
-**结论**：strided 输入不是简单的 `.contiguous()` 反面：probe 先分配 `[..., nq*2, D]`，再取 `[:, :, ::2, :]`，使 head 维 stride 翻倍；`scaled` 模式还把 q 乘 0.0625、k 乘 4、v 乘 0.25，并把 `scaleValue` 从默认 -1 改成 0.125。搬到设备时普通 `.npu()` 会丢掉这个物理 stride，所以 probe 重新构造 2 倍 head 的 buffer、写入后再 `[..., ::2, :]` 切片，并断言 `stride(2)==2*D`。候选 kernel/plugin 若先对输入做 `.contiguous()`，就会悄悄把 strided 用例变成 contiguous 用例，测不到真实布局；若按 `stride(2)==D` 写死寻址，则读到错位数据。
+**结论**：strided 输入不是简单的 `.contiguous()` 反面：probe 先分配 `[..., nq*2, D]`，再取 `[:, :, ::2, :]`，使 head 维 stride 翻倍；`scaled` 模式还把 q 乘 0.0625、k 乘 4、v 乘 0.25，并把 `scaleValue` 从默认 -1 改成 0.125。搬到设备时 probe 不依赖普通 `.npu()` 保留这个物理 stride：它重新构造 2 倍 head 的 buffer、写入后再 `[..., ::2, :]` 切片，并断言 `stride(2)==2*D`。候选 kernel/plugin 若先对输入做 `.contiguous()`，就会悄悄把 strided 用例变成 contiguous 用例，测不到真实布局；若按 `stride(2)==D` 写死寻址，则读到错位数据。
 
 **核对方式**：读 `probe.py` 的 `inputs()` 与 `device()`；打印 `q.stride()`，确认 `stride(2)==2*D` 且 `is_contiguous()==False`；用同一数值的 strided/contiguous 两份输入对比输出，确认 kernel 按实际 stride 寻址。

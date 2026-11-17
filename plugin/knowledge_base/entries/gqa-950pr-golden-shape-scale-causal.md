@@ -12,11 +12,11 @@
   "sources": [
     {
       "ref": "https://gitcode.com/cann/cann-bench/blob/53ea611a1b88da922b82812f2721dd0b2fa33476/tasks/level4/gqa/desc.md#L60-L93",
-      "sha256": "ae7b53cc5dc581771930016c090f91bd2ffe5bd35b8d554998ebf1ef3192dc85"
+      "sha256": "f4e181de4bb4fdb9957b0b4c4c7aa9ba3b7ebb08c356d8c3950037c8e1f9294d"
     },
     {
       "ref": "https://gitcode.com/cann/cann-bench/blob/53ea611a1b88da922b82812f2721dd0b2fa33476/tasks/level4/gqa/desc.md#L108-L114",
-      "sha256": "ae7b53cc5dc581771930016c090f91bd2ffe5bd35b8d554998ebf1ef3192dc85"
+      "sha256": "f4e181de4bb4fdb9957b0b4c4c7aa9ba3b7ebb08c356d8c3950037c8e1f9294d"
     },
     {
       "ref": "https://gitcode.com/cann/cann-bench/blob/53ea611a1b88da922b82812f2721dd0b2fa33476/tasks/level4/gqa/golden.py#L35-L39",
