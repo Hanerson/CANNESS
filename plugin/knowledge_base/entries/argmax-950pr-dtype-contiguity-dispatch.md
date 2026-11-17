@@ -29,6 +29,6 @@
 
 **适用条件**：950PR ArgMax，输入 x 为 contiguous，rank ≤ 8，reduce 维非空；dtype 为 fp16/fp32/bf16/int32/int64。
 
-**结论**：先按 `inner`（dim 之后所有维的乘积）是否等于 1 分成 contiguous 与 strided 两套 kernel，再按 dtype 选具体符号，共 10 个入口。contiguous 路径对 bf16 做 `view(at::kShort)` 的仅元数据位视图（kernel 按单调 int16 key 归约），对 int64 做 `view(at::kInt)` 并把元素数翻倍（用两个 int32 word plane 模拟 64 位比较）。因此 int64 contiguous 还要求 `2*numel <= INT32_MAX`，否则生成的 tiling ABI 溢出。rank>8、非 contiguous、空 reduce 维都会在 host 直接 `TORCH_CHECK` 报错，不进入 kernel。
+**结论**：先按 `inner`（dim 之后所有维的乘积）是否等于 1 分成两套 kernel；这里的 “strided” 指 reduce 维不在最内层（inner>1），输入本身仍必须是 contiguous。再按 dtype 选具体符号，共 10 个入口。contiguous 路径对 bf16 做 `view(at::kShort)` 的仅元数据位视图（kernel 按单调 int16 key 归约），对 int64 做 `view(at::kInt)` 并把元素数翻倍（用两个 int32 word plane 模拟 64 位比较）。`check_contract` 对所有 int64 输入（不只 inner==1）都要求 `2*numel <= INT32_MAX`，否则生成的 tiling ABI 溢出。rank>8、非 contiguous、空 reduce 维都会在 host 直接 `TORCH_CHECK` 报错，不进入 kernel。
 
 **核对方式**：读 `check_contract` 与 `arg_max_npu` 的 if/else 链；对 bf16/int64 检查 `view` 后 `stride()` 与元素数（int64 应翻倍）；构造 rank=9、非 contiguous、空 reduce 维和 `numel > 2^30` 的 int64 输入，确认报错信息来自 host。
