@@ -6,7 +6,7 @@ CANNESS is a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 ## Quick start
 
-The plugin package version is `0.3.0`. The local environment needs Node.js ≥ 24.9, pnpm 11, and dsh 0.2.x. Knowledge search, packaging, export, and local preflight work offline. Model calls follow the dsh configuration. Hardware evaluation needs an SSH-accessible Linux Ascend NPU host or a CANNLab tunnel.
+The plugin package version is `0.4.0`. The local environment needs Node.js ≥ 24.9, pnpm 11, and dsh 0.2.x. Knowledge search, packaging, export, and local preflight work offline. Model calls follow the dsh configuration. Hardware evaluation needs an SSH-accessible Linux Ascend NPU host or a CANNLab tunnel.
 
 With dsh installed, run:
 
