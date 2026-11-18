@@ -31,6 +31,8 @@
     "lib",
     "src",
     "scripts/validate-knowledge.mjs",
+    "scripts/check-golden.mjs",
+    "scripts/check-kernel.mjs",
     "cordis.patch.yml",
     "knowledge_base",
     "remote",
@@ -61,6 +63,8 @@
   "scripts": {
     "test": "vitest run",
     "kb:validate": "node scripts/validate-knowledge.mjs",
+    "check:golden": "node scripts/check-golden.mjs",
+    "check:kernel": "node scripts/check-kernel.mjs",
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "prepack": "pnpm build"

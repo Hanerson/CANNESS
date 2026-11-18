@@ -22,3 +22,7 @@
 ## 交付报告
 
 - [2026-11-05 评测链路真实化](reports/2026-11-05-evaluation-pipeline.md)，原仓库根目录 `REPORT-A.md`。
+
+## 实践问题清单
+
+- [2026-11-18 Cummin 实践问题](issues/2026-11-18-cummin-practice/README.md)：一轮算子实现中记录的 19 条实践问题，其中 15 条已修复归档（含同批 [工作流复盘](issues/2026-11-18-cummin-practice/WORKFLOW-REVIEW.md)），4 条仍未闭环、跟踪在仓库之外。

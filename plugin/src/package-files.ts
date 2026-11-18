@@ -284,22 +284,38 @@ function hashFiles(root: string, files: string[]): string {
 }
 
 /** Record the files that actually generated this package, not a guessed tag. */
-export function contractFingerprint(): {
+export function contractFingerprint(runtimeModuleUrl: string = import.meta.url): {
   schemaVersion: string; templatesMtime: string; libHash: string; pluginVersion: string
+  templatesHash: string; codeSource: 'src' | 'lib'; staleBuild: boolean; warnings: string[]
 } {
-  const templates = buildContractTemplateDir()
+  // Fingerprint the code tree this module actually executes from. A source test
+  // checkout can contain an unrelated old lib; a shipped lib may have no src.
+  const runtimeFile = fileURLToPath(runtimeModuleUrl)
+  const root = dirname(runtimeFile)
+  const pluginRoot = dirname(root)
+  const codeSource = runtimeFile.endsWith('.ts') ? 'src' : 'lib'
+  const templates = join(pluginRoot, TEMPLATE_RELATIVE)
   const templateFiles = listFiles(templates)
-  const newest = Math.max(...templateFiles.map(name => statSync(join(templates, name)).mtimeMs))
-  const pluginRoot = fileURLToPath(new URL('../', import.meta.url))
-  const libDir = join(pluginRoot, 'lib')
+  const newest = Math.max(0, ...templateFiles.map(name => statSync(join(templates, name)).mtimeMs))
+  const files = listFiles(root).filter(name => name.endsWith(codeSource === 'lib' ? '.js' : '.ts'))
   const sourceDir = join(pluginRoot, 'src')
-  const root = existsSync(libDir) ? libDir : sourceDir
-  const files = listFiles(root).filter(name => name.endsWith(root === libDir ? '.js' : '.ts'))
+  const staleSources = codeSource === 'lib' && existsSync(sourceDir)
+    ? listFiles(sourceDir).filter(name => name.endsWith('.ts') && !name.endsWith('.d.ts') && !name.startsWith('client/'))
+      .filter(name => {
+        const built = join(root, name.replace(/\.ts$/, '.js'))
+        return !existsSync(built) || statSync(join(sourceDir, name)).mtimeMs > statSync(built).mtimeMs
+      }) : []
+  const warnings = staleSources.length
+    ? [`Plugin sources are newer than or missing from the built lib (${staleSources.join(', ')}); run pnpm build in the plugin directory before generating packages.`] : []
   const packageMeta = JSON.parse(readFileSync(join(pluginRoot, 'package.json'), 'utf8')) as { version?: string }
   return {
     schemaVersion: CONTRACT_SCHEMA,
     templatesMtime: new Date(newest).toISOString(),
+    templatesHash: hashFiles(templates, templateFiles),
     libHash: hashFiles(root, files),
+    codeSource,
+    staleBuild: staleSources.length > 0,
+    warnings,
     pluginVersion: packageMeta.version ?? 'unknown',
   }
 }
@@ -322,9 +338,9 @@ function writeContractSelfCheck(dest: string, spec: OperatorSpec): void {
     'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR in0, GM_ADDR out0, GM_ADDR tiling) {',
     '  GET_TILING_DATA(t, tiling);',
     '  CannessAttrs attrs(tiling, t.workspaceSize);',
-    '  const auto pattern = attrs.get(0);',
-    '  const auto scale = attrs.get(1);',
-    '  const auto enabled = attrs.get(2);',
+    '  const auto pattern = attrs.find("pattern");',
+    '  const auto scale = attrs.find("scale");',
+    '  const auto enabled = attrs.find("enabled");',
     "  if (pattern.type != GoldenAttrType::String || attrs.text(pattern)[0] != 'i' ||",
     '      scale.type != GoldenAttrType::Number || scale.number != 1.0f ||',
     '      enabled.type != GoldenAttrType::Boolean || !enabled.boolean) return;',
@@ -533,11 +549,14 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
     performanceTargetUs: spec.performance_target.target_us,
     tensorSpecs: { inputs: spec.input_specs, outputs: spec.output_specs },
     attrs: spec.attrs ?? {},
+    attrsDerived: spec.attrs_derived ?? {},
     accuracyMode: spec.accuracyMode ?? 'elementwise',
     chip: spec.target_platform.chip,
     buildContract: 'v1',
     contract,
     layers: Object.values(LAYER_FILES),
+    compiledLayers: [LAYER_FILES.kernel],
+    documentedOnlyLayers: [LAYER_FILES.host, LAYER_FILES.api, LAYER_FILES.plugin],
     provenance,
     files,
   }

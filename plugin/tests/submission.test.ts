@@ -5,6 +5,7 @@ import { expect, test } from 'vitest'
 import { buildTestPackage, writeOperator } from '../src/package-files.ts'
 import { parseSpec } from '../src/spec.ts'
 import { exportSubmission } from '../src/submission.ts'
+import { sha256 } from '../src/provenance.ts'
 
 const KERNEL = 'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR in0, GM_ADDR out0, GM_ADDR tiling) {}'
 
@@ -38,4 +39,40 @@ test('exports a CANNBench source zip with the tested kernel and a generated laun
   expect(existsSync(artifact.archivePath)).toBe(true)
   writeFileSync(join(pkg, 'op_kernel/kernel.cpp'), 'modified kernel')
   expect(() => exportSubmission(workspace, generation, spec, 'exp')).toThrow(/rebuild/)
+})
+
+test('export includes custom wrapper and public signature in hashed unverified provenance', () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-export-'))
+  const spec = parseSpec({ operator_name: 'scan', operator_type: 'scan',
+    input_specs: [{name:'input',shape:['16'],dtype:'float32'}],
+    output_specs: [{name:'output',shape:['16'],dtype:'float32'}],
+    attrs: {dim:0, inner:1}, interface:{attrs:['dim']},
+    target_platform:{chip:'Ascend910B2'},performance_target:{metric:'kernel_time',target_us:50}})
+  writeOperator(workspace, 'gen-deadbeef', {kernel:KERNEL,host:'',api:'',plugin:''})
+  buildTestPackage(workspace,'gen-deadbeef',spec)
+  const generated = exportSubmission(workspace,'gen-deadbeef',spec)
+  expect(generated.signature).toBe('scan(input, dim)')
+  const wrapper = 'def scan(input, dim):\n    return input\n'
+  const artifact = exportSubmission(workspace,'gen-deadbeef',spec,'scan',{wrapper,signature:'scan(input, dim)'})
+  expect(readFileSync(join(artifact.sourceDir,'cann_bench/__init__.py'),'utf8')).toBe(wrapper)
+  const provenance = JSON.parse(readFileSync(join(artifact.sourceDir,'provenance.json'),'utf8'))
+  expect(provenance.validation.status).toBe('unverified')
+  expect(provenance.files['cann_bench/__init__.py']).toBe(sha256(wrapper))
+  expect(provenance.publicSignatureHash).toBe(sha256('scan(input, dim)'))
+})
+
+test('custom wrapper exports shape-changing mixed output dtype variants and rejects missing signature', () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-export-'))
+  const spec = parseSpec({operator_name:'reduce',operator_type:'reduce',
+    input_specs:[{name:'input',shape:['16'],dtype:'float32'}],
+    output_specs:[{name:'output',shape:['1'],dtype:'float32'},{name:'index',shape:['1'],dtype:'int64'}],
+    interface:{dtypes:['float16','float32']},target_platform:{chip:'Ascend910B2'},
+    performance_target:{metric:'kernel_time',target_us:50}})
+  writeOperator(workspace,'gen-deadbeef',{kernel:KERNEL,host:'',api:'',plugin:''})
+  buildTestPackage(workspace,'gen-deadbeef',spec)
+  expect(() => exportSubmission(workspace,'gen-deadbeef',spec,'reduce',{wrapper:'pass'})).toThrow(/signature/)
+  const artifact = exportSubmission(workspace,'gen-deadbeef',spec,'reduce',{
+    wrapper:'def reduce(input):\n    return input\n',signature:'reduce(input)'})
+  expect(readFileSync(join(artifact.sourceDir,'csrc/float16/canness_tiling.h'),'utf8')).toContain('using DTYPE_Y = half;')
+  expect(JSON.parse(readFileSync(join(artifact.sourceDir,'provenance.json'),'utf8')).signature).toBe('reduce(input)')
 })

@@ -270,14 +270,16 @@ test.skipIf(python === null)('warmup rows are excluded from the measured average
   expect(report.runRecord.params).toMatchObject({ runs: 20, requestedRuns: 20 })
 })
 
-test.skipIf(python === null)('a measured slow launch reduces profiler iterations', () => {
+test.skipIf(python === null)('a measured slow launch preserves the requested sampling protocol', () => {
   const { root, inbox, outbox } = packageAt()
   const runOnce = join(inbox, 'gen-fixture001', 'run_once.sh')
   writeFileSync(runOnce, readFileSync(runOnce, 'utf8').replace('"total":32768}', '"total":32768,"sampleUs":10000}'))
   expect(runRunner(root, inbox, outbox, fakeMsprof(root, CSV), 20).status).toBe(0)
   const report = results(outbox)
   expect(report.runRecord.params).toMatchObject({
-    runs: 2, requestedRuns: 20, sampleUs: 10000, samplingBasis: 'measured-launch-wall-time',
+    runs: 20, requestedRuns: 20, sampleUs: 10000, samplingBasis: 'fixed-requested-runs',
+    metricBasis: 'msprof-task-duration-us', wallTimeBasis: 'measured-launch-wall-time',
+    wallTimeMinusKernelUs: 9969.1,
   })
 })
 
@@ -411,4 +413,11 @@ test.skipIf(python === null)('a missing CANN environment is visible in compile.l
   } else {
     expect(existsSync(report.runRecord.params.setEnv)).toBe(true)
   }
+})
+
+
+test.skipIf(python === null)('runner diagnostics reject partial results and preserve phase evidence', () => {
+  const diagnostics = fileURLToPath(new URL('./runner_diagnostics_test.py', import.meta.url))
+  const done = spawnSync(python!, [diagnostics], { encoding: 'utf8' })
+  expect(done.status, done.stdout + done.stderr).toBe(0)
 })

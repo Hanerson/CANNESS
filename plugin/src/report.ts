@@ -28,6 +28,11 @@ export interface EvalReport {
   runRecord?: RunRecord
   /** Local duplicate guard returned the previous report without using SSH. */
   duplicate?: boolean
+  blockedBy?: 'policy' | 'transport' | 'ownership' | 'validation'
+  budget?: JsonValue
+  ownerSession?: string | null
+  stopReason?: string
+  policyEvidence?: JsonValue
   summary: string
 }
 

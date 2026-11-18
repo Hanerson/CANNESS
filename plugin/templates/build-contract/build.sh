@@ -39,7 +39,7 @@ FLAGS=(-x cce -std=c++17 "--cce-soc-version=$SOC_VERSION" --cce-soc-core-type=Ve
 # Host driver includes only the POD tiling descriptor, so no device globals are
 # emitted a second time.
 "$BISHENG" "${FLAGS[@]}" "${INCLUDES[@]}" \
-  -c main.cpp -o main.o
+  -Wno-ignored-attributes -c main.cpp -o main.o
 
 "$BISHENG" main.o kernel.o -o canness_run \
   -L"$CANN/aarch64-linux/lib64" -L"$CANN/aarch64-linux/devlib" \

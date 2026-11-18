@@ -54,7 +54,6 @@ SYSTEM_SET_ENV = '/usr/local/Ascend/ascend-toolkit/set_env.sh'
 DEFAULT_LOCK = '/tmp/canness/davinci7.lock'
 DEFAULT_DEVICE = '7'
 DEFAULT_RUNS = 20
-PROFILE_BUDGET_US = 20_000
 DEFAULT_MAX_ABS_ERR = 1e-3
 CONTRACT_ERROR = 'package does not implement build contract v1'
 LOG_LIMIT = 20000
@@ -168,7 +167,8 @@ def tensor_bytes(manifest: dict) -> int | None:
     return total
 
 
-def toolchain_version(toolkit_home: str | None = None, compiler: str | None = None) -> str:
+def toolchain_version(toolkit_home: str | None = None, compiler: str | None = None,
+                      env_prefix: str = '', bash_exe: str = 'bash') -> str:
     home = toolkit_home or os.environ.get('ASCEND_TOOLKIT_HOME') or '/usr/local/Ascend/ascend-toolkit/latest'
     version_cfg = Path(home) / 'version.cfg'
     try:
@@ -181,11 +181,10 @@ def toolchain_version(toolkit_home: str | None = None, compiler: str | None = No
     except OSError:
         pass
     for exe in (compiler,) if compiler else ('bisheng', 'ccec'):
-        if shutil.which(exe) is None:
+        if not compiler and shutil.which(exe) is None:
             continue
         try:
-            done = subprocess.run([exe, '--version'], capture_output=True,
-                                  encoding='utf-8', errors='replace', timeout=15)
+            done = run_command([bash_path(exe), '--version'], env_prefix, 15, bash_exe=bash_exe)
         except (OSError, subprocess.TimeoutExpired):
             continue
         line = first_line(done.stdout) or first_line(done.stderr)
@@ -269,7 +268,7 @@ def run_command(
     )
 
 
-def preflight(args: argparse.Namespace) -> int:
+def inspect_environment(args: argparse.Namespace) -> dict:
     """Inspect the environment selected for evaluation without running the package."""
     selected, searched = discover_set_env(args.set_env)
     issues = []
@@ -293,15 +292,20 @@ def preflight(args: argparse.Namespace) -> int:
         issues.append('bisheng is missing from the selected environment')
     if not profiler:
         issues.append('msprof is missing from the selected environment')
-    print(json.dumps({
+    return {
         'ready': not issues,
-        'toolchain': toolchain_version(str(local_path(toolkit)) if toolkit else None, compiler),
+        'toolchain': toolchain_version(str(local_path(toolkit)) if toolkit else None, compiler,
+                                       shell_env_prefix(selected, args.device), args.bash),
         'setEnv': selected,
         'searchedEnv': searched,
         'compiler': compiler or None,
         'msprof': profiler or None,
         'issues': issues,
-    }))
+    }
+
+
+def preflight(args: argparse.Namespace) -> int:
+    print(json.dumps(inspect_environment(args)))
     return 0
 
 
@@ -503,7 +507,45 @@ def build_profile(
     )
     if len(durations) < 10:
         summary += ' low_sample_count: fewer than 10 task-duration rows.'
-    return {'bottleneck': bottleneck, 'summary': summary, 'op': op}
+    if not collected:
+        for key in ('aicMacRatio', 'aicMte2Ratio', 'aicScalarRatio'):
+            op[key] = None
+    if op['aicoreTimeUs'] == 0:
+        op['aicoreTimeUs'] = None
+    return {'bottleneck': bottleneck, 'summary': summary, 'op': op,
+            'notCollected': [key for key, value in op.items() if value is None or value == '']}
+
+
+def enrich_launch_metadata(profile: dict, package: Path, params: dict) -> None:
+    """Keep measured labels separate from explicit package launch metadata."""
+    op = profile['op']
+    block_dim = number(op.get('blockDim'))
+    if block_dim is not None and block_dim.is_integer() and block_dim > 0:
+        op['blockDimSource'] = 'msprof'
+    else:
+        configured = number(params.get('blockDim', params.get('block_dim')))
+        valid = configured is not None and configured.is_integer() and configured > 0
+        op['blockDim'] = int(configured) if valid else None
+        op['blockDimSource'] = 'launch-config' if valid else None
+
+    op['kernelTaskType'] = None
+    op['kernelTaskTypeSource'] = None
+    source_path = package / 'op_kernel' / 'kernel.cpp'
+    try:
+        source = source_path.read_text(encoding='utf-8', errors='replace')
+        # Declarations inside comments or strings are documentation, not evidence.
+        source = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '', source, flags=re.DOTALL)
+        declarations = set(re.findall(
+            r'\bKERNEL_TASK_TYPE_DEFAULT\s*\(\s*(KERNEL_TYPE_[A-Z0-9_]+)\s*\)', source))
+        task_types = {'KERNEL_TYPE_AIV_ONLY': 'AIV', 'KERNEL_TYPE_AIC_ONLY': 'AIC'}
+        if len(declarations) == 1:
+            declaration = next(iter(declarations))
+            if declaration in task_types:
+                op['kernelTaskType'] = task_types[declaration]
+                op['kernelTaskTypeSource'] = f'op_kernel/kernel.cpp:KERNEL_TASK_TYPE_DEFAULT({declaration})'
+    except OSError:
+        pass
+    profile['notCollected'] = [key for key, value in op.items() if value is None or value == '']
 
 
 def profile_from_csv(outdir: Path, operator_name: str,
@@ -529,6 +571,11 @@ def profile_from_csv(outdir: Path, operator_name: str,
     summary_paths = [path for path in paths if 'op_summary' in path.name.lower()]
     statistic_paths = [path for path in paths if 'op_statistic' in path.name.lower()]
 
+    statistic_evidence = []
+    for path in statistic_paths:
+        evidence_rows, evidence_mapping = read_csv_rows(path)
+        statistic_evidence.extend(row for row in evidence_rows if row_matches(row, evidence_mapping, operator_name))
+
     durations, rows, mapping = summary_durations(summary_paths, operator_name)
     if durations:
         excluded = min(warmup, max(0, len(durations) - 1))
@@ -536,11 +583,14 @@ def profile_from_csv(outdir: Path, operator_name: str,
                                 operator_name, 'op_summary')
         if excluded:
             profile['summary'] += f' Excluded {excluded} warmup rows.'
+        profile['opStatistic'] = statistic_evidence
         return profile, ''
 
     durations, rows, mapping = statistic_durations(statistic_paths, operator_name)
     if durations:
-        return build_profile(durations, rows, mapping, operator_name, 'op_statistic (Avg Time)'), ''
+        profile = build_profile(durations, rows, mapping, operator_name, 'op_statistic (Avg Time)')
+        profile['opStatistic'] = statistic_evidence
+        return profile, ''
 
     searched = ', '.join(path.name for path in paths)
     return None, f'no Task Duration rows in {CSV_DIR}/ (searched {root}: {searched})'
@@ -565,10 +615,10 @@ def profile_executable(
     except subprocess.TimeoutExpired:
         return None, 'msprof timed out', f'msprof timed out after {args.msprof_timeout}s'
     log = truncate((done.stdout or '') + (done.stderr or ''))
+    if done.returncode != 0:
+        return None, f'msprof exited {done.returncode}: {first_line(done.stderr or done.stdout)}', log
     profile, error = profile_from_csv(outdir, operator_name, min(5, runs // 5))
     if profile is None:
-        if done.returncode != 0:
-            return None, f'msprof exited {done.returncode}: {first_line(done.stderr or done.stdout)}', log
         return None, error, log
     return profile, '', log
 
@@ -618,20 +668,22 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         report = make_report(generation, target, summary='--runs must be in 1..100000')
         report['runRecord'] = record(started, params, args)
         return report
-    # Older packages may not publish sampleUs; the target is only a fallback
-    # estimate. New packages replace this with the measured final launch time
-    # from run_once.sh before starting msprof.
-    estimated = max(1, int(PROFILE_BUDGET_US / target)) if target and target > 0 else args.runs
-    runs = min(args.runs, estimated)
+    runs = args.runs
     params['runs'] = runs
     params['requestedRuns'] = args.runs
-    params['samplingBasis'] = 'target-estimate' if target else 'requested'
+    params['samplingBasis'] = 'fixed-requested-runs'
+    params['device'] = args.device
+    params['warmupRuns'] = min(5, runs // 5)
+    params['metricBasis'] = 'msprof-task-duration-us'
+    params['phase'] = 'compile-only' if getattr(args, 'compile_only', False) else 'evaluation'
+    params['phaseTimingsMs'] = {'buildMs': None, 'accuracyMs': None, 'profileMs': None}
+    args.environment_facts = inspect_environment(args)
     selected_env, searched_env = discover_set_env(args.set_env)
     params['setEnv'] = selected_env
 
     build = package / 'build.sh'
     run_once = package / 'run_once.sh'
-    if not build.is_file() or not run_once.is_file():
+    if not build.is_file() or (not getattr(args, 'compile_only', False) and not run_once.is_file()):
         report = make_report(generation, target, status='compile_fail', summary=CONTRACT_ERROR)
         report['runRecord'] = record(started, params, args)
         return report
@@ -640,6 +692,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     env_warning = '' if selected_env else (
         'set_env.sh not found; searched: ' + ', '.join(searched_env) + '; PATH may lack bisheng\n'
     )
+    phase_started = time.perf_counter()
     selfcheck = package / '.contract-selfcheck' / 'build.sh'
     if selfcheck.is_file():
         try:
@@ -664,6 +717,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
                              summary=f'build.sh timed out after {args.build_timeout}s')
         report['runRecord'] = record(started, params, args)
         return report
+    params['phaseTimingsMs']['buildMs'] = (time.perf_counter() - phase_started) * 1000
     compile_log = truncate(env_warning + (built.stdout or '') + (built.stderr or ''))
     if built.returncode != 0:
         report = make_report(
@@ -687,6 +741,13 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         report['runRecord'] = record(started, params, args)
         return report
 
+    if getattr(args, 'compile_only', False):
+        report = make_report(generation, target, status='pass', compile_ok=True, compile_log=compile_log,
+                             summary='compile-only passed; correctness and performance were not evaluated')
+        report['runRecord'] = record(started, params, args)
+        return report
+
+    phase_started = time.perf_counter()
     try:
         correctness_run = run_command([args.bash, bash_path(run_once)], env_prefix, args.run_timeout,
                                       cwd=package, lock=args.lock, bash_exe=args.bash)
@@ -695,8 +756,15 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
                              summary=f'run_once.sh timed out after {args.run_timeout}s')
         report['runRecord'] = record(started, params, args)
         return report
+    params['phaseTimingsMs']['accuracyMs'] = (time.perf_counter() - phase_started) * 1000
     correctness_log = truncate((correctness_run.stdout or '') + (correctness_run.stderr or ''))
     result = parse_canness_result(correctness_run.stdout or '')
+    if correctness_run.returncode != 0:
+        report = make_report(generation, target, status='error', compile_ok=True,
+                             compile_log=f'{compile_log}\n{correctness_log}'.strip(),
+                             summary=f'run_once.sh exited {correctness_run.returncode}')
+        report['runRecord'] = record(started, params, args)
+        return report
     if result is None:
         report = make_report(generation, target, status='error', compile_ok=True,
                              compile_log=f'{compile_log}\n{correctness_log}'.strip(),
@@ -755,12 +823,13 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
 
     sample_us = number(result.get('sampleUs'))
     if sample_us is not None and 0 < sample_us < float('inf'):
-        runs = min(args.runs, max(1, int(PROFILE_BUDGET_US / sample_us))) if sample_us > 1000 else args.runs
-        params['runs'] = runs
         params['sampleUs'] = sample_us
-        params['samplingBasis'] = 'measured-launch-wall-time'
+        params['wallTimeBasis'] = 'measured-launch-wall-time'
 
+    phase_started = time.perf_counter()
     profile, perf_error, msprof_log = profile_executable(executable, package, args, env_prefix, str(operator_name), runs)
+    params['phaseTimingsMs']['profileMs'] = (time.perf_counter() - phase_started) * 1000
+
     if profile is None:
         report = make_report(
             generation, target, status='error', compile_ok=True,
@@ -771,7 +840,11 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         report['runRecord'] = record(started, params, args)
         return report
 
+    enrich_launch_metadata(profile, package, params)
+    params['opStatistic'] = profile.get('opStatistic', [])
     kernel_time_us = profile['op']['taskDurationUs']
+    if sample_us is not None and sample_us > 0:
+        params['wallTimeMinusKernelUs'] = sample_us - kernel_time_us
     byte_count = tensor_bytes(manifest)
     achieved_bw = (byte_count / (kernel_time_us * 1000)
                    if byte_count is not None and kernel_time_us > 0 else None)
@@ -785,6 +858,9 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         'achievedBandwidthGBps': achieved_bw,
         'rooflineUs': roofline_us,
         'baselineUs': None,
+        'notCollected': [f'op.{key}' for key in profile.get('notCollected', [])] + ['baselineUs']
+                        + (['rooflineUs'] if roofline_us is None else [])
+                        + (['achievedBandwidthGBps'] if achieved_bw is None else []),
     }
     if target is not None and kernel_time_us > target:
         status = 'perf_fail'
@@ -807,7 +883,7 @@ def record(started: float, params: dict, args: argparse.Namespace) -> dict:
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
         'host': socket.gethostname(),
         'params': params,
-        'toolchain': toolchain_version(),
+        'toolchain': getattr(args, 'environment_facts', {}).get('toolchain', 'CANN (version not collected)'),
         'durationMs': int((time.time() - started) * 1000),
     }
 
@@ -884,6 +960,7 @@ def main() -> int:
     parser.add_argument('--build-timeout', type=int, default=1800)
     parser.add_argument('--run-timeout', type=int, default=600)
     parser.add_argument('--msprof-timeout', type=int, default=1800)
+    parser.add_argument('--compile-only', action='store_true', help='build only; skip accuracy and profiling')
     parser.add_argument('--preflight', action='store_true', help='check the remote CANN toolchain without evaluating')
     args = parser.parse_args()
     if args.preflight:

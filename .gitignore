@@ -10,8 +10,13 @@ lib/
 *.tsbuildinfo
 *.log
 
-# Generated operator workspace: state.json, operators/, packages/
-.canness-workspace/
+# Generated operator workspace: artifacts live in the session cwd itself
+.canness/
+operators/
+packages/
+submissions/
+remote-files/
+# Legacy nested workspace (removed 2026-11-18; kept ignored so stale copies stay out of Git)
 canness-workspace/
 
 # Editor and OS files

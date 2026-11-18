@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join, posix } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { malformedReport, parseReport, stoppedReport, timeoutReport, type EvalReport, type JsonValue } from './report.js'
-import { applyReport, stopReason, type PolicyConfig, type TaskState } from './policy.js'
+import { applyReport, canForceEvaluation, stopReason, type PolicyConfig, type TaskState } from './policy.js'
 import { firstLines, shellQuote, waitForRemoteFile, type RemoteHost } from './remote.js'
 import { packageHash } from './package-files.js'
 
@@ -22,6 +22,8 @@ export interface RunInput {
   state: TaskState
   config: PolicyConfig
   setEnv?: string
+  force?: boolean
+  compileOnly?: boolean
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   /** Per-run temporary-name source; tests pin it so command strings are stable. */
@@ -53,12 +55,14 @@ export function runnerCommand(input: {
   generationId: string
   timeoutSec: number
   setEnv?: string
+  compileOnly?: boolean
 }): string {
   const timeout = `if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout --kill-after=10s ${Math.max(1, Math.round(input.timeoutSec))}s"; else TIMEOUT=""; fi; `
   return `${findPython}${timeout}$TIMEOUT "$PY" ${shellQuote(input.runnerPath)}`
     + ` --inbox ${shellQuote(input.inbox)} --outbox ${shellQuote(input.outbox)}`
     + ` --generation ${shellQuote(input.generationId)} --once`
     + (input.setEnv ? ` --set-env ${shellQuote(input.setEnv)}` : '')
+    + (input.compileOnly ? ' --compile-only' : '')
 }
 
 const findPython = 'PY=$(command -v python3 || command -v python) || { echo "python3 not found on remote" >&2; exit 127; }; '
@@ -101,9 +105,15 @@ export async function runEvaluation(input: RunInput): Promise<{
   report: EvalReport
   state: TaskState
   resultWritten: boolean
+  resultGenerationId?: string
 }> {
   const reason = stopReason(input.state, input.config)
-  if (reason) return { report: stoppedReport(input.generationId, reason), state: input.state, resultWritten: false }
+  if (reason && !input.compileOnly && !(input.force && canForceEvaluation(input.state, input.config))) {
+    return { report: stoppedReport(input.generationId, reason), state: input.state, resultWritten: false }
+  }
+  const fold = (report: EvalReport): TaskState => input.compileOnly ? input.state
+    : { ...applyReport({ ...input.state, packageHash: input.state.packageHash ?? packageHash(input.localPackageDir) }, report),
+        forcedRunsAfterStop: (input.state.forcedRunsAfterStop ?? 0) + (reason && input.force ? 1 : 0) }
   const manifestPath = join(input.localPackageDir, 'manifest.json')
   if (existsSync(manifestPath)) {
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { packageHash?: string }
@@ -111,8 +121,9 @@ export async function runEvaluation(input: RunInput): Promise<{
       throw new Error('package changed after build_test_package; rebuild before upload')
     }
   }
-  const remoteDir = `${input.inbox}/${input.generationId}`
-  const resultPath = `${input.outbox}/${input.generationId}/results.json`
+  const generation = input.compileOnly ? `${input.generationId}-compile-${randomUUID().slice(0, 8)}` : input.generationId
+  const remoteDir = `${input.inbox}/${generation}`
+  const resultPath = `${input.outbox}/${generation}/results.json`
   const baseDir = posix.dirname(posix.normalize(input.inbox))
   const token = (input.token ?? (() => randomUUID().slice(0, 12)))()
   const runnerPath = posix.join(baseDir, `runner-${token}.py`)
@@ -127,19 +138,20 @@ export async function runEvaluation(input: RunInput): Promise<{
       runnerPath,
       inbox: input.inbox,
       outbox: input.outbox,
-      generationId: input.generationId,
+      generationId: generation,
       timeoutSec: Math.round(input.timeoutMs / 1000),
       setEnv: input.setEnv,
+      compileOnly: input.compileOnly,
     }))
     if (started.code === 124) {
       const report = timeoutReport(input.generationId, Math.round(input.timeoutMs / 1000))
-      return { report, state: applyReport(input.state, report), resultWritten: false }
+      return { report, state: fold(report), resultWritten: false }
     }
     const early = await input.files.readFile(resultPath)
     if (early === null && started.code !== 0) {
       const detail = firstLines(started.stderr, 20) || firstLines(started.stdout, 20) || `exit ${started.code}`
       const report = runnerFailedReport(input.generationId, detail)
-      return { report, state: applyReport(input.state, report), resultWritten: false }
+      return { report, state: fold(report), resultWritten: false }
     }
     const body = early ?? await waitForRemoteFile(input.files, resultPath, {
       timeoutMs: input.timeoutMs,
@@ -148,12 +160,12 @@ export async function runEvaluation(input: RunInput): Promise<{
       sleep: input.sleep,
     })
     const report = parseReport(JSON.parse(Buffer.from(body).toString('utf8')))
-    return { report, state: applyReport(input.state, report), resultWritten: true }
+    return { report, state: fold(report), resultWritten: true, resultGenerationId: generation }
   } catch (error) {
     const report = error instanceof Error && error.message === 'timeout'
       ? timeoutReport(input.generationId, Math.round(input.timeoutMs / 1000))
       : malformedReport(input.generationId, error instanceof Error ? error.message : 'unknown')
-    return { report, state: applyReport(input.state, report), resultWritten: false }
+    return { report, state: fold(report), resultWritten: false }
   } finally {
     // Best-effort: a stale temp script is harmless, a failed cleanup is not a
     // reason to lose the report above.

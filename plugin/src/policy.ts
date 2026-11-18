@@ -69,6 +69,11 @@ export interface TaskState {
   packageHash?: string | null
   /** Fingerprint sent to the runner in the most recent evaluation. */
   lastEvaluatedHash?: string | null
+  /** One explicit retest may cross a soft stop per task budget window. */
+  forcedRunsAfterStop?: number
+  comparisonBasis?: string
+  budgetWindowStartedAt?: string | null
+  lastBlocked?: { reason: string; at: string; session: string | null; blockedBy?: string; tool?: string; budget?: import('./report.js').JsonValue } | null
   /** A built package whose remote evaluation can resume without regenerating. */
   pendingStage?: 'run_evaluation' | null
   lastReport: EvalReport | null
@@ -128,6 +133,28 @@ export function applyReport(state: TaskState, report: EvalReport): TaskState {
   }
   next.validIterations += 1
   const us = report.performance.kernelTimeUs
+  // Repeated measurements are observations, not new optimization candidates.
+  // A protocol change starts a new window rather than comparing unlike samples.
+  const repeated = state.packageHash != null && state.packageHash === state.lastEvaluatedHash
+  const basis = (value: EvalReport | null) => {
+    const params = value?.runRecord?.params
+    return JSON.stringify([value?.runRecord?.host, value?.runRecord?.toolchain,
+      ...['runs', 'requestedRuns', 'samplingBasis', 'metricBasis', 'warmupRuns', 'device'].map(key => params?.[key] ?? null)])
+  }
+  const previousBasis = state.comparisonBasis ?? (state.lastReport == null ? null : basis(state.lastReport))
+  const changedBasis = previousBasis !== null && previousBasis !== basis(report)
+  if (us != null) next.comparisonBasis = basis(report)
+  if (us != null && (repeated || changedBasis)) {
+    if (changedBasis) {
+      next.negativeStreak = 0
+      next.recentKernelTimeUs = [us]
+      next.previousPassKernelTimeUs = null
+      next.lastPassKernelTimeUs = null
+      next.bestKernelTimeUs = report.correctness.ok ? us : null
+    }
+    if (report.correctness.ok && (next.bestKernelTimeUs == null || us < next.bestKernelTimeUs)) next.bestKernelTimeUs = us
+    return next
+  }
   if (us != null) {
     next.recentKernelTimeUs = [...(state.recentKernelTimeUs ?? []), us].slice(-RECENT_LIMIT)
   }
@@ -143,8 +170,11 @@ export function applyReport(state: TaskState, report: EvalReport): TaskState {
   if (us != null && (next.bestKernelTimeUs == null || us < next.bestKernelTimeUs)) {
     next.bestKernelTimeUs = us
     next.negativeStreak = 0
-  } else {
-    next.negativeStreak += 1
+  } else if (us != null) {
+    // A consecutive regression compares adjacent candidates, not every
+    // experiment against the all-time winner. Small variation is not a loss.
+    const previous = state.lastReport?.performance.kernelTimeUs ?? state.bestKernelTimeUs
+    next.negativeStreak = previous != null && us > previous * 1.03 ? state.negativeStreak + 1 : 0
   }
   return next
 }
@@ -211,6 +241,13 @@ export function stopReason(state: TaskState, config: PolicyConfig): StopReason |
 
 export function shouldSteer(state: TaskState, config: PolicyConfig): boolean {
   return state.lastReport != null && state.lastReport.status !== 'pass' && stopReason(state, config) === null
+}
+
+/** Explicit remeasurement may override a heuristic, never a resource ceiling. */
+export function canForceEvaluation(state: TaskState, config: PolicyConfig): boolean {
+  const reason = stopReason(state, config)
+  return reason !== null && ['negativeStreak', 'stalled', 'converged', 'targetMet'].includes(reason)
+    && (state.forcedRunsAfterStop ?? 0) < 1
 }
 
 /** Lines a compiler emits that carry no decision, only context expansion. */

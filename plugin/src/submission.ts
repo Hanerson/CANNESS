@@ -42,10 +42,11 @@ function pythonValue(value: string | number | boolean): string {
   return JSON.stringify(value)
 }
 
-function submissionValues(spec: OperatorSpec, callable: string, socVersion: string): Record<string, string> {
+function submissionValues(spec: OperatorSpec, callable: string, socVersion: string, custom = false): Record<string, string> {
   if (!publicIdentifier(callable)) throw new Error('callable must be a public Python identifier')
   const inputNames = spec.input_specs.map(tensor => tensor.name)
   const attrs = Object.entries(spec.attrs ?? {})
+  const publicAttrs = spec.interface?.attrs ?? attrs.map(([name]) => name)
   const names = [...inputNames, ...attrs.map(([key]) => key)]
   if (new Set(names).size !== names.length || !names.every(publicIdentifier)) {
     throw new Error('CANNBench input and attribute names must be distinct public Python identifiers')
@@ -53,7 +54,7 @@ function submissionValues(spec: OperatorSpec, callable: string, socVersion: stri
   // Shape-changing kernels need a task-specific output/geometry adapter.
   const shape = spec.input_specs[0]!.shape
   const tensors = [...spec.input_specs, ...spec.output_specs]
-  if (tensors.some(tensor => JSON.stringify(tensor.shape) !== JSON.stringify(shape))) {
+  if (!custom && tensors.some(tensor => JSON.stringify(tensor.shape) !== JSON.stringify(shape))) {
     throw new Error('automatic CANNBench export currently supports same-shape inputs and outputs')
   }
   if (!/^[A-Za-z0-9._-]+$/.test(socVersion)) throw new Error('invalid CANNBench SoC')
@@ -78,7 +79,8 @@ function submissionValues(spec: OperatorSpec, callable: string, socVersion: stri
     const key = cppBytes(name)
     const defaults = spec.interface?.defaults ?? {}
     const defaultValue = Object.hasOwn(defaults, name) ? defaults[name] : undefined
-    pyParams.push(defaultValue === undefined ? name : `${name}=${pythonValue(defaultValue)}`)
+    if (publicAttrs.includes(name)) pyParams.push(defaultValue === undefined ? name : `${name}=${pythonValue(defaultValue)}`)
+    else pySetup.push(`${name} = ${pythonValue(value)}`)
     capacity += length + 1
     if (typeof value === 'string') {
       params.push(`const char* ${arg}, uint32_t ${arg}Length`)
@@ -108,12 +110,12 @@ function submissionValues(spec: OperatorSpec, callable: string, socVersion: stri
     rows.push(`{${cppBytes(name)}, GoldenAttrType::Number, ${argument} > 0 ? std::log(${argument}) : 1.0, false, nullptr, ${length}}`)
   }
   const argumentTail = (items: string[]) => items.length ? ', ' + items.join(', ') : ''
-  const signature = [...inputNames, ...pyParams].join(', ')
+  const signature = [...inputNames, ...publicAttrs.map(name => pyParams.find(param => param === name || param.startsWith(`${name}=`))!)].join(', ')
   // Python requires all mandatory positional attributes to precede defaults.
   let optional = false
-  for (const [name] of attrs) {
+  for (const name of publicAttrs) {
     if (Object.hasOwn(spec.interface?.defaults ?? {}, name)) optional = true
-    else if (optional) throw new Error('required interface attributes must precede attributes with defaults')
+    else if (optional && !custom) throw new Error('required interface attributes must precede attributes with defaults')
   }
   return {
     SOC_VERSION: socVersion,
@@ -144,7 +146,12 @@ function submissionValues(spec: OperatorSpec, callable: string, socVersion: stri
   }
 }
 
-export function exportSubmission(workspace: string, generationId: string, spec: OperatorSpec, callable?: string) {
+export interface ExportOptions { wrapper?: string; signature?: string }
+
+export function exportSubmission(workspace: string, generationId: string, spec: OperatorSpec, callable?: string, options: ExportOptions = {}) {
+  if (options.wrapper !== undefined && (!options.wrapper.trim() || !options.signature?.trim())) {
+    throw new Error('custom wrapper requires nonempty source and an explicit public signature')
+  }
   if (!/^gen-[a-f0-9]{8}$/i.test(generationId)) throw new Error('invalid generation ID')
   const pkg = join(workspace, 'packages', generationId)
   const manifestPath = join(pkg, 'manifest.json')
@@ -154,7 +161,7 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
   if (manifest.packageHash !== hash) throw new Error('package changed after build_test_package; rebuild the package before export')
   const filename = callable ?? spec.operator_name
   const config = JSON.parse(readFileSync(join(pkg, 'config.json'), 'utf8'))
-  const values = submissionValues(spec, filename, config.socVersion)
+  const values = submissionValues(spec, filename, config.socVersion, options.wrapper !== undefined)
   const tensors = [...spec.input_specs, ...spec.output_specs]
   const dtype = (name: string) => {
     const result = DTYPES[normalizedDtype(name)]
@@ -164,8 +171,8 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
   const variants = spec.interface?.dtypes?.map(dtype)
   if (variants && (new Set(variants).size !== variants.length
       || !variants.includes(dtype(tensors[0]!.dtype))
-      || tensors.some(tensor => dtype(tensor.dtype) !== dtype(tensors[0]!.dtype)))) {
-    throw new Error('interface.dtypes requires uniform tensor dtypes, unique variants, and the test dtype')
+      || spec.input_specs.some(tensor => dtype(tensor.dtype) !== dtype(tensors[0]!.dtype)))) {
+    throw new Error('interface.dtypes requires uniform input dtypes, unique variants, and the test dtype')
   }
   const names = variants ?? ['default']
   values.VARIANTS = names.join(' ')
@@ -174,10 +181,15 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
     : `${values.PY_DTYPES?.split(', ')[0]}: "default"`
   if (variants) {
     values.PY_DTYPES = spec.input_specs.map(() => '_first.dtype').join(', ')
-    values.PY_OUTPUTS = spec.output_specs.map(() =>
-      '_torch.empty(_first.shape, dtype=_first.dtype, device=_first.device)').join(', ')
+    values.PY_OUTPUTS = spec.output_specs.map(tensor =>
+      `_torch.empty(_first.shape, dtype=${dtype(tensor.dtype) === dtype(tensors[0]!.dtype) ? '_first.dtype' : `_torch.${dtype(tensor.dtype)}`}, device=_first.device)`).join(', ')
   }
-  const signature = `${filename}(${values.PY_PARAMS})`
+  const generatedSignature = `${filename}(${values.PY_PARAMS})`
+  if (options.signature !== undefined && !options.wrapper && options.signature !== generatedSignature) {
+    throw new Error(`public signature mismatch: generated ${generatedSignature}`)
+  }
+  const signature = options.signature ?? generatedSignature
+  if (!signature.startsWith(`${filename}(`) || !signature.endsWith(')') || /[\r\n]/.test(signature)) throw new Error('invalid public signature')
   const root = join(workspace, 'submissions')
   mkdirSync(root, { recursive: true })
   const staging = mkdtempSync(join(root, `${generationId}-`))
@@ -186,7 +198,7 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
     const files: Record<string, Buffer | string> = {
       'build.sh': render('build.sh', values),
       'setup.py': render('setup.py', values),
-      'cann_bench/__init__.py': render('operator.py', values),
+      'cann_bench/__init__.py': options.wrapper ?? render('operator.py', values),
       'csrc/launch.cpp': render('launch.cpp', values),
     }
     for (const name of [LAYER_FILES.kernel, 'canness_tiling.h', 'canness_tiling_common.h', 'canness_tiling_host.h']) {
@@ -197,14 +209,16 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
     for (const name of variants ?? []) {
       const variantSpec = { ...spec,
         input_specs: spec.input_specs.map(tensor => ({ ...tensor, dtype: name, input_values: undefined })),
-        output_specs: spec.output_specs.map(tensor => ({ ...tensor, dtype: name })),
+        output_specs: spec.output_specs.map(tensor => ({ ...tensor, dtype: dtype(tensor.dtype) === dtype(tensors[0]!.dtype) ? name : tensor.dtype })),
       }
       files[`csrc/${name}/canness_tiling.h`] = renderBuildContract(variantSpec)['canness_tiling.h']!
     }
     const fileHashes = Object.fromEntries(Object.entries(files).map(([name, content]) => [name, sha256(content)]))
     files['provenance.json'] = JSON.stringify({
       generationId, packageHash: hash, callable: filename, signature, dtypes: variants ?? tensors.map(tensor => tensor.dtype),
-      bindings: 'CANNESS-generated direct launch', files: fileHashes, layers: manifest.provenance ?? null,
+      bindings: options.wrapper ? 'user-provided wrapper with CANNESS direct launch library' : 'CANNESS-generated direct launch',
+      publicSignatureHash: sha256(signature), validation: { status: 'unverified', reason: 'export does not compile or execute the submission' },
+      compiledLayers: manifest.compiledLayers ?? [LAYER_FILES.kernel], documentedOnlyLayers: manifest.documentedOnlyLayers ?? [], files: fileHashes, layers: manifest.provenance ?? null,
     }, null, 2)
     for (const [name, content] of Object.entries(files)) {
       const target = join(sourceDir, name)
@@ -218,7 +232,7 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
       : spawnSync('zip', ['-q', archivePath, ...Object.keys(files)], { cwd: sourceDir, encoding: 'utf8' })
     if (archive.status !== 0) throw new Error(`could not create CANNBench zip: ${archive.error?.message ?? archive.stderr.trim()}`)
     if (statSync(archivePath).size > MAX_ARCHIVE_BYTES) throw new Error('CANNBench zip exceeds 50 MB')
-    return { sourceDir, archivePath, packageDir: pkg, callable: filename, signature }
+    return { sourceDir, archivePath, packageDir: pkg, callable: filename, signature, validation: { status: 'unverified' as const } }
   } catch (error) {
     rmSync(staging, { recursive: true, force: true })
     throw error

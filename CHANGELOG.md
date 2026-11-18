@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+- **工作区改为会话 cwd 本身**：`operators/`、`packages/`、`submissions/`、`.canness/` 直接位于会话工作目录，不再嵌套 `canness-workspace/`（`plugin/src/workspace.ts`）；显式 `workspace` 的相对路径按会话目录解析。原因是嵌套目录落在 Windows 沙箱进程可写授权之外，导致 `bash`/`pwsh` 侧的构建、拷贝、打包被拒，而插件自身写入成功。仓库提交的旧 `canness-workspace/` 已迁出并删除，`.gitignore` 改为忽略上述四个产物目录。
+- 同步更新 `docs/guides/setup.md`、`docs/reference/configuration.md`、`docs/design/05-plugin-architecture.md` 的工作区说明。
+
 ## [0.4.0] - 2026-11-17
 
 - 知识库支持带适用条件、证据类型和来源的结构化条目。`kb_search` 增加多条件检索，保留只传算子名的文本调用。新增条目校验命令和编写指南。

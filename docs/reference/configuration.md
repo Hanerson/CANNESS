@@ -5,7 +5,7 @@ bundle 配置以 [cordis.patch.yml](../../plugin/cordis.patch.yml) 与各插件�
 ## 知识库与生成
 
 - `canness-knowledge.kbRoot` 为知识库根目录，bundle 默认 `./plugin/knowledge_base`。
-- `canness-generator.workspace`、`canness-eval.workspace`、`canness-loop.workspace` 采用相同的工作区解析规则。默认从会话目录派生 `canness-workspace`，显式覆盖时三处应指向同一目录。
+- `canness-generator.workspace`、`canness-eval.workspace`、`canness-loop.workspace` 采用相同的工作区解析规则。默认工作区是会话工作目录本身——`operators/`、`packages/`、`submissions/`、`.canness/` 直接位于该目录，不再嵌套 `canness-workspace/`。拿不到绝对会话目录时退到进程 cwd；显式覆盖时相对路径按会话目录解析，三处应指向同一目录。详见[插件架构](../design/05-plugin-architecture.md#工作区)。
 
 ## 远端评测
 

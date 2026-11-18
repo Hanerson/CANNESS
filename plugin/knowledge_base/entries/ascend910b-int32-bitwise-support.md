@@ -1,0 +1,4 @@
+---
+{"schema_version":1,"id":"ascend910b-int32-bitwise-support","title":"910B CANN 9.0 int32 bitwise API compile diagnostics","kind":"troubleshooting","operator":"Cummin","hardware":["Ascend910B2"],"cann_versions":["9.0.0"],"dtypes":["int32","int16","uint16"],"keywords":["And","Xor","bitwise","compile-only"],"evidence":"reported","sources":[{"ref":"CAN-005, Cummin practice report, 2026-11-18"}]}
+---
+The reported 910B2/CANN 9.0.0 compilation rejected int32 And/Xor overloads. xor.h diagnosed supported int16_t/uint16_t types. This is a report from that target, not a universal statement about every CANN version or API overload. Read the actual headers using configured readRoots, then run run_evaluation({compile_only:true}) to verify the intended intrinsic without spending evaluation or compile-retry budgets. A local host stub cannot establish target API support.

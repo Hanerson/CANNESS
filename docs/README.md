@@ -19,4 +19,5 @@
 ## 验收与历史
 
 - [验收记录与待办](../tickets/TODO.md)记录已有真机证据和待补项。[知识库填充交接](../tickets/knowledge-base-handoff.md)记录后续条目生产计划。
+- [2026-11-18 Cummin 实践问题归档](archive/issues/2026-11-18-cummin-practice/README.md)保存一轮算子实现中 15 条已修复问题的证据与复盘，并列出仍未闭环的 4 条及其归属。
 - [历史归档](archive/README.md)保存早期设计、实施计划、PR 审查和评测链路交付报告，供追溯设计演变。

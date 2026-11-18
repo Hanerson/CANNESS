@@ -192,11 +192,12 @@ test('run_evaluation claims the task for the calling session and owes exactly on
   expect(state.ownerSessionId).toBe('session-a')
   expect(state.pendingSteer).toBe(true)
 
-  // A later call from another session takes over the task rather than leaving
-  // two sessions believing they own it.
-  await ctx.toolsRegistered[0]!.execute({ force: true }, { agent: { session: { id: 'session-b' } } })
-  const taken = JSON.parse(readFileSync(statePath, 'utf8')) as { ownerSessionId?: string }
-  expect(taken.ownerSessionId).toBe('session-b')
+  // A second session must not steal this task or consume its budget.
+  expect(await ctx.toolsRegistered[0]!.execute({ force: true }, { agent: { session: { id: 'session-b' } } }))
+    .toMatchObject({ blockedBy: 'ownership', ownerSession: 'session-a', pendingStage: null })
+  const taken = loadState(statePath)
+  expect(taken.ownerSessionId).toBe('session-a')
+  expect(taken.lastBlocked).toMatchObject({ blockedBy: 'ownership', session: 'session-b' })
 })
 
 test('unchanged package reuses the report without SSH; changed code and force run again', async () => {

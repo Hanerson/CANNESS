@@ -167,6 +167,25 @@ export function remoteFromShell(
       if (result.code !== 0) throw execFailure(`read ${remotePath}`, result)
       return new Uint8Array(Buffer.from(result.stdout.replace(/\s+/g, ''), 'base64'))
     },
+    async readFileWithin(remotePath, roots, maxBytes) {
+      const script = [
+        'import base64, os, pathlib, sys',
+        'target = pathlib.Path(sys.argv[1]).resolve()',
+        'limit = int(sys.argv[2])',
+        'roots = [pathlib.Path(p).resolve() for p in sys.argv[3:]]',
+        "if not any(root != pathlib.Path(root.anchor) and root in target.parents for root in roots): sys.exit('resolved remote path is outside allowed roots')",
+        'if not target.is_file(): sys.exit(44)',
+        "with target.open('rb') as handle: data = handle.read(limit + 1)",
+        "if len(data) > limit: sys.exit('remote file exceeds read limit')",
+        "sys.stdout.write(base64.b64encode(data).decode('ascii'))",
+      ].join('\n')
+      const command = 'PY=$(command -v python3 || command -v python) || exit 127; '
+        + `"$PY" -c ${shellQuote(script)} ${shellQuote(remotePath)} ${maxBytes} ${roots.map(shellQuote).join(' ')}`
+      const result = await shell.exec(command)
+      if (result.code === 44) return null
+      if (result.code !== 0) throw execFailure('bounded remote read', result)
+      return new Uint8Array(Buffer.from(result.stdout.trim(), 'base64'))
+    },
     async removeFile(remotePath) {
       await run(`rm -f -- ${shellQuote(remotePath)}`, `remove ${remotePath}`)
     },

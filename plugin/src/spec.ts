@@ -19,7 +19,7 @@ export interface OperatorSpec {
   tiling_hints: string | null
   /** Runtime operator attributes shared by the kernel and golden reference. */
   attrs?: Record<string, number | boolean | string>
-  interface?: { defaults?: Record<string, number | boolean | string>; dtypes?: string[] }
+  interface?: { attrs?: string[]; defaults?: Record<string, number | boolean | string>; dtypes?: string[] }
   /** Numeric host transformations packed alongside the original attributes. */
   attrs_derived?: Record<string, { source: string; transform: 'log_positive_or_one' }>
   /** Index check accepts any correct argmax tie position. */
@@ -144,8 +144,13 @@ export function parseSpec(raw: unknown): OperatorSpec {
   }
   if (raw.interface !== undefined) {
     if (!isRecord(raw.interface)) throw new Error('interface must be an object')
-    const { defaults, dtypes } = raw.interface
+    const { defaults, dtypes, attrs } = raw.interface
     spec.interface = {}
+    if (attrs !== undefined) {
+      if (!Array.isArray(attrs) || !attrs.every(name => typeof name === 'string' && Object.hasOwn(spec.attrs ?? {}, name))
+          || new Set(attrs).size !== attrs.length) throw new Error('interface.attrs must be unique declared attribute names')
+      spec.interface.attrs = attrs
+    }
     if (defaults !== undefined) {
       if (!isRecord(defaults)) throw new Error('interface.defaults must be an object')
       for (const [key, value] of Object.entries(defaults)) {

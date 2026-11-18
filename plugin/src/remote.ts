@@ -40,6 +40,8 @@ export interface RemoteStat {
  * a plain `RemoteFiles` still supports the upload-and-wait flow.
  */
 export interface RemoteHost extends RemoteFiles, RemoteShell {
+  /** Resolve symlinks on the host and perform a bounded read under allowed roots. */
+  readFileWithin?(remotePath: string, roots: readonly string[], maxBytes: number): Promise<Uint8Array | null>
   mkdirp(remoteDir: string): Promise<void>
   put(localPath: string, remotePath: string): Promise<void>
   stat(remotePath: string): Promise<RemoteStat | null>
@@ -103,6 +105,16 @@ export class MemoryRemote implements RemoteHost {
       this.files.set(this.staged.path, this.staged.bytes)
     }
     return this.files.get(remotePath) ?? null
+  }
+
+  async readFileWithin(remotePath: string, roots: readonly string[], maxBytes: number): Promise<Uint8Array | null> {
+    const target = posix.normalize(remotePath)
+    if (!roots.some(root => target.startsWith(posix.normalize(root).replace(/\/$/, '') + '/'))) {
+      throw new Error('resolved remote path is outside allowed roots')
+    }
+    const bytes = await this.readFile(target)
+    if (bytes && bytes.byteLength > maxBytes) throw new Error('remote file exceeds read limit')
+    return bytes
   }
 
   async removeFile(remotePath: string): Promise<void> {

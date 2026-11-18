@@ -15,10 +15,12 @@ CANNESS 以 `dsh-canness` bundle 接入 DeepSeek Harness。dsh 提供会话、�
 
 ## 工作区与产物
 
-生成、评测和循环服务使用同一个工作区。默认工作区为会话目录下的 `canness-workspace`，无法获取绝对会话目录时使用进程 cwd。工作区可以通过三个服务的 `workspace` 配置显式指定。
+生成、评测和循环服务使用同一个工作区。默认工作区**就是会话工作目录**：产物直接落在该目录，不再嵌套 `canness-workspace/`；无法获取绝对会话目录时退到进程 cwd。工作区可以通过三个服务的 `workspace` 配置显式指定（相对路径按会话目录解析）。
+
+> 为什么不再嵌套：Windows 沙箱的进程可写授权只落在会话工作区根（外加每会话私有 temp）上。嵌套目录在授权落地之前已存在时不会补到该授权，于是插件自身的文件写入成功、而 `bash`/`pwsh` 里的构建、拷贝、打包步骤被拒。产物回到根上后，这一类拒绝不再出现。详见[实践问题归档 CAN-001](../../docs/archive/issues/2026-11-18-cummin-practice/CAN-001-sandbox-acl-vs-policy.md)。
 
 ```text
-<workspace>/
+<session cwd>/          ← 工作区即会话目录
 ├── .canness/state.json
 ├── operators/<generationId>/
 ├── packages/<generationId>/

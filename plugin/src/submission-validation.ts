@@ -1,0 +1,57 @@
+import { randomUUID, createHash } from 'node:crypto'
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, posix } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { shellQuote, type RemoteHost } from './remote.js'
+import type { JsonValue } from './report.js'
+
+export interface SubmissionValidationInput { sourceDir: string; remoteRoot: string; setEnv?: string; testScript?: string; timeoutSec?: number }
+function checkSources(root: string): void {
+  const actual = new Set<string>()
+  const walk = (dir: string, prefix = '') => {
+    if (lstatSync(dir).isSymbolicLink()) throw new Error('submission symlinks are not allowed')
+    for (const name of readdirSync(dir)) {
+      const rel = prefix + name, path = join(dir, name), stat = lstatSync(path)
+      if (stat.isSymbolicLink()) throw new Error('submission symlinks are not allowed')
+      if (stat.isDirectory()) walk(path, rel + '/')
+      else if (stat.isFile() && rel !== 'provenance.json') actual.add(rel)
+      else if (!stat.isFile()) throw new Error('submission contains a non-regular file')
+    }
+  }
+  walk(root)
+  const declared = JSON.parse(readFileSync(join(root, 'provenance.json'), 'utf8')).files as Record<string, string>
+  if (!declared || typeof declared !== 'object' || Array.isArray(declared)) throw new Error('invalid provenance.files')
+  for (const [name, hash] of Object.entries(declared)) {
+    if (!actual.delete(name) || !/^[a-f0-9]{64}$/i.test(hash) || createHash('sha256').update(readFileSync(join(root, name))).digest('hex') !== hash.toLowerCase()) throw new Error(`submission provenance mismatch: ${name}`)
+  }
+  if (actual.size) throw new Error('submission contains unhashed files')
+}
+export async function validateSubmission(files: RemoteHost, input: SubmissionValidationInput): Promise<JsonValue> {
+  const timeout = Math.max(1, Math.min(3600, Math.round(input.timeoutSec ?? 600)))
+  const remoteDir = posix.join(input.remoteRoot, `submission-validation-${randomUUID()}`)
+  const failure = (reason: string): JsonValue => ({ status: 'failed', correctness: 'unverified', remoteDir, reason })
+  const temp = mkdtempSync(join(tmpdir(), 'canness-submission-validation-'))
+  try {
+    checkSources(input.sourceDir)
+    await files.mkdirp(remoteDir)
+    await files.uploadDir(input.sourceDir, posix.join(remoteDir, 'source'))
+    const built = fileURLToPath(new URL('../../remote/validate_submission.py', import.meta.url))
+    const runner = existsSync(built) ? built : fileURLToPath(new URL('../remote/validate_submission.py', import.meta.url))
+    await files.put(runner, posix.join(remoteDir, 'validate_submission.py'))
+    if (input.testScript !== undefined) {
+      writeFileSync(join(temp, 'test.py'), input.testScript)
+      await files.put(join(temp, 'test.py'), posix.join(remoteDir, 'test.py'))
+    }
+    const command = `python3 ${shellQuote(posix.join(remoteDir, 'validate_submission.py'))} --root ${shellQuote(remoteDir)} --timeout-sec ${timeout}`
+      + (input.setEnv ? ` --set-env ${shellQuote(input.setEnv)}` : '')
+      + (input.testScript !== undefined ? ' --test-script test.py' : '')
+    const result = await files.exec(command)
+    const line = result.stdout.split(/\r?\n/).filter(row => row.startsWith('CANNESS_SUBMISSION_REPORT ')).at(-1)
+    if (!line) return failure(`runner exited ${result.code}: ${result.stderr.slice(-4000)}`)
+    const report = JSON.parse(line.slice('CANNESS_SUBMISSION_REPORT '.length))
+    if (result.code !== 0 && report.status !== 'failed') return failure(`runner exited ${result.code}`)
+    return { ...report, remoteDir }
+  } catch (error) { return failure(error instanceof Error ? error.message : String(error)) }
+  finally { rmSync(temp, { recursive: true, force: true }) }
+}

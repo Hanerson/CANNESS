@@ -65,6 +65,20 @@ public:
         return result;
     }
 
+    // Indices follow serialized attrs order, then attrs_derived order. Prefer names.
+    __aicore__ inline CannessDeviceAttr find(const char* key) const {
+        for (uint32_t i = 0; i < count(); ++i) {
+            const auto attr = get(i);
+            const auto bytes = name(attr);
+            uint32_t j = 0;
+            while (j < attr.nameLength && key[j] != '\0' && bytes[j] == static_cast<uint8_t>(key[j])) ++j;
+            if (j == attr.nameLength && key[j] == '\0') return attr;
+        }
+        CannessDeviceAttr missing{};
+        missing.type = GoldenAttrType::Missing;
+        return missing;
+    }
+
     __aicore__ inline __gm__ const uint8_t* name(const CannessDeviceAttr& attr) const {
         return attr.nameOffset == 0 ? nullptr : base_ + attr.nameOffset;
     }

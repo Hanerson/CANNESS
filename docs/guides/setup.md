@@ -33,7 +33,7 @@ bundle 的 `kbRoot` 默认是 `./plugin/knowledge_base`，相对于 dsh 进程�
     kbRoot: "/absolute/path/to/CANNESS/plugin/knowledge_base"
 ```
 
-生成、评测和循环的 `workspace` 默认是会话目录下的 `canness-workspace`。拿不到绝对会话目录时，插件使用进程 cwd。需要固定位置时，在 `canness-generator`、`canness-eval` 和 `canness-loop` 三行中设置相同的绝对路径。profile 补丁中的 `config` 会替换对应行的配置；手工覆盖评测或循环行时，保留该行已有的必填项。配置值见[配置参考](../reference/configuration.md)。
+生成、评测和循环的 `workspace` 默认**就是会话工作目录**：`operators/`、`packages/`、`submissions/`、`.canness/` 直接位于该目录，不再嵌套 `canness-workspace/`。拿不到绝对会话目录时，插件使用进程 cwd。需要固定位置时，在 `canness-generator`、`canness-eval` 和 `canness-loop` 三行中设置相同的绝对路径。profile 补丁中的 `config` 会替换对应行的配置；手工覆盖评测或循环行时，保留该行已有的必填项。配置值见[配置参考](../reference/configuration.md)。
 
 ## 连接 NPU
 

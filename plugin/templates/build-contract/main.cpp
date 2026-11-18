@@ -398,6 +398,23 @@ int main(int argc, char** argv) {
     const GoldenCtx ctx = golden_context(raw_input_pointers.data());
     try {
         for (size_t output = 0; output < outputs.size(); ++output) {
+#ifdef CANNESS_GOLDEN_BATCH
+            std::vector<float> expected_values;
+            std::vector<int64_t> expected_integers;
+            if (outputs[output]->dtype == DType::I32 || outputs[output]->dtype == DType::I64) {
+#if CANNESS_INTEGER_OUTPUT && !CANNESS_INDEX_CHECK
+                expected_integers.resize(outputs[output]->elements);
+                canness_golden::evaluate_integer_all(ctx, static_cast<int>(output), input_pointers.data(),
+                    static_cast<int>(inputs.size()), expected_integers.data(), outputs[output]->elements);
+#endif
+            } else {
+#if CANNESS_FLOAT_OUTPUT && !CANNESS_INDEX_CHECK
+                expected_values.resize(outputs[output]->elements);
+                canness_golden::evaluate_all(ctx, static_cast<int>(output), input_pointers.data(),
+                    static_cast<int>(inputs.size()), expected_values.data(), outputs[output]->elements);
+#endif
+            }
+#endif
             for (int64_t element = 0; element < outputs[output]->elements; ++element) {
                 ++total;
 #if CANNESS_INDEX_CHECK
@@ -412,9 +429,13 @@ int main(int argc, char** argv) {
 #if CANNESS_INTEGER_OUTPUT
                     const int64_t actual = load_integer(outputs[output]->dtype,
                                                         outputs[output]->host.data(), element);
+#ifdef CANNESS_GOLDEN_BATCH
+                    const int64_t expected = expected_integers[element];
+#else
                     const int64_t expected = canness_golden::evaluate_integer(
                         ctx, static_cast<int>(output), input_pointers.data(),
                         static_cast<int>(inputs.size()), element);
+#endif
                     if (actual != expected) {
                         ++bad;
                         const double error = std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
@@ -426,7 +447,9 @@ int main(int argc, char** argv) {
 #if CANNESS_FLOAT_OUTPUT
                     const float actual = load_value(outputs[output]->dtype,
                                                     outputs[output]->host.data(), element);
-#ifdef CANNESS_GOLDEN_WITH_CONTEXT
+#ifdef CANNESS_GOLDEN_BATCH
+                    const float expected = expected_values[element];
+#elif defined(CANNESS_GOLDEN_WITH_CONTEXT)
                     const float expected = canness_golden::evaluate(
                         ctx, static_cast<int>(output), input_pointers.data(),
                         static_cast<int>(inputs.size()), element);

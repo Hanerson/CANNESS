@@ -254,3 +254,14 @@ test('state file round-trips and a missing file is empty', () => {
   saveState(path, state)
   expect(loadState(path).generationId).toBe('gen-01234567')
 })
+
+test('contract identifies compiled layers and supports named attrs and batch golden', () => {
+  const { pkg } = packageFor()
+  const manifest = JSON.parse(readFileSync(join(pkg, 'manifest.json'), 'utf8'))
+  expect(manifest.compiledLayers).toEqual(['op_kernel/kernel.cpp'])
+  expect(manifest.documentedOnlyLayers).toEqual(['op_host/host.cpp', 'op_api/api.cpp', 'op_plugin/plugin.py'])
+  const files = renderBuildContract(specFor('float32'))
+  expect(files['canness_tiling.h']).toContain('find(const char*')
+  expect(files['main.cpp']).toContain('canness_golden::evaluate_all(')
+  expect(files['main.cpp']).toContain('canness_golden::evaluate_integer_all(')
+})

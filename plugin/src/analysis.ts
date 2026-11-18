@@ -5,6 +5,9 @@ export interface MsprofOp {
   taskDurationUs: number
   taskWaitTimeUs: number | null
   blockDim: number | null
+  blockDimSource?: 'msprof' | 'launch-config' | null
+  kernelTaskType?: 'AIV' | 'AIC' | null
+  kernelTaskTypeSource?: string | null
   aicoreTimeUs: number | null
   aicMacRatio: number | null
   aicMte2Ratio: number | null
@@ -20,6 +23,7 @@ export interface PerformanceAnalysis {
   achievedBandwidthGBps?: number | null
   rooflineUs?: number | null
   baselineUs?: number | null
+  notCollected?: string[]
 }
 
 /** The only accepted origin: numbers came from an actual msprof run. */
@@ -49,6 +53,9 @@ function parseOp(raw: unknown): MsprofOp | null {
     taskDurationUs,
     taskWaitTimeUs: numOrNull(raw.taskWaitTimeUs),
     blockDim: numOrNull(raw.blockDim),
+    blockDimSource: raw.blockDimSource === 'msprof' || raw.blockDimSource === 'launch-config' ? raw.blockDimSource : null,
+    kernelTaskType: raw.kernelTaskType === 'AIV' || raw.kernelTaskType === 'AIC' ? raw.kernelTaskType : null,
+    kernelTaskTypeSource: typeof raw.kernelTaskTypeSource === 'string' ? raw.kernelTaskTypeSource : null,
     aicoreTimeUs: numOrNull(raw.aicoreTimeUs),
     aicMacRatio: numOrNull(raw.aicMacRatio),
     aicMte2Ratio: numOrNull(raw.aicMte2Ratio),
@@ -69,5 +76,6 @@ export function parseAnalysis(raw: unknown): PerformanceAnalysis | null {
     achievedBandwidthGBps: numOrNull(raw.achievedBandwidthGBps),
     rooflineUs: numOrNull(raw.rooflineUs),
     baselineUs: numOrNull(raw.baselineUs),
+    ...(Array.isArray(raw.notCollected) ? { notCollected: raw.notCollected.filter((item): item is string => typeof item === 'string') } : {}),
   }
 }
