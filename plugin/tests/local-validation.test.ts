@@ -9,7 +9,10 @@ import { expect, test } from 'vitest'
 // not g++, so the suite skips these cases instead of failing on a missing tool.
 const compiler = process.env.CXX?.trim() || 'g++'
 const hasCompiler = spawnSync(compiler, ['--version'], { encoding: 'utf8', windowsHide: true }).status === 0
-const testWithCompiler = hasCompiler ? test : test.skip
+// These cases compile and launch real C++ programs. Hosted Windows workers can
+// exceed Vitest's 5s default; keep this allowance scoped to external compilers.
+const testWithCompiler = (name: string, run: () => void) =>
+  (hasCompiler ? test : test.skip)(name, { timeout: 120_000 }, run)
 import { buildTestPackage, writeOperator } from '../src/package-files.ts'
 import { parseSpec } from '../src/spec.ts'
 

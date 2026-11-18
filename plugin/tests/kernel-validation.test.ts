@@ -11,7 +11,10 @@ const script=fileURLToPath(new URL('../scripts/check-kernel.mjs',import.meta.url
 // not g++, so the suite skips these cases instead of failing on a missing tool.
 const compiler=process.env.CXX?.trim()||'g++'
 const hasCompiler=spawnSync(compiler,['--version'],{encoding:'utf8',windowsHide:true}).status===0
-const testWithCompiler=hasCompiler?test:test.skip
+// Four real compiler invocations per case need more than the 5s unit-test
+// default on hosted Windows. Each subprocess retains its own bounded timeout.
+const testWithCompiler=(name:string,run:()=>void)=>
+  (hasCompiler?test:test.skip)(name,{timeout:120_000},run)
 function run(body:string, selfCheck=false) {
   const workspace=mkdtempSync(join(tmpdir(),'canness-kernel-check-'))
   const spec=parseSpec({operator_name:'add',operator_type:'elementwise',input_specs:[{name:'x',shape:['16'],dtype:'float32'}],output_specs:[{name:'y',shape:['16'],dtype:'float32'}],target_platform:{chip:'Ascend910B2'},performance_target:{metric:'kernel_time',target_us:50}})
