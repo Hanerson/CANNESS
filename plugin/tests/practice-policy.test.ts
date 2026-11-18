@@ -1,3 +1,4 @@
+import { resolve } from 'node:path'
 import { expect, test } from 'vitest'
 import { applyReport, emptyState, canForceEvaluation } from '../src/policy.ts'
 import { resolveWorkspace } from '../src/workspace.ts'
@@ -42,12 +43,16 @@ test('a manual forced measurement may cross a soft policy stop once, never hard 
   expect(canForceEvaluation({ ...state, validIterations: 10 }, config)).toBe(false)
 })
 test('workspace is the session cwd itself, and an explicit override resolves against it', () => {
-  expect(resolveWorkspace('', { agent: { session: { cwd: 'D:/jobs/one' } } })).toMatch(/D:[\\/]jobs[\\/]one$/)
-  expect(resolveWorkspace('D:/fixed', { agent: { session: { cwd: 'D:/jobs/one' } } })).toMatch(/D:[\\/]fixed$/)
-  expect(resolveWorkspace('artifacts', { agent: { session: { cwd: 'D:/jobs/one' } } })).toMatch(/D:[\\/]jobs[\\/]one[\\/]artifacts$/)
-  expect(resolveWorkspace('', { agent: { session: { cwd: '', header: { cwd: 'D:/jobs/two' } } } })).toMatch(/D:[\\/]jobs[\\/]two$/)
+  // Platform-neutral absolute paths: the assertions only use path.resolve, so they
+  // hold on both the Windows and the POSIX runners.
+  const one = resolve('/jobs/one')
+  const two = resolve('/jobs/two')
+  expect(resolveWorkspace('', { agent: { session: { cwd: one } } })).toBe(one)
+  expect(resolveWorkspace('/fixed', { agent: { session: { cwd: one } } })).toBe(resolve('/fixed'))
+  expect(resolveWorkspace('artifacts', { agent: { session: { cwd: one } } })).toBe(resolve(one, 'artifacts'))
+  expect(resolveWorkspace('', { agent: { session: { cwd: '', header: { cwd: two } } } })).toBe(two)
   // A nested default would put artifacts below the sandbox's writable root without its grant.
-  expect(resolveWorkspace('', { agent: { session: { cwd: 'D:/jobs/one' } } })).not.toMatch(/canness-workspace$/)
+  expect(resolveWorkspace('', { agent: { session: { cwd: one } } })).not.toMatch(/canness-workspace$/)
 })
 test('remote reads admit history only when it is a known local generation and configured roots', () => {
   expect(remoteTargetAllowed('/in/gen-old/log', '/out', '/in', 'gen-now', ['/opt/Ascend'], ['gen-old'])).toBe(true)
