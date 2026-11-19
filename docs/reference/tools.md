@@ -11,7 +11,8 @@
 - `submit_spec({ spec, reset? })` 校验算子规格并创建 generation。同名算子默认沿用预算，显式 `reset: true` 可重新计数。输出含 `generationId`、绝对工作区路径及预算沿用信息。
 - `write_operator({ kernel, host, api, plugin, provenance? })` 将当前 generation 的四层源码写到 `op_kernel/kernel.cpp`、`op_host/host.cpp`、`op_api/api.cpp` 和 `op_plugin/plugin.py`。`provenance` 按层记录 `generated`、`adapted_from` 或 `copied_from`；后两者需要 `source`，可带 `sha256`。
 - `write_package_file({ path: "golden.h", content })` 设置完整的精度参考，只接受 `golden.h`。它会更新生成目录以及已存在的包副本。之后运行 `build_test_package` 刷新包指纹。
-- `build_test_package()` 渲染构建契约 v1，生成四层源码、`build.sh`、`run_once.sh`、`main.cpp`、`golden.h`、三个 tiling 头文件、`config.json` 和 `manifest.json`。manifest 记录文件清单、版本指纹、包指纹与来源信息。
+- `build_test_package()` 渲染构建契约 v1，生成四层源码、`build.sh`、`run_once.sh`、`main.cpp`、`golden.h`、三个 tiling 头文件、`config.json` 和 `manifest.json`。manifest 记录文件清单、版本指纹、包指纹与来源信息。生成的 `.sh` 脚本一律为 LF；若模板仍带 CR，构建会拒绝写包。
+- `repair_package({ drop?, write? })` 对**已构建**的包做受支持的后处理：`drop` 删除包内文件或目录，`write` 创建/替换文本文件（内容归一为 LF）。它会重建 `manifest.files`、重签 `manifest.packageHash` 并同步工作区 state，因此 `run_evaluation`/`export_submission` 会接受修补后的包。路径必须留在包内且不能是 `manifest.json`。之后的 `build_test_package` 仍会从 `operators/<generationId>` 重建并丢弃这些修补。
 - `export_submission({ callable? })` 按当前代的已构建测试包生成 CANNBench 源码与 ZIP。返回 `sourceDir`、`archivePath`、`packageDir`、`callable` 和 `signature`。
 
 ### 算子规格
@@ -51,7 +52,8 @@ kernel 入口固定为 `extern "C" __global__ __aicore__ void canness_kernel(...
 ## 预检、评测与诊断
 
 - `preflight_evaluation({ remote? })` 本地检查包、指纹和 golden 状态；`remote: true` 另外探测 SSH 及 CANN 工具链。预检无需编译，也不消耗评测轮数。
-- `run_evaluation({ force? })` 上传并评测当前包，返回编译、精度、性能、诊断和路径。相同包已有报告时可能返回 `duplicate: true`。`force: true` 要求重新测量，仍受停止规则约束。
+- `run_evaluation({ force?, compile_only? })` 上传并评测当前包，返回编译、精度、性能、诊断和路径。相同包已有报告时可能返回 `duplicate: true`。`force: true` 要求重新测量，仍受停止规则约束。`compile_only: true` 只做编译诊断：不消耗评测轮数、不使用精度/性能结果，也不做包哈希门禁（便于在修包前直接试编译）。
+- 评测以 `manifest.packageHash` 为唯一放行依据；`.canness/state.json` 里的 `packageHash` 只是上次评测的缓存，不再参与判定。哈希不符时错误会同时给出 manifest、state 与实际值。
 - `fetch_remote_file({ remotePath, localPath? })` 下载远端诊断文件。`remotePath` 必须为绝对路径，限配置的 outbox 和当前 generation 的 inbox。`localPath` 相对于工作区，默认 `remote-files/<basename>`。
 
 报告字段、远端目录和断点恢复见[远端评测指南](../guides/remote-evaluation.md)。

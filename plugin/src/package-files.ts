@@ -1,8 +1,8 @@
 import {
-  cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
+  cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { dirname, join, relative, sep } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { normalizedDtype, type FloatInputValue, type OperatorSpec, type TensorSpec } from './spec.js'
 import { lineOverlap, parseProvenance, sha256, type Origin } from './provenance.js'
@@ -253,8 +253,30 @@ function renderTemplate(body: string, values: Record<string, string>): string {
   })
 }
 
+/**
+ * Normalize every line ending to LF.
+ *
+ * Remote build scripts run under bash, where a CRLF checkout leaves `\r` on
+ * variable and option names (`set: pipefail\r: invalid option name`). Template
+ * bodies and submission sources therefore share one normalizer instead of each
+ * render path applying its own.
+ */
+export function normalizeEol(text: string): string {
+  return text.replace(/\r\n?/g, '\n')
+}
+
+/**
+ * Read one build-contract template with LF line endings.
+ *
+ * Exposed with an explicit directory so a test can point it at a fixture whose
+ * bytes are deliberately CRLF; the default is the shipped template directory.
+ */
+export function readTemplateBody(name: string, dir: string = buildContractTemplateDir()): string {
+  return normalizeEol(readFileSync(join(dir, name), 'utf8'))
+}
+
 function templateBody(name: string): string {
-  return readFileSync(join(buildContractTemplateDir(), name), 'utf8')
+  return readTemplateBody(name)
 }
 
 /** Recursively list regular files, POSIX-style and sorted. */
@@ -477,7 +499,7 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     KERNEL_ARGS_CALL: kernelArgsCall,
   }
 
-  return {
+  const rendered: Record<string, string> = {
     'build.sh': renderTemplate(templateBody('build.sh'), values),
     'run_once.sh': renderTemplate(templateBody('run_once.sh'), values),
     'main.cpp': renderTemplate(templateBody('main.cpp'), values),
@@ -486,6 +508,15 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     'canness_tiling_common.h': renderTemplate(templateBody('canness_tiling_common.h'), values),
     'canness_tiling_host.h': renderTemplate(templateBody('canness_tiling_host.h'), values),
   }
+  // Defence in depth: normalizing at read time already removes CR, but a script
+  // that carries one to the target breaks the whole package before the user's
+  // kernel is ever compiled. Refuse to write such a package.
+  for (const [name, body] of Object.entries(rendered)) {
+    if (name.endsWith('.sh') && body.includes('\r')) {
+      throw new Error(`rendered ${name} contains CR; build contract scripts must use LF line endings`)
+    }
+  }
+  return rendered
 }
 
 export function buildTestPackage(workspace: string, generationId: string, spec: OperatorSpec): string {
@@ -563,4 +594,96 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
   writeFileSync(join(dest, 'manifest.json'), JSON.stringify(manifest, null, 2))
   writeFileSync(join(dest, 'manifest.json'), JSON.stringify({ ...manifest, packageHash: packageHash(dest) }, null, 2))
   return dest
+}
+
+/** A supported post-build edit: remove files and/or replace text files. */
+export interface PackageRepair {
+  drop?: string[]
+  write?: Array<{ path: string; content: string }>
+}
+
+export interface PackageRepairResult {
+  packageDir: string
+  packageHash: string
+  dropped: string[]
+  written: string[]
+}
+
+function assertNotSymlink(path: string, label: string): void {
+  try {
+    if (lstatSync(path).isSymbolicLink()) throw new Error(`package path traverses a symlink: ${label}`)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
+/** Resolve a package-relative path, refusing absolute paths, `..`, and symlinks. */
+function packageRelativePath(root: string, value: string): string {
+  const normalized = value.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')
+  if (normalized === '') throw new Error('package path must not be empty')
+  if (/^(?:\/|[A-Za-z]:)/.test(normalized)) throw new Error(`package path must be relative: ${value}`)
+  // Windows paths are case-insensitive: "MANIFEST.JSON" would overwrite the
+  // signed manifest without going through the re-signing path.
+  if (normalized.toLowerCase() === 'manifest.json') {
+    throw new Error('manifest.json is rewritten by repair_package and cannot be patched directly')
+  }
+  const parts = normalized.split('/')
+  if (parts.some(part => part === '' || part === '.' || part === '..')) {
+    throw new Error(`package path must stay inside the package: ${value}`)
+  }
+  const base = resolve(root)
+  let current = base
+  for (const part of parts) {
+    current = join(current, part)
+    if (current !== base && !current.startsWith(base + sep)) {
+      throw new Error(`package path must stay inside the package: ${value}`)
+    }
+    assertNotSymlink(current, value)
+  }
+  return current
+}
+
+/**
+ * Apply a supported edit to an already-built package and re-sign it.
+ *
+ * `build_test_package` deletes and rewrites `packages/<generationId>`, so a
+ * plain file edit afterwards changes the content hash and evaluation refuses
+ * the package. This repairs the files in place, refreshes `manifest.files`,
+ * and recomputes `manifest.packageHash` with the same algorithm used by
+ * `build_test_package` (CAN-103). Callers are responsible for refreshing any
+ * cached state hash; the generator tool does that.
+ */
+export function repairPackage(workspace: string, generationId: string, repair: PackageRepair): PackageRepairResult {
+  const dest = join(workspace, 'packages', generationId)
+  const manifestPath = join(dest, 'manifest.json')
+  if (!existsSync(manifestPath)) {
+    throw new Error(`no built package for ${generationId}; run build_test_package first`)
+  }
+  const drop = repair.drop ?? []
+  const write = repair.write ?? []
+  if (drop.length === 0 && write.length === 0) {
+    throw new Error('repair_package requires at least one drop or write entry')
+  }
+  const dropped: string[] = []
+  for (const value of drop) {
+    const target = packageRelativePath(dest, value)
+    if (!existsSync(target)) throw new Error(`cannot drop ${value}: not present in package ${generationId}`)
+    rmSync(target, { recursive: true, force: true })
+    dropped.push(value)
+  }
+  const written: string[] = []
+  for (const entry of write) {
+    const target = packageRelativePath(dest, entry.path)
+    mkdirSync(dirname(target), { recursive: true })
+    writeFileSync(target, normalizeEol(entry.content))
+    written.push(entry.path)
+  }
+  const files = [...listFiles(dest).filter(name => name !== 'manifest.json'), 'manifest.json'].sort()
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
+  const { packageHash: _stale, ...rest } = manifest
+  const updated = { ...rest, files }
+  writeFileSync(manifestPath, JSON.stringify(updated, null, 2))
+  const hash = packageHash(dest)
+  writeFileSync(manifestPath, JSON.stringify({ ...updated, packageHash: hash }, null, 2))
+  return { packageDir: dest, packageHash: hash, dropped, written }
 }

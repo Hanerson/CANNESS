@@ -115,10 +115,12 @@ export async function runEvaluation(input: RunInput): Promise<{
     : { ...applyReport({ ...input.state, packageHash: input.state.packageHash ?? packageHash(input.localPackageDir) }, report),
         forcedRunsAfterStop: (input.state.forcedRunsAfterStop ?? 0) + (reason && input.force ? 1 : 0) }
   const manifestPath = join(input.localPackageDir, 'manifest.json')
-  if (existsSync(manifestPath)) {
+  if (!input.compileOnly && existsSync(manifestPath)) {
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { packageHash?: string }
-    if (manifest.packageHash && manifest.packageHash !== packageHash(input.localPackageDir)) {
-      throw new Error('package changed after build_test_package; rebuild before upload')
+    const actual = packageHash(input.localPackageDir)
+    if (manifest.packageHash && manifest.packageHash !== actual) {
+      throw new Error(`package changed after build_test_package: manifest=${manifest.packageHash}, `
+        + `actual=${actual}; rebuild or repair before upload`)
     }
   }
   const generation = input.compileOnly ? `${input.generationId}-compile-${randomUUID().slice(0, 8)}` : input.generationId

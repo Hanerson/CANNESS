@@ -8,6 +8,8 @@ import * as generator from '../src/generator.ts'
 import * as evalPlugin from '../src/eval.ts'
 import * as loop from '../src/loop.ts'
 import { emptyState, type PolicyConfig } from '../src/policy.ts'
+import { buildTestPackage, writeOperator } from '../src/package-files.ts'
+import { parseSpec } from '../src/spec.ts'
 import { MemoryRemote, type RemoteHost } from '../src/remote.ts'
 import type { EvalReport } from '../src/report.ts'
 import { loadState, saveState } from '../src/state-file.ts'
@@ -95,6 +97,31 @@ test('submit_spec rejects the first missing field and writes no state', async ()
   const submit = gen.toolsRegistered.find(tool => tool.name === 'submit_spec')!
   await expect(submit.execute({ spec: { operator_name: 'Add' } })).rejects.toThrow('missing performance_target.metric')
   expect(existsSync(join(workspace, '.canness', 'state.json'))).toBe(false)
+})
+
+test('repair_package re-signs the package and refreshes the cached state hash', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
+  const gen = fakeCtx()
+  generator.apply(gen as never, { workspace })
+  const spec = parseSpec({
+    operator_name: 'Add', operator_type: 'elementwise',
+    input_specs: [{ name: 'x', shape: ['16'], dtype: 'float16' }],
+    output_specs: [{ name: 'y', shape: ['16'], dtype: 'float16' }],
+    target_platform: { chip: 'Ascend910B2' }, performance_target: { metric: 'kernel_time', target_us: 50 },
+  })
+  writeOperator(workspace, 'gen-01234567', {
+    kernel: 'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR x, GM_ADDR y, GM_ADDR tiling) { GET_TILING_DATA(t, tiling); }',
+    host: '', api: '', plugin: '',
+  })
+  const pkg = buildTestPackage(workspace, 'gen-01234567', spec)
+  const stateFile = join(workspace, '.canness', 'state.json')
+  saveState(stateFile, { ...emptyState(), generationId: 'gen-01234567' })
+  const repair = gen.toolsRegistered.find(tool => tool.name === 'repair_package')!
+  const value = await repair.execute({ drop: ['.contract-selfcheck'] }) as { packageHash: string }
+  expect(existsSync(join(pkg, '.contract-selfcheck'))).toBe(false)
+  const state = loadState(stateFile)
+  expect(state.packageHash).toBe(value.packageHash)
+  expect(state.pendingStage).toBe('run_evaluation')
 })
 
 test('run_evaluation with an empty host does not throw and reports ssh host is empty', async () => {

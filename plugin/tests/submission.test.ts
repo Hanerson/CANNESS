@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, test } from 'vitest'
-import { buildTestPackage, writeOperator } from '../src/package-files.ts'
+import { buildTestPackage, repairPackage, writeOperator } from '../src/package-files.ts'
 import { parseSpec } from '../src/spec.ts'
 import { exportSubmission } from '../src/submission.ts'
 import { sha256 } from '../src/provenance.ts'
@@ -39,6 +39,21 @@ test('exports a CANNBench source zip with the tested kernel and a generated laun
   expect(existsSync(artifact.archivePath)).toBe(true)
   writeFileSync(join(pkg, 'op_kernel/kernel.cpp'), 'modified kernel')
   expect(() => exportSubmission(workspace, generation, spec, 'exp')).toThrow(/rebuild/)
+})
+
+test('export accepts a package repaired after build_test_package (CAN-103)', () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-export-'))
+  const spec = parseSpec({
+    operator_name: 'Add', operator_type: 'elementwise',
+    input_specs: [{ name: 'x', shape: ['16'], dtype: 'float32' }],
+    output_specs: [{ name: 'y', shape: ['16'], dtype: 'float32' }],
+    target_platform: { chip: 'Ascend910B2' }, performance_target: { metric: 'kernel_time', target_us: 50 },
+  })
+  writeOperator(workspace, 'gen-deadbeef', { kernel: KERNEL, host: '', api: '', plugin: '' })
+  buildTestPackage(workspace, 'gen-deadbeef', spec)
+  repairPackage(workspace, 'gen-deadbeef', { drop: ['.contract-selfcheck'] })
+  const artifact = exportSubmission(workspace, 'gen-deadbeef', spec)
+  expect(existsSync(artifact.archivePath)).toBe(true)
 })
 
 test('export includes custom wrapper and public signature in hashed unverified provenance', () => {

@@ -91,6 +91,32 @@ class Diagnostics(unittest.TestCase):
                 self.assertEqual(profile['op']['kernelTaskType'], expected)
                 self.assertIsNone(profile['op']['blockDim'])
 
+    def test_failed_contract_selfcheck_warns_but_does_not_block_the_user_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p = Path(directory)
+            (p/'manifest.json').write_text(json.dumps({'generationId': 'g'}))
+            (p/'build.sh').touch()
+            (p/'run_once.sh').touch()
+            (p/'exe').touch()
+            selfcheck = p/'.contract-selfcheck'
+            selfcheck.mkdir()
+            (selfcheck/'build.sh').touch()
+
+            def run_command(argv, *a, **kw):
+                if any('.contract-selfcheck' in str(item) for item in argv):
+                    return subprocess.CompletedProcess(argv, 1, '', 'selfcheck boom')
+                return subprocess.CompletedProcess(argv, 0, str(p/'exe'), '')
+
+            args = self.args()
+            args.compile_only = True
+            with patch.object(r, 'run_command', side_effect=run_command), \
+                    patch.object(r, 'inspect_environment', return_value={'toolchain': 't'}):
+                report = r.evaluate(p, 'g', args)
+            self.assertEqual(report['status'], 'pass')
+            self.assertFalse(report['runRecord']['params']['contractSelfCheck']['ok'])
+            self.assertIn('selfcheck boom', report['compile']['log'])
+            self.assertIn('contract self-check failed', report['summary'])
+
     def test_missing_and_uncollected_metrics_are_explicit(self):
         mapping=r.column_map(['Task Duration(us)','aicore_time(us)','aic_mac_ratio','aic_mte2_ratio','aic_scalar_ratio'])
         row={v:'0' for v in mapping.values()}

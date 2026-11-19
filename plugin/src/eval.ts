@@ -222,13 +222,21 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'unknown error'
 }
 
-/** Return the current package fingerprint or reject edits made after packaging. */
+/**
+ * Return the current package fingerprint or reject edits made after packaging.
+ *
+ * `manifest.packageHash` is the single source of truth. `state.packageHash` is
+ * only a cache of "which package was last evaluated" and must not authorize a
+ * different package: a stale state entry used to block even `compile_only`
+ * diagnostics (CAN-104). It is reported in the error text so the mismatch is
+ * attributable at a glance.
+ */
 function checkPackageHash(packageDir: string, state: TaskState): string {
   const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as { packageHash?: string }
   const hash = packageHash(packageDir)
-  if ((manifest.packageHash !== undefined && manifest.packageHash !== hash)
-      || (state.packageHash != null && state.packageHash !== hash)) {
-    throw new Error('package changed after build_test_package; rebuild the package before evaluation')
+  if (manifest.packageHash !== undefined && manifest.packageHash !== hash) {
+    throw new Error(`package changed after build_test_package: manifest=${manifest.packageHash}, `
+      + `state=${state.packageHash ?? '<none>'}, actual=${hash}; rebuild the package or repair it before evaluation`)
   }
   return hash
 }
@@ -531,7 +539,10 @@ export function apply(
         if (cfg.host === '') return fail(unavailableReport(state.generationId, 'ssh host is empty'))
         throw new Error('build_test_package first')
       }
-      const currentHash = checkPackageHash(localPackageDir, state)
+      // compile_only is a diagnostic build: it writes no comparable evaluation
+      // result, so a stale hash must not block it (CAN-104). The full gate still
+      // applies to evaluations that consume budget.
+      const currentHash = compileOnly ? packageHash(localPackageDir) : checkPackageHash(localPackageDir, state)
       const kernelDtypes = (_args as { kernel_dtypes?: string[] } | null)?.kernel_dtypes
       if (kernelDtypes) {
         const localKernel = await checkKernel(localPackageDir, kernelDtypes)
@@ -599,8 +610,9 @@ export function apply(
       if (latest.generationId === state.generationId && latest.packageHash === state.packageHash) {
         saveState(stateFile, {
           ...next,
-          // Legacy hand-built packages do not acquire a build fingerprint by measurement.
-          packageHash: state.packageHash ?? null,
+          // This is a cache of the package just evaluated, not an authorization
+          // source (CAN-104). Keep it aligned with what was measured.
+          packageHash: currentHash,
           forcedRunsAfterStop: (state.forcedRunsAfterStop ?? 0) + (forcedAfterStop ? 1 : 0),
           pendingStage: null,
           lastEvaluatedHash: currentHash,
