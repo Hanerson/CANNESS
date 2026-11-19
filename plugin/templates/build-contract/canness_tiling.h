@@ -67,6 +67,31 @@ public:
 
     // Indices follow serialized attrs order, then attrs_derived order. Prefer names.
     __aicore__ inline CannessDeviceAttr find(const char* key) const {
+        return findKey(key);
+    }
+
+#ifndef CANNESS_LOCAL_VALIDATION
+    // Device string literals live in global memory, so `attrs.find("dim")` passes
+    // a `const __gm__ char*`, which a generic `const char*` parameter cannot
+    // accept (clang 15 / CANN 9.0.0: "cannot initialize a parameter of type
+    // 'const char *' with an lvalue of type 'const __gm__ char[8]'"). Keep the
+    // generic overload for locally built keys and route both through one probe.
+    __aicore__ inline CannessDeviceAttr find(const __gm__ char* key) const {
+        return findKey(key);
+    }
+#endif
+
+    __aicore__ inline __gm__ const uint8_t* name(const CannessDeviceAttr& attr) const {
+        return attr.nameOffset == 0 ? nullptr : base_ + attr.nameOffset;
+    }
+
+    __aicore__ inline __gm__ const uint8_t* text(const CannessDeviceAttr& attr) const {
+        return attr.textOffset == 0 ? nullptr : base_ + attr.textOffset;
+    }
+
+private:
+    template <typename KeyT>
+    __aicore__ inline CannessDeviceAttr findKey(const KeyT* key) const {
         for (uint32_t i = 0; i < count(); ++i) {
             const auto attr = get(i);
             const auto bytes = name(attr);
@@ -79,14 +104,5 @@ public:
         return missing;
     }
 
-    __aicore__ inline __gm__ const uint8_t* name(const CannessDeviceAttr& attr) const {
-        return attr.nameOffset == 0 ? nullptr : base_ + attr.nameOffset;
-    }
-
-    __aicore__ inline __gm__ const uint8_t* text(const CannessDeviceAttr& attr) const {
-        return attr.textOffset == 0 ? nullptr : base_ + attr.textOffset;
-    }
-
-private:
     GM_ADDR base_;
 };

@@ -5,7 +5,8 @@ import { expect, test } from 'vitest'
 import { runEvaluation, runnerCommand } from '../src/eval-run.ts'
 import { emptyState, type PolicyConfig } from '../src/policy.ts'
 import { MemoryRemote } from '../src/remote.ts'
-import { packageHash } from '../src/package-files.ts'
+import { buildTestPackage, packageHash, repairPackage, writeOperator } from '../src/package-files.ts'
+import { parseSpec } from '../src/spec.ts'
 
 const config: PolicyConfig = {
   maxIterations: 10,
@@ -36,6 +37,70 @@ test('a changed package is rejected before any remote upload', async () => {
     state: emptyState(), config,
   })).rejects.toThrow('package changed after build_test_package')
   expect(remote.files.size).toBe(0)
+})
+
+test('runEvaluation accepts a package repaired after build_test_package (CAN-103)', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-repair-'))
+  const generationId = 'gen-0badf00d'
+  const spec = parseSpec({
+    operator_name: 'Add', operator_type: 'elementwise',
+    input_specs: [{ name: 'x', shape: ['16'], dtype: 'float16' }],
+    output_specs: [{ name: 'y', shape: ['16'], dtype: 'float16' }],
+    target_platform: { chip: 'Ascend910B2' }, performance_target: { metric: 'kernel_time', target_us: 50 },
+  })
+  writeOperator(workspace, generationId, {
+    kernel: 'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR x, GM_ADDR y, GM_ADDR tiling) { GET_TILING_DATA(t, tiling); }',
+    host: '', api: '', plugin: '',
+  })
+  const pkg = buildTestPackage(workspace, generationId, spec)
+  repairPackage(workspace, generationId, { drop: ['.contract-selfcheck'] })
+  const remote = new MemoryRemote()
+  remote.execHandler = () => {
+    remote.files.set(`/out/${generationId}/results.json`, Buffer.from(JSON.stringify({
+      generationId,
+      status: 'pass',
+      compile: { ok: true, log: '' },
+      correctness: { ok: true, maxRelativeError: 0 },
+      performance: { kernelTimeUs: 10, targetUs: 50 },
+      summary: 'repaired package accepted',
+    })))
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  const { report } = await runEvaluation({
+    files: remote,
+    localPackageDir: pkg,
+    generationId,
+    inbox: '/in',
+    outbox: '/out',
+    timeoutMs: 1000,
+    intervalMs: 1000,
+    state: { ...emptyState(), generationId },
+    config,
+  })
+  expect(report.status).toBe('pass')
+})
+
+test('compile-only uploads a package whose manifest hash drifted (CAN-104)', async () => {
+  const dir = pack()
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ packageHash: 'stale-manifest' }))
+  const remote = new MemoryRemote()
+  let t = 0
+  const { report } = await runEvaluation({
+    files: remote,
+    localPackageDir: dir,
+    generationId: 'gen-drift',
+    inbox: '/in',
+    outbox: '/out',
+    timeoutMs: 1000,
+    intervalMs: 1000,
+    state: emptyState(),
+    config,
+    compileOnly: true,
+    now: () => t,
+    sleep: async (ms) => { t += ms },
+  })
+  expect(report.status).toBe('timeout')
+  expect(remote.files.size).toBeGreaterThan(0)
 })
 
 test('uploads then parses a result that shows up later', async () => {

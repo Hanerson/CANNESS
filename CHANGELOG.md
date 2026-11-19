@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+- **修复构建契约模板的行尾处理（CAN-101）**：模板读取统一归一为 LF，`build_test_package` 写盘前断言 `.sh` 不含 CR；新增故意使用 CRLF 的 fixture 回归测试，避免 Windows 工作树把 `\r` 带进远端脚本。
+- **修复契约自检的两个问题（CAN-102）**：`CannessAttrs::find` 增加 `const __gm__ char*` 重载，设备代码里的 `attrs.find("dim")` 字面量可直接编译；runner 把自检改为软门禁，自检失败只记录到 `compile.log` 与 `runRecord.params.contractSelfCheck`，仍继续编译用户 kernel。
+- **新增 `repair_package` 工具（CAN-103）**：在 `build_test_package` 之后受支持地删除/替换包内文件，自动重建 `manifest.files`、重签 `manifest.packageHash` 并同步工作区 state，不再需要手工改哈希。
+- **统一包哈希判定（CAN-104）**：以 `manifest.packageHash` 为唯一放行依据，`state.packageHash` 只作缓存；`compile_only` 不再受哈希门禁影响；哈希不符时错误同时给出 manifest、state 与实际值。
 - **工作区改为会话 cwd 本身**：`operators/`、`packages/`、`submissions/`、`.canness/` 直接位于会话工作目录，不再嵌套 `canness-workspace/`（`plugin/src/workspace.ts`）；显式 `workspace` 的相对路径按会话目录解析。原因是嵌套目录落在 Windows 沙箱进程可写授权之外，导致 `bash`/`pwsh` 侧的构建、拷贝、打包被拒，而插件自身写入成功。仓库提交的旧 `canness-workspace/` 已迁出并删除，`.gitignore` 改为忽略上述四个产物目录。
 - 同步更新 `docs/guides/setup.md`、`docs/reference/configuration.md`、`docs/design/05-plugin-architecture.md` 的工作区说明。
 

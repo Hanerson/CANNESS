@@ -11,8 +11,9 @@ function fixture() {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-practice-'))
   const path = join(workspace, '.canness/state.json')
   const generationId = 'gen-practice'
-  mkdirSync(join(workspace, 'packages', generationId), { recursive: true })
-  writeFileSync(join(workspace, 'packages', generationId, 'manifest.json'), '{}')
+  const pkg = join(workspace, 'packages', generationId)
+  mkdirSync(pkg, { recursive: true })
+  writeFileSync(join(pkg, 'manifest.json'), '{}')
   writeFileSync(join(workspace, 'key'), 'TEST KEY')
   const tools: any[] = []
   const vol = (value: unknown) => ({ get: () => value })
@@ -31,7 +32,7 @@ function fixture() {
   evaluator.apply({ tools: { register: (t: unknown) => tools.push(t) }, get: () => undefined } as never, cfg, async () => remote)
   const tool = tools.find(t => t.name === 'run_evaluation')
   saveState(path, { ...emptyState(), generationId, bestKernelTimeUs: 90, negativeStreak: 3, pendingStage: 'run_evaluation' })
-  return { path, tool, remote, preflight: tools.find(t => t.name === 'preflight_evaluation') }
+  return { path, pkg, tool, remote, preflight: tools.find(t => t.name === 'preflight_evaluation') }
 }
 test('policy blocks report a policy reason without suggesting transport recovery', async () => {
   const { tool, path } = fixture()
@@ -60,4 +61,27 @@ test('compile-only runs despite a policy stop without overwriting counters or me
   expect(result.resultsPath).toMatch(/gen-practice-compile-/)
   expect(loadState(path)).toEqual(before)
   expect(remote.execCalls.some(command => command.includes('--compile-only'))).toBe(true)
+})
+
+test('a stale state hash neither authorizes nor blocks a real evaluation (CAN-104)', async () => {
+  const { path, tool } = fixture()
+  saveState(path, { ...loadState(path), packageHash: 'stale-state' })
+  // The manifest carries no hash; the stale state must not reject the run.
+  const result = await tool.execute({ force: true })
+  expect(result.status).toBe('perf_fail')
+})
+
+test('compile-only ignores a stale manifest hash instead of blocking the diagnostic (CAN-104)', async () => {
+  const { tool, pkg } = fixture()
+  writeFileSync(join(pkg, 'manifest.json'), JSON.stringify({ packageHash: 'stale-manifest' }))
+  const result = await tool.execute({ compile_only: true })
+  expect(result).toMatchObject({ compileOnly: true, compile: { ok: true } })
+})
+
+test('a changed manifest names manifest, state, and actual hashes (CAN-104)', async () => {
+  const { path, tool, pkg } = fixture()
+  saveState(path, { ...loadState(path), packageHash: 'state-hash' })
+  writeFileSync(join(pkg, 'manifest.json'), JSON.stringify({ packageHash: 'manifest-hash' }))
+  await expect(tool.execute({ force: true }))
+    .rejects.toThrow(/manifest=manifest-hash, state=state-hash, actual=[0-9a-f]+/)
 })

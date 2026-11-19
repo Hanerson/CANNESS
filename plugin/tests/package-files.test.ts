@@ -1,11 +1,11 @@
-import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative, sep } from 'node:path'
 import { expect, test } from 'vitest'
 import { newGenerationId } from '../src/ids.ts'
 import {
   buildContractTemplateDir, buildTestPackage, checkKernelEntry, CONTRACT_FILES, KERNEL_ENTRY, LAYER_FILES,
-  maxAbsErrForDtype, packageHash, renderBuildContract, writeOperator,
+  maxAbsErrForDtype, normalizeEol, packageHash, readTemplateBody, renderBuildContract, repairPackage, writeOperator,
 } from '../src/package-files.ts'
 import { parseSpec } from '../src/spec.ts'
 import { emptyState } from '../src/policy.ts'
@@ -262,6 +262,53 @@ test('contract identifies compiled layers and supports named attrs and batch gol
   expect(manifest.documentedOnlyLayers).toEqual(['op_host/host.cpp', 'op_api/api.cpp', 'op_plugin/plugin.py'])
   const files = renderBuildContract(specFor('float32'))
   expect(files['canness_tiling.h']).toContain('find(const char*')
+  expect(files['canness_tiling.h']).toContain('find(const __gm__ char*')
   expect(files['main.cpp']).toContain('canness_golden::evaluate_all(')
   expect(files['main.cpp']).toContain('canness_golden::evaluate_integer_all(')
+})
+
+test('CRLF template bytes are normalized before rendering (CAN-101)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'canness-crlf-'))
+  writeFileSync(join(dir, 'build.sh'), '#!/bin/bash\r\nset -euo pipefail\r\n')
+  expect(readTemplateBody('build.sh', dir)).toBe('#!/bin/bash\nset -euo pipefail\n')
+  expect(normalizeEol('a\r\nb\rc\n')).toBe('a\nb\nc\n')
+})
+
+test('generated package scripts never carry CR, including the self-check (CAN-101)', () => {
+  const { pkg } = packageFor()
+  for (const name of ['build.sh', 'run_once.sh', '.contract-selfcheck/build.sh', '.contract-selfcheck/run_once.sh']) {
+    expect(readFileSync(join(pkg, name), 'utf8')).not.toContain('\r')
+  }
+})
+
+test('repairPackage drops files, writes replacements, and re-signs the package (CAN-103)', () => {
+  const { workspace, pkg } = packageFor()
+  const before = packageHash(pkg)
+  const result = repairPackage(workspace, 'gen-01234567', {
+    drop: ['.contract-selfcheck'],
+    write: [{ path: 'notes/diagnostic.txt', content: 'patched\r\n' }],
+  })
+  expect(existsSync(join(pkg, '.contract-selfcheck'))).toBe(false)
+  expect(readFileSync(join(pkg, 'notes/diagnostic.txt'), 'utf8')).toBe('patched\n')
+  expect(result.packageHash).not.toBe(before)
+  expect(result.packageHash).toBe(packageHash(pkg))
+  const manifest = JSON.parse(readFileSync(join(pkg, 'manifest.json'), 'utf8'))
+  expect(manifest.packageHash).toBe(result.packageHash)
+  expect(manifest.files).not.toContain('.contract-selfcheck/build.sh')
+  expect(manifest.files).toContain('notes/diagnostic.txt')
+  expect(manifest.files).toContain('manifest.json')
+})
+
+test('repairPackage refuses path escapes and direct manifest edits', () => {
+  const { workspace } = packageFor()
+  expect(() => repairPackage(workspace, 'gen-01234567', { drop: ['../outside'] }))
+    .toThrow(/must stay inside the package/)
+  expect(() => repairPackage(workspace, 'gen-01234567', { write: [{ path: 'manifest.json', content: '{}' }] }))
+    .toThrow(/manifest\.json is rewritten/)
+  expect(() => repairPackage(workspace, 'gen-01234567', { drop: ['/etc/passwd'] }))
+    .toThrow(/must be relative/)
+  expect(() => repairPackage(workspace, 'gen-01234567', {}))
+    .toThrow(/at least one/)
+  expect(() => repairPackage(workspace, 'gen-01234567', { drop: ['missing.txt'] }))
+    .toThrow(/not present in package/)
 })

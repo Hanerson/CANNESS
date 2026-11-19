@@ -6,7 +6,7 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { carrySources, missingLayers, sameSourceContract, writePartialOperator } from './generator-sources.js'
 import { newGenerationId } from './ids.js'
-import { buildTestPackage, checkKernelEntry, contractFingerprint, KERNEL_ENTRY, packageHash } from './package-files.js'
+import { buildTestPackage, checkKernelEntry, contractFingerprint, KERNEL_ENTRY, packageHash, repairPackage } from './package-files.js'
 import { parseProvenance } from './provenance.js'
 import { emptyState } from './policy.js'
 import { parseSpec } from './spec.js'
@@ -287,6 +287,58 @@ export function apply(ctx: Context, config: Config): void {
         writeFileSync(destination, body)
       }
       return { path: destinations[0]!, bytes: Buffer.byteLength(body) }
+    },
+  }))
+  ctx.tools.register(defineTool({
+    name: 'repair_package',
+    description: [
+      'Remove or replace files in the already-built package for the current generation, then re-sign it.',
+      'Use this instead of editing packages/<generationId> on disk: repair_package refreshes manifest.files,',
+      'manifest.packageHash and the workspace state hash, so run_evaluation and export_submission accept the result.',
+      'Paths are package-relative and must not escape the package. manifest.json is rewritten and cannot be patched.',
+      'A later build_test_package still starts from operators/<generationId> and discards these edits.',
+    ].join(' '),
+    parameters: {
+      drop: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Package-relative files or directories to remove, e.g. ".contract-selfcheck".',
+      },
+      write: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            path: { type: 'string', required: true },
+            content: { type: 'string', required: true },
+          },
+        },
+        description: 'Package-relative text files to create or replace. Content is normalized to LF.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          packageDir: { type: 'string', required: true },
+          packageHash: { type: 'string', required: true },
+          dropped: { type: 'array', items: { type: 'string' }, required: true },
+          written: { type: 'array', items: { type: 'string' }, required: true },
+        },
+      },
+      render: (_args, value) => render(value),
+    },
+    async execute(args, exec) {
+      const workspace = resolveWorkspace(config.workspace, exec)
+      const path = statePath(workspace)
+      const state = claimTaskOwnership(path, 'repair_package', exec)
+      if (state.generationId == null) throw new Error('submit_spec first')
+      const result = repairPackage(workspace, state.generationId, { drop: args.drop, write: args.write })
+      const pendingStage = state.lastEvaluatedHash === result.packageHash && state.pendingStage == null ? null : 'run_evaluation'
+      saveState(path, { ...state, packageHash: result.packageHash, pendingStage })
+      return result
     },
   }))
 }
