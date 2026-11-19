@@ -1,4 +1,4 @@
-﻿import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+﻿import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -63,7 +63,24 @@ testWithCompiler('generated contract selfcheck compiles in all host dtype varian
 // GM-qualified key in addition to the bounded stub path used above.
 const clang=process.env.CLANGXX?.trim()||'clang++'
 const hasClang=spawnSync(clang,['--version'],{encoding:'utf8',windowsHide:true}).status===0
-const testWithClang=(hasClang?test:test.skip)
+// Some clang targets (notably the MSVC x86 target used on CI Windows) reject
+// address_space(1) outright. Probe the host model before treating this test as
+// applicable; Ubuntu runners can model it and run the regression.
+function clangModelsAddressSpace(clangPath:string):boolean{
+  const dir=mkdtempSync(join(tmpdir(),'canness-gm-model-'))
+  try{
+    const probe=join(dir,'probe.cpp')
+    writeFileSync(probe,[
+      '#define __gm__ __attribute__((address_space(1)))',
+      '#include <cstdint>',
+      'static const __gm__ char key[] = "pattern";',
+      'int main() { return key[0]; }',
+    ].join('\n'))
+    return spawnSync(clangPath,['-std=c++17','-fsyntax-only',probe],{encoding:'utf8',windowsHide:true}).status===0
+  }finally{rmSync(dir,{recursive:true,force:true})}
+}
+const clangModelsGm=hasClang&&clangModelsAddressSpace(clang)
+const testWithClang=(clangModelsGm?test:test.skip)
 testWithClang('GM-qualified keys bind to the device find overload (CAN-102)',{timeout:60_000},()=>{
   const workspace=mkdtempSync(join(tmpdir(),'canness-gm-find-'))
   const spec=parseSpec({operator_name:'add',operator_type:'elementwise',input_specs:[{name:'x',shape:['16'],dtype:'float16'}],output_specs:[{name:'y',shape:['16'],dtype:'float16'}],target_platform:{chip:'Ascend910B2'},performance_target:{metric:'kernel_time',target_us:50}})
@@ -97,5 +114,5 @@ testWithClang('GM-qualified keys bind to the device find overload (CAN-102)',{ti
   ].join('\n'))
   const result=spawnSync(clang,['-std=c++17','-fsyntax-only','-I',fake,'-I',pkg,join(workspace,'probe.cpp')],{encoding:'utf8',windowsHide:true})
   expect(result.stderr).not.toMatch(/address space|__gm__/u)
-  expect(result.status).toBe(0)
+  expect(result.status,result.stderr).toBe(0)
 })
