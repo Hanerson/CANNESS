@@ -124,12 +124,19 @@ export async function runEvaluation(input: RunInput): Promise<{
     }
   }
   const generation = input.compileOnly ? `${input.generationId}-compile-${randomUUID().slice(0, 8)}` : input.generationId
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(generation)) {
+    throw new Error(`unsafe evaluation generation id: ${generation}`)
+  }
   const remoteDir = `${input.inbox}/${generation}`
   const resultPath = `${input.outbox}/${generation}/results.json`
   const baseDir = posix.dirname(posix.normalize(input.inbox))
   const token = (input.token ?? (() => randomUUID().slice(0, 12)))()
   const runnerPath = posix.join(baseDir, `runner-${token}.py`)
 
+  // Reusing a generation directory leaves files that the local package deleted
+  // (for example a repaired-away .contract-selfcheck) on the remote runner.
+  // Start every upload from an empty generation directory.
+  await input.files.removeDir(remoteDir)
   await input.files.uploadDir(input.localPackageDir, remoteDir)
   // The runner skips a generation whose results.json already exists, so drop
   // the previous attempt before starting a new one.

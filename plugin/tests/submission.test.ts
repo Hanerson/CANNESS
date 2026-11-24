@@ -56,6 +56,25 @@ test('export accepts a package repaired after build_test_package (CAN-103)', () 
   expect(existsSync(artifact.archivePath)).toBe(true)
 })
 
+test('export keeps provenance layers in sync after repair rewrites a layer (CAN-103 review)', () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-export-'))
+  const spec = parseSpec({
+    operator_name: 'Add', operator_type: 'elementwise',
+    input_specs: [{ name: 'x', shape: ['16'], dtype: 'float32' }],
+    output_specs: [{ name: 'y', shape: ['16'], dtype: 'float32' }],
+    target_platform: { chip: 'Ascend910B2' }, performance_target: { metric: 'kernel_time', target_us: 50 },
+  })
+  writeOperator(workspace, 'gen-deadbeef', { kernel: KERNEL, host: '', api: '', plugin: '' })
+  buildTestPackage(workspace, 'gen-deadbeef', spec)
+  const repaired = `${KERNEL}\n// repaired after packaging`
+  repairPackage(workspace, 'gen-deadbeef', { write: [{ path: 'op_kernel/kernel.cpp', content: repaired }] })
+  const artifact = exportSubmission(workspace, 'gen-deadbeef', spec)
+  const provenance = JSON.parse(readFileSync(join(artifact.sourceDir, 'provenance.json'), 'utf8'))
+  expect(provenance.files['csrc/op_kernel/kernel.cpp']).toBe(sha256(repaired))
+  expect(provenance.layers['op_kernel/kernel.cpp'].sha256).toBe(sha256(repaired))
+  expect(provenance.layers['op_kernel/kernel.cpp'].modifiedByRepair).toBe(true)
+})
+
 test('export includes custom wrapper and public signature in hashed unverified provenance', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-export-'))
   const spec = parseSpec({ operator_name: 'scan', operator_type: 'scan',

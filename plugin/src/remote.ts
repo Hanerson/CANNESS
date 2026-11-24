@@ -45,6 +45,16 @@ export interface RemoteHost extends RemoteFiles, RemoteShell {
   mkdirp(remoteDir: string): Promise<void>
   put(localPath: string, remotePath: string): Promise<void>
   stat(remotePath: string): Promise<RemoteStat | null>
+  /** Remove a per-generation upload directory before reusing it. */
+  removeDir(remoteDir: string): Promise<void>
+}
+
+/** Refuse to delete the root, the cwd, or a traversal path over exec. */
+export function assertSafeRemoteDir(dir: string): void {
+  const normalized = posix.normalize(dir)
+  if (normalized === '' || normalized === '.' || normalized === '/' || normalized.split('/').includes('..')) {
+    throw new Error(`refusing to remove unsafe remote directory: ${dir}`)
+  }
 }
 
 export interface WaitOptions {
@@ -119,6 +129,17 @@ export class MemoryRemote implements RemoteHost {
 
   async removeFile(remotePath: string): Promise<void> {
     this.files.delete(remotePath)
+  }
+
+  async removeDir(remoteDir: string): Promise<void> {
+    assertSafeRemoteDir(remoteDir)
+    const prefix = remoteDir.endsWith('/') ? remoteDir : `${remoteDir}/`
+    for (const path of [...this.files.keys()]) {
+      if (path === remoteDir || path.startsWith(prefix)) this.files.delete(path)
+    }
+    for (const dir of [...this.dirs]) {
+      if (dir === remoteDir || dir.startsWith(prefix)) this.dirs.delete(dir)
+    }
   }
 
   async mkdirp(remoteDir: string): Promise<void> {

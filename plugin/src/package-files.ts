@@ -1,5 +1,6 @@
 import {
-  cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
+  cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync,
+  statSync, writeFileSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { dirname, join, relative, resolve, sep } from 'node:path'
@@ -648,10 +649,11 @@ function packageRelativePath(root: string, value: string): string {
  *
  * `build_test_package` deletes and rewrites `packages/<generationId>`, so a
  * plain file edit afterwards changes the content hash and evaluation refuses
- * the package. This repairs the files in place, refreshes `manifest.files`,
- * and recomputes `manifest.packageHash` with the same algorithm used by
- * `build_test_package` (CAN-103). Callers are responsible for refreshing any
- * cached state hash; the generator tool does that.
+ * the package. This repairs a staged copy, refreshes `manifest.files`, recomputes
+ * `manifest.packageHash` with the same algorithm used by `build_test_package`,
+ * and only then swaps the result into place (CAN-103). A failed drop or write
+ * therefore leaves the original signed package untouched. Callers are
+ * responsible for refreshing any cached state hash; the generator tool does that.
  */
 export function repairPackage(workspace: string, generationId: string, repair: PackageRepair): PackageRepairResult {
   const dest = join(workspace, 'packages', generationId)
@@ -664,26 +666,69 @@ export function repairPackage(workspace: string, generationId: string, repair: P
   if (drop.length === 0 && write.length === 0) {
     throw new Error('repair_package requires at least one drop or write entry')
   }
-  const dropped: string[] = []
+
+  // Validate every path and every drop target against the signed package
+  // before any mutation, so an invalid later entry cannot follow a valid one.
   for (const value of drop) {
     const target = packageRelativePath(dest, value)
     if (!existsSync(target)) throw new Error(`cannot drop ${value}: not present in package ${generationId}`)
-    rmSync(target, { recursive: true, force: true })
-    dropped.push(value)
   }
-  const written: string[] = []
-  for (const entry of write) {
-    const target = packageRelativePath(dest, entry.path)
-    mkdirSync(dirname(target), { recursive: true })
-    writeFileSync(target, normalizeEol(entry.content))
-    written.push(entry.path)
+  for (const entry of write) packageRelativePath(dest, entry.path)
+
+  const parent = dirname(dest)
+  const stagingRoot = mkdtempSync(join(parent, `.${generationId}-repair-`))
+  const staging = join(stagingRoot, 'package')
+  try {
+    cpSync(dest, staging, { recursive: true })
+    const dropped: string[] = []
+    for (const value of drop) {
+      rmSync(packageRelativePath(staging, value), { recursive: true, force: true })
+      dropped.push(value)
+    }
+    const written: string[] = []
+    for (const entry of write) {
+      const target = packageRelativePath(staging, entry.path)
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, normalizeEol(entry.content))
+      written.push(entry.path)
+    }
+
+    const stagingManifestPath = join(staging, 'manifest.json')
+    const files = [...listFiles(staging).filter(name => name !== 'manifest.json'), 'manifest.json'].sort()
+    const manifest = JSON.parse(readFileSync(stagingManifestPath, 'utf8')) as Record<string, unknown>
+    // A rewritten layer file no longer matches the hash recorded when the
+    // package was assembled. Keep the declared/similarity history but point the
+    // digest at the bytes actually shipped, so exported provenance.json layers
+    // and files agree.
+    const provenance = manifest.provenance
+    if (provenance !== null && provenance !== undefined
+        && typeof provenance === 'object' && !Array.isArray(provenance)) {
+      for (const name of written) {
+        const entry = (provenance as Record<string, unknown>)[name]
+        if (entry !== null && entry !== undefined && typeof entry === 'object' && !Array.isArray(entry)) {
+          const record = entry as Record<string, unknown>
+          record.sha256 = sha256(readFileSync(join(staging, name)))
+          record.modifiedByRepair = true
+        }
+      }
+    }
+    const { packageHash: _stale, ...rest } = manifest
+    const updated = { ...rest, files }
+    writeFileSync(stagingManifestPath, JSON.stringify(updated, null, 2))
+    const hash = packageHash(staging)
+    writeFileSync(stagingManifestPath, JSON.stringify({ ...updated, packageHash: hash }, null, 2))
+
+    const backup = join(parent, `.${generationId}-repair-backup-${process.pid}-${Date.now()}`)
+    renameSync(dest, backup)
+    try {
+      renameSync(staging, dest)
+    } catch (error) {
+      renameSync(backup, dest)
+      throw error
+    }
+    rmSync(backup, { recursive: true, force: true })
+    return { packageDir: dest, packageHash: hash, dropped, written }
+  } finally {
+    rmSync(stagingRoot, { recursive: true, force: true })
   }
-  const files = [...listFiles(dest).filter(name => name !== 'manifest.json'), 'manifest.json'].sort()
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
-  const { packageHash: _stale, ...rest } = manifest
-  const updated = { ...rest, files }
-  writeFileSync(manifestPath, JSON.stringify(updated, null, 2))
-  const hash = packageHash(dest)
-  writeFileSync(manifestPath, JSON.stringify({ ...updated, packageHash: hash }, null, 2))
-  return { packageDir: dest, packageHash: hash, dropped, written }
 }

@@ -3,8 +3,8 @@ import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { Client, type SFTPWrapper } from 'ssh2'
 import {
-  base64WriteCommands, createTar, firstLines, remoteFileBundlePath, remoteUploadBundlePath, shellQuote,
-  type ExecResult, type RemoteFiles, type RemoteHost, type RemoteShell, type RemoteStat,
+  assertSafeRemoteDir, base64WriteCommands, createTar, firstLines, remoteFileBundlePath, remoteUploadBundlePath,
+  shellQuote, type ExecResult, type RemoteFiles, type RemoteHost, type RemoteShell, type RemoteStat,
 } from './remote.js'
 
 export interface SftpLike {
@@ -86,6 +86,13 @@ export function remoteHostFrom(sftp: SftpLike, shell: RemoteShell): RemoteHost {
     put: (local, remote) => sftp.fastPut(local, remote),
     stat: remote => sftp.stat(remote),
     exec: command => shell.exec(command),
+    async removeDir(remoteDir) {
+      assertSafeRemoteDir(remoteDir)
+      const result = await shell.exec(`rm -rf -- ${shellQuote(remoteDir)}`)
+      if (result.code !== 0) {
+        throw new Error(`remove ${remoteDir} failed: ${firstLines(result.stderr || result.stdout)}`)
+      }
+    },
   }
 }
 
@@ -188,6 +195,10 @@ export function remoteFromShell(
     },
     async removeFile(remotePath) {
       await run(`rm -f -- ${shellQuote(remotePath)}`, `remove ${remotePath}`)
+    },
+    async removeDir(remoteDir) {
+      assertSafeRemoteDir(remoteDir)
+      await run(`rm -rf -- ${shellQuote(remoteDir)}`, `remove directory ${remoteDir}`)
     },
     async mkdirp(remoteDir) {
       await run(`mkdir -p -- ${shellQuote(remoteDir)}`, `mkdir ${remoteDir}`)

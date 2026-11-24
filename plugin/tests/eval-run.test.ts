@@ -80,6 +80,52 @@ test('runEvaluation accepts a package repaired after build_test_package (CAN-103
   expect(report.status).toBe('pass')
 })
 
+test('a same-generation rerun drops files deleted by repair_package (CAN-103 review)', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-reupload-'))
+  const generationId = 'gen-0badf00d'
+  const spec = parseSpec({
+    operator_name: 'Add', operator_type: 'elementwise',
+    input_specs: [{ name: 'x', shape: ['16'], dtype: 'float16' }],
+    output_specs: [{ name: 'y', shape: ['16'], dtype: 'float16' }],
+    target_platform: { chip: 'Ascend910B2' }, performance_target: { metric: 'kernel_time', target_us: 50 },
+  })
+  writeOperator(workspace, generationId, {
+    kernel: 'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR x, GM_ADDR y, GM_ADDR tiling) { GET_TILING_DATA(t, tiling); }',
+    host: '', api: '', plugin: '',
+  })
+  const pkg = buildTestPackage(workspace, generationId, spec)
+  const remote = new MemoryRemote()
+  remote.execHandler = () => {
+    remote.files.set(`/out/${generationId}/results.json`, Buffer.from(JSON.stringify({
+      generationId,
+      status: 'pass',
+      compile: { ok: true, log: '' },
+      correctness: { ok: true, maxRelativeError: 0 },
+      performance: { kernelTimeUs: 10, targetUs: 50 },
+      summary: 'ok',
+    })))
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  const run = () => runEvaluation({
+    files: remote,
+    localPackageDir: pkg,
+    generationId,
+    inbox: '/in',
+    outbox: '/out',
+    timeoutMs: 1000,
+    intervalMs: 1000,
+    state: { ...emptyState(), generationId },
+    config,
+  })
+  await run()
+  const staleSelfCheck = `/in/${generationId}/.contract-selfcheck/build.sh`
+  expect(remote.files.has(staleSelfCheck)).toBe(true)
+  repairPackage(workspace, generationId, { drop: ['.contract-selfcheck'] })
+  await run()
+  expect(remote.files.has(staleSelfCheck)).toBe(false)
+  expect(remote.files.has(`/in/${generationId}/manifest.json`)).toBe(true)
+})
+
 test('compile-only uploads a package whose manifest hash drifted (CAN-104)', async () => {
   const dir = pack()
   writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ packageHash: 'stale-manifest' }))

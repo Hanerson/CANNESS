@@ -181,6 +181,7 @@ function trackedRemote(events: string[], upload?: () => Promise<void>): { files:
       events.push('remove')
       await remote.removeFile(path)
     },
+    async removeDir(dir) { await remote.removeDir(dir) },
     async close() {
       events.push('close')
     },

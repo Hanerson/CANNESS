@@ -10,6 +10,7 @@ import {
 import { parseSpec } from '../src/spec.ts'
 import { emptyState } from '../src/policy.ts'
 import { loadState, saveState } from '../src/state-file.ts'
+import { sha256 } from '../src/provenance.ts'
 
 /** A kernel that satisfies build contract v1. */
 const VALID_KERNEL = [
@@ -312,4 +313,30 @@ test('repairPackage refuses path escapes and direct manifest edits', () => {
     .toThrow(/at least one/)
   expect(() => repairPackage(workspace, 'gen-01234567', { drop: ['missing.txt'] }))
     .toThrow(/not present in package/)
+})
+
+test('repairPackage leaves the signed package intact when a later drop is missing', () => {
+  const { workspace, pkg } = packageFor()
+  const beforeHash = packageHash(pkg)
+  const beforeFiles = diskFiles(pkg)
+  const beforeRunOnce = readFileSync(join(pkg, 'run_once.sh'), 'utf8')
+  expect(() => repairPackage(workspace, 'gen-01234567', {
+    drop: ['run_once.sh', 'missing.txt'],
+    write: [{ path: 'notes/new.txt', content: 'new' }],
+  })).toThrow(/not present in package/)
+  expect(packageHash(pkg)).toBe(beforeHash)
+  expect(diskFiles(pkg)).toEqual(beforeFiles)
+  expect(readFileSync(join(pkg, 'run_once.sh'), 'utf8')).toBe(beforeRunOnce)
+  expect(existsSync(join(pkg, 'notes/new.txt'))).toBe(false)
+})
+
+test('repairPackage keeps provenance hashes in sync with rewritten layer files', () => {
+  const { workspace, pkg } = packageFor()
+  const repaired = `${VALID_KERNEL}\n// repaired after packaging`
+  repairPackage(workspace, 'gen-01234567', { write: [{ path: LAYER_FILES.kernel, content: repaired }] })
+  const manifest = JSON.parse(readFileSync(join(pkg, 'manifest.json'), 'utf8'))
+  const entry = manifest.provenance[LAYER_FILES.kernel]
+  expect(entry.sha256).toBe(sha256(normalizeEol(repaired)))
+  expect(entry.modifiedByRepair).toBe(true)
+  expect(manifest.packageHash).toBe(packageHash(pkg))
 })
