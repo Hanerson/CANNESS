@@ -66,20 +66,15 @@ public:
     }
 
     // Indices follow serialized attrs order, then attrs_derived order. Prefer names.
-    __aicore__ inline CannessDeviceAttr find(const char* key) const {
+    // Templating on the pointee type binds both device string literals
+    // (`const __gm__ char*`) and local `char[]` keys without an address-space
+    // conversion. Do not split this into two overloads: on CANN 8.0.1/9.2.1
+    // `__gm__` expands to an attribute, attributes do not participate in
+    // overload resolution, and the second overload becomes a redeclaration.
+    template <typename CharT>
+    __aicore__ inline CannessDeviceAttr find(const CharT* key) const {
         return findKey(key);
     }
-
-#ifndef CANNESS_LOCAL_VALIDATION
-    // Device string literals live in global memory, so `attrs.find("dim")` passes
-    // a `const __gm__ char*`, which a generic `const char*` parameter cannot
-    // accept (clang 15 / CANN 9.0.0: "cannot initialize a parameter of type
-    // 'const char *' with an lvalue of type 'const __gm__ char[8]'"). Keep the
-    // generic overload for locally built keys and route both through one probe.
-    __aicore__ inline CannessDeviceAttr find(const __gm__ char* key) const {
-        return findKey(key);
-    }
-#endif
 
     __aicore__ inline __gm__ const uint8_t* name(const CannessDeviceAttr& attr) const {
         return attr.nameOffset == 0 ? nullptr : base_ + attr.nameOffset;

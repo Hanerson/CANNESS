@@ -3,10 +3,6 @@
 #pragma once
 #include <cstdint>
 #include <type_traits>
-// The host model erases address spaces, so the device-only __gm__ overload in
-// canness_tiling.h would collapse into a duplicate of the generic overload.
-// Tell that header it is being compiled against the bounded host stub.
-#define CANNESS_LOCAL_VALIDATION 1
 #define __gm__
 #define __aicore__
 #define __global__

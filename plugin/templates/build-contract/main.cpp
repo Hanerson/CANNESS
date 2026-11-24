@@ -198,6 +198,9 @@ static int64_t load_integer(DType dtype, const uint8_t* base, int64_t index) {
 }
 
 struct Tensor {
+    // CANN 8.0.1 treats the implicit default constructor as an [aicore]
+    // function, so its std::vector member cannot be constructed. Pin it to host.
+    [host] Tensor() = default;
     void* device = nullptr;
     std::vector<uint8_t> host;
     int64_t elements = 0;
