@@ -69,6 +69,8 @@ export interface TaskState {
   packageHash?: string | null
   /** Fingerprint sent to the runner in the most recent evaluation. */
   lastEvaluatedHash?: string | null
+  /** Path of the remote result for the most recent evaluation, if one was written. */
+  lastResultsPath?: string | null
   /** One explicit retest may cross a soft stop per task budget window. */
   forcedRunsAfterStop?: number
   comparisonBasis?: string

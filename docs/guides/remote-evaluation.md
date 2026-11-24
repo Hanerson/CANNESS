@@ -6,7 +6,7 @@
 
 1. 提交规格、写入算子和自定义 `golden.h`，然后执行 `build_test_package()`。如果改动了已经构建的包，重新打包以更新清单与指纹。
 2. 执行 `preflight_evaluation()` 检查当前工作区里的包。需要检查目标机时传入 `remote: true`，查看 `remote.ssh` 和 `remote.cann.ready`。
-3. 执行 `run_evaluation()`。插件将包上传到 `<inbox>/<generationId>/`，启动临时 [runner.py](../../plugin/remote/runner.py)，从 `<outbox>/<generationId>/results.json` 读取报告。
+3. 执行 `run_evaluation()`。每次正式评测将包上传到独立的 `<inbox>/<generationId>/attempt-<id>/<generationId>/`，启动临时 [runner.py](../../plugin/remote/runner.py)，并在返回值的 `resultsPath` 中提供本次报告路径。
 
 上传经 SSH exec 传递 base64 编码的 tar。runner 按次启动。它先运行构建契约的最小编译自检，再用包内 `build.sh` 编译并获取可执行文件路径，调用 `run_once.sh` 解析 `CANNESS_RESULT`。精度通过后用真实 `msprof` 采样。
 

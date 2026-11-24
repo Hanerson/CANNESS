@@ -8,7 +8,7 @@
 
 ```
 /tmp/canness-a/                     # A 的远端根目录（与 B 的 /tmp/canness-b 隔离）
-├── inbox/<generationId>/           # 测试包：四层代码 + 构建契约 + config.json + manifest.json
+├── inbox/<generationId>/attempt-<id>/<generationId>/  # 本次评测的测试包
 │   ├── op_kernel/kernel.cpp
 │   ├── op_host/host.cpp
 │   ├── op_api/api.cpp
@@ -20,12 +20,12 @@
 │   ├── canness_tiling.h            # 通用 CannessTilingData + GET_TILING_DATA shim
 │   ├── config.json                 # 按 dtype 推导的 maxAbsErr 与 tiling 参数
 │   └── manifest.json
-├── outbox/<generationId>/results.json
+├── outbox/<generationId>/attempt-<id>/<generationId>/results.json
 ├── runner-<uuid>.py                # 每次评测临时上传，结束后删除
 └── .canness-upload-<uuid>.b64      # 上传用的 base64 tar，解包后删除
 ```
 
-- 远端临时文件一律带 uuid，并发评测不会互相覆盖。
+- 每次正式评测都有独立的输入和报告目录。用 `run_evaluation` 返回的 `resultsPath` 下载报告。
 - `7` 是 runner 的默认设备编号，实际映射取决于部署。可用 `CANNESS_ASCEND_VISIBLE_DEVICES` 或 `--device` 设置；运行和采样在有 `flock` 时共享配置的锁。
 - 登录信息只放在本地配置 / 凭据存储，**不得写入仓库**。
 
@@ -70,8 +70,8 @@
 ```bash
 PY=$(command -v python3 || command -v python)
 timeout --kill-after=10s 1800s "$PY" /tmp/canness-a/runner-<uuid>.py \
-  --inbox  /tmp/canness-a/inbox \
-  --outbox /tmp/canness-a/outbox \
+  --inbox  /tmp/canness-a/inbox/<generationId>/attempt-<id> \
+  --outbox /tmp/canness-a/outbox/<generationId>/attempt-<id> \
   --generation <generationId> \
   --once
 ```
@@ -115,7 +115,7 @@ Received exit code 127 while establishing SFTP session
 
 1. 本地用**纯 JS** 生成 POSIX tar（不调用外部 `tar` 进程；沙箱会 `spawnSync tar EPERM`）。
 2. 分块 `printf '%s' '<base64>' >> <uuid>.b64`。
-3. 远端 `base64 -d < <uuid>.b64 | tar -xf - -C <inbox>/<generationId>`。
+3. 远端 `base64 -d < <uuid>.b64 | tar -xf - -C <本次上传目录>`。
 4. 下载反过来：`base64 -w 0 <remote_file>`，本地解码写盘。
 
 失败信息包含远端 stderr 前 20 行。`fetch_remote_file` 工具用于把 CSV / 日志拉回本地 workspace。
@@ -146,7 +146,7 @@ msprof --application="<exe> <实际迭代次数>" --output=<预建目录>
 3. 远端 flock + bash run_once.sh，解析 CANNESS_RESULT（含 golden 来源）
 4. 远端 flock + msprof，按实际迭代次数采样
 5. 读 CSV：op_summary 有效采样行求平均；只有聚合文件时取 op_statistic 的 Avg
-6. 写 outbox/<gen>/results.json（含 runRecord.params.golden）
+6. 写本次评测的 results.json（含 runRecord.params.golden）
 7. run_evaluation 轮询并解析 results.json
 ```
 

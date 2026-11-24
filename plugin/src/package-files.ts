@@ -686,11 +686,14 @@ export function repairPackage(workspace: string, generationId: string, repair: P
       dropped.push(value)
     }
     const written: string[] = []
+    const writtenLayerKeys = new Set<string>()
+    const layerKey = (name: string) => process.platform === 'win32' ? name.toLowerCase() : name
     for (const entry of write) {
       const target = packageRelativePath(staging, entry.path)
       mkdirSync(dirname(target), { recursive: true })
       writeFileSync(target, normalizeEol(entry.content))
       written.push(entry.path)
+      writtenLayerKeys.add(layerKey(relative(staging, target).split(sep).join('/')))
     }
 
     const stagingManifestPath = join(staging, 'manifest.json')
@@ -703,8 +706,8 @@ export function repairPackage(workspace: string, generationId: string, repair: P
     const provenance = manifest.provenance
     if (provenance !== null && provenance !== undefined
         && typeof provenance === 'object' && !Array.isArray(provenance)) {
-      for (const name of written) {
-        const entry = (provenance as Record<string, unknown>)[name]
+      for (const [name, entry] of Object.entries(provenance)) {
+        if (!writtenLayerKeys.has(layerKey(name))) continue
         if (entry !== null && entry !== undefined && typeof entry === 'object' && !Array.isArray(entry)) {
           const record = entry as Record<string, unknown>
           record.sha256 = sha256(readFileSync(join(staging, name)))

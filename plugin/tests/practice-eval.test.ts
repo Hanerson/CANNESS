@@ -23,7 +23,8 @@ function fixture() {
   const remote = new MemoryRemote()
   remote.execHandler = command => {
     const id = command.match(/--generation '([^']+)'/)?.[1]
-    if (id) remote.files.set(`/out/${id}/results.json`, Buffer.from(JSON.stringify({
+    const outbox = command.match(/--outbox '([^']+)'/)?.[1]
+    if (id && outbox) remote.files.set(`${outbox}/${id}/results.json`, Buffer.from(JSON.stringify({
       generationId, status: command.includes('--compile-only') ? 'pass' : 'perf_fail',
       compile: { ok: true, log: '' }, correctness: { ok: !command.includes('--compile-only'), maxRelativeError: 0 },
       performance: { kernelTimeUs: command.includes('--compile-only') ? null : 100, targetUs: 10 }, analysis: null, summary: 'fixture result' })))

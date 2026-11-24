@@ -45,16 +45,6 @@ export interface RemoteHost extends RemoteFiles, RemoteShell {
   mkdirp(remoteDir: string): Promise<void>
   put(localPath: string, remotePath: string): Promise<void>
   stat(remotePath: string): Promise<RemoteStat | null>
-  /** Remove a per-generation upload directory before reusing it. */
-  removeDir(remoteDir: string): Promise<void>
-}
-
-/** Refuse to delete the root, the cwd, or a traversal path over exec. */
-export function assertSafeRemoteDir(dir: string): void {
-  const normalized = posix.normalize(dir)
-  if (normalized === '' || normalized === '.' || normalized === '/' || normalized.split('/').includes('..')) {
-    throw new Error(`refusing to remove unsafe remote directory: ${dir}`)
-  }
 }
 
 export interface WaitOptions {
@@ -85,9 +75,9 @@ export class MemoryRemote implements RemoteHost {
   readonly puts: Array<{ localPath: string; remotePath: string }> = []
   execHandler: MemoryExecHandler = () => ({ code: 0, stdout: '', stderr: '' })
   reads = 0
-  private staged: { path: string; bytes: Uint8Array; onRead: number } | null = null
+  private staged: { path: string | RegExp; bytes: Uint8Array; onRead: number } | null = null
 
-  appearOnRead(path: string, bytes: Uint8Array, onRead: number): void {
+  appearOnRead(path: string | RegExp, bytes: Uint8Array, onRead: number): void {
     this.staged = { path, bytes, onRead }
   }
 
@@ -111,8 +101,9 @@ export class MemoryRemote implements RemoteHost {
 
   async readFile(remotePath: string): Promise<Uint8Array | null> {
     this.reads += 1
-    if (this.staged && this.reads >= this.staged.onRead && remotePath === this.staged.path) {
-      this.files.set(this.staged.path, this.staged.bytes)
+    if (this.staged && this.reads >= this.staged.onRead
+        && (typeof this.staged.path === 'string' ? remotePath === this.staged.path : this.staged.path.test(remotePath))) {
+      this.files.set(remotePath, this.staged.bytes)
     }
     return this.files.get(remotePath) ?? null
   }
@@ -129,17 +120,6 @@ export class MemoryRemote implements RemoteHost {
 
   async removeFile(remotePath: string): Promise<void> {
     this.files.delete(remotePath)
-  }
-
-  async removeDir(remoteDir: string): Promise<void> {
-    assertSafeRemoteDir(remoteDir)
-    const prefix = remoteDir.endsWith('/') ? remoteDir : `${remoteDir}/`
-    for (const path of [...this.files.keys()]) {
-      if (path === remoteDir || path.startsWith(prefix)) this.files.delete(path)
-    }
-    for (const dir of [...this.dirs]) {
-      if (dir === remoteDir || dir.startsWith(prefix)) this.dirs.delete(dir)
-    }
   }
 
   async mkdirp(remoteDir: string): Promise<void> {
