@@ -4,14 +4,65 @@
 
 ## [Unreleased]
 
-- **修复构建契约模板的行尾处理（CAN-101）**：模板读取统一归一为 LF，`build_test_package` 写盘前断言 `.sh` 不含 CR；新增故意使用 CRLF 的 fixture 回归测试，避免 Windows 工作树把 `\r` 带进远端脚本。
-- **修复契约自检的两个问题（CAN-102）**：`CannessAttrs::find` 改为按字符类型模板化，设备字符串字面量（`const __gm__ char*`）与本地 `char[]` 都能直接编译。CANN 8.0.1/9.2.1 把 `__gm__` 展开为不参与重载解析的属性，此前的 `find(const __gm__ char*)` 重载在这两个版本上会变成重定义；单个模板在 8.0.1、9.2.1 与 9.0.0 语义下都成立。runner 把自检改为软门禁，自检失败只记录到 `compile.log` 与 `runRecord.params.contractSelfCheck`，仍继续编译用户 kernel。
-- **修复构建契约在 CANN 8.0.1 上的 host 编译与链接（CAN-115）**：`canness_tiling_host.h` 中的 host lambda 在 8.0.1 会被当作 aicore 函数，改为命名函数 `cannessAppendText`；`main.cpp` 为 `Tensor` 显式声明 `[host]` 默认构造；`build.sh` 普通链接失败时回退到 `bisheng --cce-fatobj-link`。CANN 9.x 仍走普通链接，行为不变；build-contract 与 cannbench 两个模板同步修改。
-- **按评审意见补强 CAN-103**：正式评测上传前清空远端 generation 目录，避免 `repair_package` 删除的 `.contract-selfcheck` 在重跑时残留并被 runner 执行；`repair_package` 改为在签名包副本上完成全部修改与重签后再替换原包，失败不留半成品；重写 layer 文件时同步 `manifest.provenance[file].sha256` 并标记 `modifiedByRepair`，导出的 `provenance.json` 中 `files` 与 `layers` 保持一致。
-- **新增 `repair_package` 工具（CAN-103）**：在 `build_test_package` 之后受支持地删除/替换包内文件，自动重建 `manifest.files`、重签 `manifest.packageHash` 并同步工作区 state，不再需要手工改哈希。
-- **统一包哈希判定（CAN-104）**：以 `manifest.packageHash` 为唯一放行依据，`state.packageHash` 只作缓存；`compile_only` 不再受哈希门禁影响；哈希不符时错误同时给出 manifest、state 与实际值。
-- **工作区改为会话 cwd 本身**：`operators/`、`packages/`、`submissions/`、`.canness/` 直接位于会话工作目录，不再嵌套 `canness-workspace/`（`plugin/src/workspace.ts`）；显式 `workspace` 的相对路径按会话目录解析。原因是嵌套目录落在 Windows 沙箱进程可写授权之外，导致 `bash`/`pwsh` 侧的构建、拷贝、打包被拒，而插件自身写入成功。仓库提交的旧 `canness-workspace/` 已迁出并删除，`.gitignore` 改为忽略上述四个产物目录。
-- 同步更新 `docs/guides/setup.md`、`docs/reference/configuration.md`、`docs/design/05-plugin-architecture.md` 的工作区说明。
+## [0.5.0] - 2026-11-24
+
+修掉 2026-11-19 SwiGLU 实践里**阻塞全部评测**的四个 P0，并补上受支持的包修补通道。
+含一处破坏性变更（工作区路径），升级前请先读迁移说明。
+逐条修复记录见 [`docs/contracts/2026-11-19-p0-fixes.md`](docs/contracts/2026-11-19-p0-fixes.md)。
+
+### 破坏性变更
+
+- **工作区改为会话 cwd 本身**：`operators/`、`packages/`、`submissions/`、`.canness/` 直接位于会话工作目录，
+  不再嵌套 `canness-workspace/`；显式 `workspace` 的相对路径按会话目录解析。
+  原因是嵌套目录落在 Windows 沙箱进程可写授权之外，`bash` / `pwsh` 侧的构建、拷贝、打包被拒，
+  而插件自身写入成功 —— 表现为「插件说打包好了，构建却说文件不存在」。
+  **迁移**：旧工作区里的 `operators/`、`packages/`、`submissions/`、`.canness/` 移到会话目录即可；
+  插件不会自动搬迁。仓库内提交过的 `canness-workspace/` 已迁出并删除，`.gitignore` 改为忽略这四个产物目录。
+
+### 新增
+
+- **`repair_package`**（工具）：在 `build_test_package` 之后受支持地删除/替换包内文件。
+  重建 `manifest.files`、重签 `manifest.packageHash`、同步工作区 state，并在签名副本上完成全部改动后再替换原包
+  （失败不留半成品）。路径校验拒绝绝对路径、`..`、符号链接穿越；`manifest.json` 不可直接修补。
+  重写 layer 文件时同步 `manifest.provenance[file].sha256` 并标记 `modifiedByRepair`。
+- **契约自检进报告**：自检结果写入 `runRecord.params.contractSelfCheck`，失败时摘要带
+  `contract self-check failed (template issue)`，用于区分「模板问题」与「用户 kernel 问题」。
+- **评测串行化**：同一工作区并发提交正式评测时按顺序读取/更新预算，避免两次评测同时消耗额度。
+- 新增本地校验相关模板：`templates/local-validation/kernel_operator.h`（扩充的 host stub）与
+  `algorithm-simulation.py`，配套 `docs/contracts/local-validation.md`。
+- 归档 2026-11-18 / 2026-11-19 两轮实践的全部 issue（`docs/archive/issues/`），
+  并新增 `docs/contracts/practice-fixes.md`、`docs/contracts/2026-11-19-p0-fixes.md` 记录修复落地。
+
+### 修复
+
+- **CAN-101 模板 CRLF**：模板读取统一经 `normalizeEol()` 归一为 LF；`renderBuildContract()` 写盘前断言
+  所有 `.sh` 不含 CR，否则拒绝写包。新增故意使用 CRLF 的 fixture 回归测试 ——
+  此前 `packageHash()` 本身对 `\r\n` 做过归一，所以 CRLF 污染的包**哈希完全相同**、校验一路放行，
+  只有远端编译才炸出 `set: pipefail\r: invalid option name`。
+- **CAN-102 契约自检不可编译且是硬门禁**：`CannessAttrs::find` 改为成员函数模板 `find(const CharT*)`，
+  设备字符串字面量（`const __gm__ char*`）与本地 `char[]` 均可直接编译。CANN 8.0.1 / 9.2.1 把 `__gm__`
+  展开为 `cce_global` 属性（属性不参与重载解析），此前的 `find(const __gm__ char*)` 重载会与
+  `find(const char*)` 重定义；单个模板在 8.0.1、9.2.1、9.0.0 三种语义下都成立。
+  runner 把自检改为**软门禁**：自检失败只记录，用户 kernel 的主编译照常执行
+  （此前自检先跑、失败即 `return`，用户 kernel 根本不会被编译）。
+- **CAN-103 无受支持修包通道**：见上「新增」；正式评测上传前清空远端 generation 目录，
+  避免被 `repair_package` 删除的 `.contract-selfcheck` 在重跑时残留并被 runner 执行。
+- **CAN-104 包哈希三真相源**：以 `manifest.packageHash` 为唯一放行依据，`state.packageHash` 降为缓存；
+  `compile_only` 不再受哈希门禁影响（此前诊断通道会被上一次的陈旧 hash 拦住）；
+  哈希不符时错误同时给出 `manifest=…, state=…, actual=…`。
+- **CAN-115 CANN 8.0.1 host 编译与链接**：`canness_tiling_host.h` 的 host lambda 在 8.0.1 会被当作
+  aicore 函数，改为命名函数 `cannessAppendText`；`main.cpp` 为 `Tensor` 显式声明 `[host]` 默认构造；
+  `build.sh` 普通链接失败时回退到 `bisheng --cce-fatobj-link`。CANN 9.x 仍走普通链接，行为不变。
+
+### 验证
+
+- 单元测试 35 个文件、**275 通过 + 2 跳过**；host / client 类型检查与构建通过；`kb:validate` 18 条通过。
+- 真机复验（2026-11-23/24）：CAN-102 的自检编译在 **CANN 8.0.1 / 910B3** 与 **CANN 9.2.1 docker / 910B2** 上均通过；
+  记录见 `issues/VERIFICATION-cann801-910b3-2026-11-23.md`。
+- **仍未修**（2026-11-19 实践提出、本轮未动）：CAN-105 单 shape 覆盖、CAN-106 `validate_submission` 输出截断与
+  case 隔离、CAN-108 `readRoots` 默认空、CAN-109 msprof 产物路径不可取、CAN-110 shape-changing 导出无模板、
+  CAN-111 属性数值精度无文档、CAN-112 golden fixture 绑定字面 shape、CAN-113 KB 缺 elementwise 基线、
+  CAN-114 层继承/重连/目标校准。
 
 ## [0.4.0] - 2026-11-17
 

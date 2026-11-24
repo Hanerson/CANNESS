@@ -6,7 +6,7 @@ CANNESS 是面向昇腾 CANN 算子开发的 [DeepSeek Harness](https://github.c
 
 ## 快速开始
 
-插件包版本为 `0.4.0`。本地需要 Node.js ≥ 24.9、pnpm 11 和 dsh 0.2.x。知识检索、打包、导出和本地预检可以离线运行，模型调用由 dsh 配置决定。真机评测需要可通过 SSH 访问的 Linux 昇腾 NPU 环境，也可通过 CANNLab 隧道连接。
+插件包版本为 `0.5.0`。本地需要 Node.js ≥ 24.9、pnpm 11 和 dsh 0.2.x。知识检索、打包、导出和本地预检可以离线运行，模型调用由 dsh 配置决定。真机评测需要可通过 SSH 访问的 Linux 昇腾 NPU 环境，也可通过 CANNLab 隧道连接。
 
 在已安装 dsh 的终端运行：
 
