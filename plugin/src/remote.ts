@@ -75,9 +75,9 @@ export class MemoryRemote implements RemoteHost {
   readonly puts: Array<{ localPath: string; remotePath: string }> = []
   execHandler: MemoryExecHandler = () => ({ code: 0, stdout: '', stderr: '' })
   reads = 0
-  private staged: { path: string; bytes: Uint8Array; onRead: number } | null = null
+  private staged: { path: string | RegExp; bytes: Uint8Array; onRead: number } | null = null
 
-  appearOnRead(path: string, bytes: Uint8Array, onRead: number): void {
+  appearOnRead(path: string | RegExp, bytes: Uint8Array, onRead: number): void {
     this.staged = { path, bytes, onRead }
   }
 
@@ -101,8 +101,9 @@ export class MemoryRemote implements RemoteHost {
 
   async readFile(remotePath: string): Promise<Uint8Array | null> {
     this.reads += 1
-    if (this.staged && this.reads >= this.staged.onRead && remotePath === this.staged.path) {
-      this.files.set(this.staged.path, this.staged.bytes)
+    if (this.staged && this.reads >= this.staged.onRead
+        && (typeof this.staged.path === 'string' ? remotePath === this.staged.path : this.staged.path.test(remotePath))) {
+      this.files.set(remotePath, this.staged.bytes)
     }
     return this.files.get(remotePath) ?? null
   }

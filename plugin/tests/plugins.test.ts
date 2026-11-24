@@ -8,6 +8,8 @@ import * as generator from '../src/generator.ts'
 import * as evalPlugin from '../src/eval.ts'
 import * as loop from '../src/loop.ts'
 import { emptyState, type PolicyConfig } from '../src/policy.ts'
+import { buildTestPackage, writeOperator } from '../src/package-files.ts'
+import { parseSpec } from '../src/spec.ts'
 import { MemoryRemote, type RemoteHost } from '../src/remote.ts'
 import type { EvalReport } from '../src/report.ts'
 import { loadState, saveState } from '../src/state-file.ts'
@@ -97,6 +99,31 @@ test('submit_spec rejects the first missing field and writes no state', async ()
   expect(existsSync(join(workspace, '.canness', 'state.json'))).toBe(false)
 })
 
+test('repair_package re-signs the package and refreshes the cached state hash', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
+  const gen = fakeCtx()
+  generator.apply(gen as never, { workspace })
+  const spec = parseSpec({
+    operator_name: 'Add', operator_type: 'elementwise',
+    input_specs: [{ name: 'x', shape: ['16'], dtype: 'float16' }],
+    output_specs: [{ name: 'y', shape: ['16'], dtype: 'float16' }],
+    target_platform: { chip: 'Ascend910B2' }, performance_target: { metric: 'kernel_time', target_us: 50 },
+  })
+  writeOperator(workspace, 'gen-01234567', {
+    kernel: 'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR x, GM_ADDR y, GM_ADDR tiling) { GET_TILING_DATA(t, tiling); }',
+    host: '', api: '', plugin: '',
+  })
+  const pkg = buildTestPackage(workspace, 'gen-01234567', spec)
+  const stateFile = join(workspace, '.canness', 'state.json')
+  saveState(stateFile, { ...emptyState(), generationId: 'gen-01234567' })
+  const repair = gen.toolsRegistered.find(tool => tool.name === 'repair_package')!
+  const value = await repair.execute({ drop: ['.contract-selfcheck'] }) as { packageHash: string }
+  expect(existsSync(join(pkg, '.contract-selfcheck'))).toBe(false)
+  const state = loadState(stateFile)
+  expect(state.packageHash).toBe(value.packageHash)
+  expect(state.pendingStage).toBe('run_evaluation')
+})
+
 test('run_evaluation with an empty host does not throw and reports ssh host is empty', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-plugin-'))
   const ev = fakeCtx()
@@ -138,6 +165,10 @@ function readyPackage(): { workspace: string; generationId: string } {
   return { workspace, generationId }
 }
 
+function evaluationResultPath(generationId: string): RegExp {
+  return new RegExp(`^/out/${generationId}/attempt-[a-f0-9-]+/${generationId}/results\\.json$`, 'u')
+}
+
 function trackedRemote(events: string[], upload?: () => Promise<void>): { files: RemoteHost; remote: MemoryRemote } {
   const remote = new MemoryRemote()
   const files: RemoteHost = {
@@ -169,7 +200,7 @@ function trackedRemote(events: string[], upload?: () => Promise<void>): { files:
 test('run_evaluation claims the task for the calling session and owes exactly one retry', async () => {
   const ready = readyPackage()
   const remote = trackedRemote([])
-  remote.remote.appearOnRead(`/out/${ready.generationId}/results.json`, Buffer.from(JSON.stringify({
+  remote.remote.appearOnRead(evaluationResultPath(ready.generationId), Buffer.from(JSON.stringify({
     generationId: ready.generationId,
     status: 'compile_fail',
     compile: { ok: false, log: 'error: x' },
@@ -206,7 +237,7 @@ test('unchanged package reuses the report without SSH; changed code and force ru
   const packageDir = join(ready.workspace, 'packages', ready.generationId)
   writeFileSync(join(packageDir, 'op_kernel.cpp'), 'first')
   const remote = new MemoryRemote()
-  const resultPath = `/out/${ready.generationId}/results.json`
+  const resultPath = evaluationResultPath(ready.generationId)
   remote.appearOnRead(resultPath, Buffer.from(JSON.stringify({
     ...failReport('perf_fail'),
     runRecord: { timestamp: '2026-11-06T10:00:00+0800', host: 'npu', params: {}, toolchain: 'CANN', durationMs: 1 },
@@ -216,11 +247,13 @@ test('unchanged package reuses the report without SSH; changed code and force ru
   evalPlugin.apply(ctx as never, evalConfig(ready.workspace, { privateKeyPath: vol(join(ready.workspace, 'id_key')) }),
     async () => { connections += 1; return remote })
   const tool = ctx.toolsRegistered[0]!
-  await tool.execute({})
+  const first = tool.execute({})
+  const overlapping = tool.execute({})
+  const firstValue = await first as { resultsPath: string }
   expect(connections).toBe(1)
   const valid = loadState(statePath).validIterations
-  const duplicate = await tool.execute({}) as EvalReport
-  expect(duplicate).toMatchObject({ status: 'perf_fail', duplicate: true })
+  const duplicate = await overlapping as EvalReport
+  expect(duplicate).toMatchObject({ status: 'perf_fail', duplicate: true, resultsPath: firstValue.resultsPath })
   expect(connections).toBe(1)
   expect(loadState(statePath)).toMatchObject({ validIterations: valid, pendingSteer: false })
   writeFileSync(join(packageDir, 'op_kernel.cpp'), 'second')
@@ -235,7 +268,7 @@ test('run_evaluation closes after a finished attempt and after an upload failure
   const finishedEvents: string[] = []
   const finished = readyPackage()
   const finishedRemote = trackedRemote(finishedEvents)
-  const resultPath = `/out/${finished.generationId}/results.json`
+  const resultPath = evaluationResultPath(finished.generationId)
   finishedRemote.remote.appearOnRead(resultPath, Buffer.from(JSON.stringify({
     generationId: finished.generationId,
     status: 'compile_fail',
@@ -250,7 +283,7 @@ test('run_evaluation closes after a finished attempt and after an upload failure
   const finishedValue = await finishedCtx.toolsRegistered[0]!.execute({})
   expect(finishedValue).toMatchObject({ status: 'compile_fail', summary: 'failed compile' })
   // The final remove drops the per-run runner script before the connection closes.
-  expect(finishedEvents).toEqual(['upload', 'remove', 'read', 'remove', 'close'])
+  expect(finishedEvents).toEqual(['upload', 'read', 'remove', 'close'])
 
   const failedEvents: string[] = []
   const failed = readyPackage()
@@ -274,7 +307,7 @@ test('run_evaluation closes after a poll timeout and does not connect when alrea
   const timedOut = await timeoutCtx.toolsRegistered[0]!.execute({})
   expect(timedOut).toMatchObject({ status: 'timeout' })
   // One immediate read after the runner, one poll before the zero budget expires, then cleanup.
-  expect(timeoutEvents).toEqual(['upload', 'remove', 'read', 'read', 'remove', 'close'])
+  expect(timeoutEvents).toEqual(['upload', 'read', 'read', 'remove', 'close'])
 
   const stoppedEvents: string[] = []
   const stopped = readyPackage()
@@ -308,7 +341,9 @@ test('a runner that cannot start reports the remote stderr excerpt', async () =>
   expect((value as { summary: string }).summary).toMatch(/^remote runner failed: /)
   expect((value as { summary: string }).summary).toContain('python3 not found on remote')
   expect(remote.execCalls.some(command => command.includes('--generation'))).toBe(true)
-  expect(remote.files.has(`/in/${pkg.generationId}/manifest.json`)).toBe(true)
+  expect([...remote.files.keys()]).toContainEqual(expect.stringMatching(
+    new RegExp(`^/in/${pkg.generationId}/attempt-[a-f0-9-]+/${pkg.generationId}/manifest\\.json$`, 'u'),
+  ))
   // The per-run runner script is removed again after the attempt.
   expect([...remote.files.keys()].some(path => path.startsWith('/runner-'))).toBe(false)
 })
@@ -316,7 +351,7 @@ test('a runner that cannot start reports the remote stderr excerpt', async () =>
 test('run_evaluation returns workspace, packageDir and resultsPath', async () => {
   const pkg = readyPackage()
   const remote = new MemoryRemote()
-  const resultPath = `/out/${pkg.generationId}/results.json`
+  const resultPath = evaluationResultPath(pkg.generationId)
   remote.appearOnRead(resultPath, Buffer.from(JSON.stringify({
     generationId: pkg.generationId,
     status: 'pass',
@@ -338,9 +373,12 @@ test('run_evaluation returns workspace, packageDir and resultsPath', async () =>
     status: 'pass',
     workspace: pkg.workspace,
     packageDir: join(pkg.workspace, 'packages', pkg.generationId),
-    resultsPath: resultPath,
+    resultsPath: expect.stringMatching(resultPath),
     runRecord: { host: 'npu-host', params: { blockDim: 16 }, toolchain: 'CANN 9.0.0', durationMs: 1234 },
   })
+  const fetch = ctx.toolsRegistered.find(tool => tool.name === 'fetch_remote_file')!
+  const downloaded = await fetch.execute({ remotePath: value.resultsPath }) as { path: string }
+  expect(JSON.parse(readFileSync(downloaded.path, 'utf8'))).toMatchObject({ generationId: pkg.generationId, status: 'pass' })
 })
 
 test('fetch_remote_file copies a remote file into the workspace', async () => {
@@ -482,7 +520,7 @@ test('a stale CANNLab forward leaves the package ready to resume without spendin
   const pkg = readyPackage()
   const stateFile = join(pkg.workspace, '.canness', 'state.json')
   const remote = new MemoryRemote()
-  remote.appearOnRead(`/out/${pkg.generationId}/results.json`, Buffer.from(JSON.stringify({
+  remote.appearOnRead(evaluationResultPath(pkg.generationId), Buffer.from(JSON.stringify({
     ...failReport('perf_fail'), generationId: pkg.generationId, summary: 'evaluation ran',
   })), 1)
   let reachable = false

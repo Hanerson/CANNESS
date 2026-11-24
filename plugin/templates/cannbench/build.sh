@@ -29,9 +29,18 @@ for variant in {{VARIANTS}}; do
   "$compiler" "${flags[@]}" "${includes[@]}" "$entry" -c csrc/launch.cpp -o "build/launch-$variant.o"
   "$compiler" "${flags[@]}" "${includes[@]}" "$entry" -include "$header" \
     -c csrc/op_kernel/kernel.cpp -o "build/kernel-$variant.o"
-  "$compiler" -shared "build/launch-$variant.o" "build/kernel-$variant.o" -o "cann_bench/libcanness-$variant.so" \
-    -L"$toolkit/$platform/lib64" -L"$toolkit/$platform/devlib" -L"$toolkit/lib64" \
-    -lascendcl -lruntime -lstdc++ -lpthread -ldl -lm \
-    "-Wl,-rpath,$toolkit/$platform/lib64:$toolkit/lib64"
+  link_libs=(-L"$toolkit/$platform/lib64" -L"$toolkit/$platform/devlib" -L"$toolkit/lib64"
+    -lascendcl -lruntime -lstdc++ -lpthread -ldl -lm
+    "-Wl,-rpath,$toolkit/$platform/lib64:$toolkit/lib64")
+  # CANN 8.0.1 resolves the device runtime only through the CCE fat-object
+  # linker; CANN 9.x links directly. Shared libraries allow undefined symbols by
+  # default, so --no-undefined is what makes the 8.0.1 failure visible and
+  # triggers the fallback instead of shipping a .so that fails to load.
+  if ! "$compiler" -shared -Wl,--no-undefined "build/launch-$variant.o" "build/kernel-$variant.o" \
+      -o "cann_bench/libcanness-$variant.so" "${link_libs[@]}"; then
+    echo "build.sh: plain link failed; retrying with --cce-fatobj-link (CANN 8.x runtime)" >&2
+    "$compiler" --cce-fatobj-link -shared "build/launch-$variant.o" "build/kernel-$variant.o" \
+      -o "cann_bench/libcanness-$variant.so" "${link_libs[@]}"
+  fi
 done
 "$python" setup.py bdist_wheel --dist-dir dist

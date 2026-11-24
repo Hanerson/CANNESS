@@ -41,10 +41,19 @@ FLAGS=(-x cce -std=c++17 "--cce-soc-version=$SOC_VERSION" --cce-soc-core-type=Ve
 "$BISHENG" "${FLAGS[@]}" "${INCLUDES[@]}" \
   -Wno-ignored-attributes -c main.cpp -o main.o
 
-"$BISHENG" main.o kernel.o -o canness_run \
-  -L"$CANN/aarch64-linux/lib64" -L"$CANN/aarch64-linux/devlib" \
-  -lascendcl -lruntime -lstdc++ -lpthread -ldl -lm \
+LINK_LIBS=(
+  -L"$CANN/aarch64-linux/lib64" -L"$CANN/aarch64-linux/devlib"
+  -lascendcl -lruntime -lstdc++ -lpthread -ldl -lm
   "-Wl,-rpath,$CANN/aarch64-linux/lib64:$CANN/aarch64-linux/devlib"
+)
+
+# CANN 8.0.1 needs the CCE fat-object linker to resolve the device runtime
+# (__cce_rtLaunch / rtLinkedDevBinaryRegister); CANN 9.x links the two objects
+# directly. Try the plain link first so 9.x keeps its existing behavior.
+if ! "$BISHENG" main.o kernel.o -o canness_run "${LINK_LIBS[@]}"; then
+  echo "build.sh: plain link failed; retrying with --cce-fatobj-link (CANN 8.x runtime)" >&2
+  "$BISHENG" --cce-fatobj-link main.o kernel.o -o canness_run "${LINK_LIBS[@]}"
+fi
 
 # run_once.sh and msprof-launched runs both use this path.
 printf '%s\n' "$HERE/canness_run" > "$HERE/.canness-exe"

@@ -97,15 +97,14 @@ function runnerFailedReport(generationId: string, detail: string): EvalReport {
 /**
  * Upload one package, execute the real remote runner, and parse its report.
  *
- * The runner is uploaded next to the configured inbox (not inside the package)
- * under a uuid name, so concurrent evaluations cannot overwrite each other and
- * the package contract stays exactly what the generator produced.
+ * Each attempt gets its own remote input and output directories. Keep its
+ * logical generation ID unchanged so runner reports still identify the package.
  */
 export async function runEvaluation(input: RunInput): Promise<{
   report: EvalReport
   state: TaskState
   resultWritten: boolean
-  resultGenerationId?: string
+  resultsPath?: string
 }> {
   const reason = stopReason(input.state, input.config)
   if (reason && !input.compileOnly && !(input.force && canForceEvaluation(input.state, input.config))) {
@@ -115,29 +114,34 @@ export async function runEvaluation(input: RunInput): Promise<{
     : { ...applyReport({ ...input.state, packageHash: input.state.packageHash ?? packageHash(input.localPackageDir) }, report),
         forcedRunsAfterStop: (input.state.forcedRunsAfterStop ?? 0) + (reason && input.force ? 1 : 0) }
   const manifestPath = join(input.localPackageDir, 'manifest.json')
-  if (existsSync(manifestPath)) {
+  if (!input.compileOnly && existsSync(manifestPath)) {
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { packageHash?: string }
-    if (manifest.packageHash && manifest.packageHash !== packageHash(input.localPackageDir)) {
-      throw new Error('package changed after build_test_package; rebuild before upload')
+    const actual = packageHash(input.localPackageDir)
+    if (manifest.packageHash && manifest.packageHash !== actual) {
+      throw new Error(`package changed after build_test_package: manifest=${manifest.packageHash}, `
+        + `actual=${actual}; rebuild or repair before upload`)
     }
   }
   const generation = input.compileOnly ? `${input.generationId}-compile-${randomUUID().slice(0, 8)}` : input.generationId
-  const remoteDir = `${input.inbox}/${generation}`
-  const resultPath = `${input.outbox}/${generation}/results.json`
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(generation)) {
+    throw new Error(`unsafe evaluation generation id: ${generation}`)
+  }
   const baseDir = posix.dirname(posix.normalize(input.inbox))
-  const token = (input.token ?? (() => randomUUID().slice(0, 12)))()
+  const token = input.token?.() ?? randomUUID()
+  if (!/^[A-Za-z0-9_-]+$/u.test(token)) throw new Error('unsafe evaluation attempt token')
   const runnerPath = posix.join(baseDir, `runner-${token}.py`)
+  const attempt = posix.join(generation, `attempt-${token}`)
+  const inbox = input.compileOnly ? input.inbox : posix.join(input.inbox, attempt)
+  const outbox = input.compileOnly ? input.outbox : posix.join(input.outbox, attempt)
+  const resultPath = posix.join(outbox, generation, 'results.json')
 
-  await input.files.uploadDir(input.localPackageDir, remoteDir)
-  // The runner skips a generation whose results.json already exists, so drop
-  // the previous attempt before starting a new one.
-  await input.files.removeFile(resultPath)
+  await input.files.uploadDir(input.localPackageDir, posix.join(inbox, generation))
   try {
     await input.files.put(runnerScriptFile(), runnerPath)
     const started = await input.files.exec(runnerCommand({
       runnerPath,
-      inbox: input.inbox,
-      outbox: input.outbox,
+      inbox,
+      outbox,
       generationId: generation,
       timeoutSec: Math.round(input.timeoutMs / 1000),
       setEnv: input.setEnv,
@@ -160,7 +164,7 @@ export async function runEvaluation(input: RunInput): Promise<{
       sleep: input.sleep,
     })
     const report = parseReport(JSON.parse(Buffer.from(body).toString('utf8')))
-    return { report, state: fold(report), resultWritten: true, resultGenerationId: generation }
+    return { report, state: fold(report), resultWritten: true, resultsPath: resultPath }
   } catch (error) {
     const report = error instanceof Error && error.message === 'timeout'
       ? timeoutReport(input.generationId, Math.round(input.timeoutMs / 1000))

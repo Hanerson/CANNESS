@@ -693,43 +693,47 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         'set_env.sh not found; searched: ' + ', '.join(searched_env) + '; PATH may lack bisheng\n'
     )
     phase_started = time.perf_counter()
+    # The self-check validates the plugin's own contract template, not the
+    # user's kernel. Treat it as a soft diagnostic: a broken template must be
+    # visible in the report, but it must not prevent the user's build from
+    # running (CAN-102). The user build below is the authoritative compile.
+    selfcheck_result = {'ok': True, 'summary': ''}
+    selfcheck_log = ''
     selfcheck = package / '.contract-selfcheck' / 'build.sh'
     if selfcheck.is_file():
         try:
             checked = run_command([args.bash, bash_path(selfcheck)], env_prefix,
                                   args.build_timeout, cwd=selfcheck.parent, bash_exe=args.bash)
         except subprocess.TimeoutExpired:
-            report = make_report(generation, target, status='compile_fail',
-                                 summary='contract template itself broken: self-check timed out')
-            report['runRecord'] = record(started, params, args)
-            return report
-        if checked.returncode != 0:
-            diagnostic = truncate((checked.stdout or '') + (checked.stderr or ''))
-            report = make_report(generation, target, status='compile_fail',
-                                 compile_log=diagnostic,
-                                 summary='contract template itself broken: minimal kernel did not compile')
-            report['runRecord'] = record(started, params, args)
-            return report
+            selfcheck_result = {'ok': False, 'summary': 'contract self-check timed out (template issue)'}
+            selfcheck_log = selfcheck_result['summary'] + '\n'
+        else:
+            if checked.returncode != 0:
+                diagnostic = truncate((checked.stdout or '') + (checked.stderr or ''))
+                selfcheck_result = {'ok': False, 'summary': 'contract self-check failed (template issue)'}
+                selfcheck_log = f"{selfcheck_result['summary']}:\n{diagnostic}\n"
+    params['contractSelfCheck'] = selfcheck_result
+    selfcheck_suffix = '' if selfcheck_result['ok'] else '; ' + selfcheck_result['summary']
     try:
         built = run_command([args.bash, bash_path(build)], env_prefix, args.build_timeout, cwd=package, bash_exe=args.bash)
     except subprocess.TimeoutExpired:
         report = make_report(generation, target, status='compile_fail',
-                             summary=f'build.sh timed out after {args.build_timeout}s')
+                             summary=f'build.sh timed out after {args.build_timeout}s{selfcheck_suffix}')
         report['runRecord'] = record(started, params, args)
         return report
     params['phaseTimingsMs']['buildMs'] = (time.perf_counter() - phase_started) * 1000
-    compile_log = truncate(env_warning + (built.stdout or '') + (built.stderr or ''))
+    compile_log = truncate(env_warning + selfcheck_log + (built.stdout or '') + (built.stderr or ''))
     if built.returncode != 0:
         report = make_report(
             generation, target, status='compile_fail', compile_log=compile_log,
-            summary=f'build.sh exited {built.returncode}: {first_line(built.stderr or built.stdout)}',
+            summary=f'build.sh exited {built.returncode}: {first_line(built.stderr or built.stdout)}{selfcheck_suffix}',
         )
         report['runRecord'] = record(started, params, args)
         return report
     executable_text = last_nonempty_line(built.stdout or '')
     if executable_text == '':
         report = make_report(generation, target, status='compile_fail', compile_log=compile_log,
-                             summary='build.sh did not print the executable path on its last stdout line')
+                             summary=f'build.sh did not print the executable path on its last stdout line{selfcheck_suffix}')
         report['runRecord'] = record(started, params, args)
         return report
     executable = local_path(executable_text)
@@ -737,13 +741,14 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         executable = package / executable
     if not executable.exists():
         report = make_report(generation, target, status='compile_fail', compile_log=compile_log,
-                             summary=f'build.sh reported a missing executable: {executable}')
+                             summary=f'build.sh reported a missing executable: {executable}{selfcheck_suffix}')
         report['runRecord'] = record(started, params, args)
         return report
 
     if getattr(args, 'compile_only', False):
         report = make_report(generation, target, status='pass', compile_ok=True, compile_log=compile_log,
-                             summary='compile-only passed; correctness and performance were not evaluated')
+                             summary='compile-only passed; correctness and performance were not evaluated'
+                                     + selfcheck_suffix)
         report['runRecord'] = record(started, params, args)
         return report
 

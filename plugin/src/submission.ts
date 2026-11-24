@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { launchGeometry, LAYER_FILES, packageHash, renderBuildContract } from './package-files.js'
+import { launchGeometry, LAYER_FILES, normalizeEol, packageHash, renderBuildContract } from './package-files.js'
 import { sha256 } from './provenance.js'
 import { normalizedDtype, type OperatorSpec } from './spec.js'
 
@@ -20,7 +20,7 @@ function publicIdentifier(value: string): boolean {
 }
 
 function render(name: string, values: Record<string, string>): string {
-  return readFileSync(join(TEMPLATE, name), 'utf8').replace(/\r\n/g, '\n')
+  return normalizeEol(readFileSync(join(TEMPLATE, name), 'utf8'))
     .replace(/\{\{([A-Z0-9_]+)\}\}/g, (token, key: string) => {
       const value = values[key]
       if (value === undefined) throw new Error(`unbound CANNBench template token ${token}`)

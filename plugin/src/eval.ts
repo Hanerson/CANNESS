@@ -222,13 +222,21 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'unknown error'
 }
 
-/** Return the current package fingerprint or reject edits made after packaging. */
+/**
+ * Return the current package fingerprint or reject edits made after packaging.
+ *
+ * `manifest.packageHash` is the single source of truth. `state.packageHash` is
+ * only a cache of "which package was last evaluated" and must not authorize a
+ * different package: a stale state entry used to block even `compile_only`
+ * diagnostics (CAN-104). It is reported in the error text so the mismatch is
+ * attributable at a glance.
+ */
 function checkPackageHash(packageDir: string, state: TaskState): string {
   const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as { packageHash?: string }
   const hash = packageHash(packageDir)
-  if ((manifest.packageHash !== undefined && manifest.packageHash !== hash)
-      || (state.packageHash != null && state.packageHash !== hash)) {
-    throw new Error('package changed after build_test_package; rebuild the package before evaluation')
+  if (manifest.packageHash !== undefined && manifest.packageHash !== hash) {
+    throw new Error(`package changed after build_test_package: manifest=${manifest.packageHash}, `
+      + `state=${state.packageHash ?? '<none>'}, actual=${hash}; rebuild the package or repair it before evaluation`)
   }
   return hash
 }
@@ -334,18 +342,43 @@ function withPaths(
   generationId: string | null,
   outbox: string,
   pendingStage: RunEvaluationValue['pendingStage'] = null,
-  hasResult = false,
+  resultsPath: string | null = null,
   inbox?: string,
 ): RunEvaluationValue {
   return {
     ...report,
     workspace,
     packageDir: generationId === null ? null : join(workspace, 'packages', generationId),
-    resultsPath: hasResult && generationId !== null ? posix.join(outbox, generationId, 'results.json') : null,
+    resultsPath,
     pendingStage,
     artifactsPersistent: ![outbox, inbox ?? outbox].some(path => /^\/(?:tmp|var\/tmp)(?:\/|$)/.test(path)),
     ...([outbox, inbox ?? outbox].some(path => /^\/(?:tmp|var\/tmp)(?:\/|$)/.test(path))
       ? { artifactWarning: 'Remote artifacts are in a temporary directory. Configure inbox/outbox under a persistent mount such as /mnt/workspace on CANNLab.' } : {}),
+  }
+}
+
+const pendingEvaluations = new Map<string, Promise<RunEvaluationValue>>()
+
+function serializeFormalEvaluations(
+  configuredWorkspace: string | undefined,
+  evaluate: (args: unknown, exec: ToolAgentContext | undefined, workspace: string) => Promise<RunEvaluationValue>,
+) {
+  return async (args: unknown, exec?: ToolAgentContext): Promise<RunEvaluationValue> => {
+    const workspace = resolveWorkspace(configuredWorkspace, exec)
+    if ((args as { compile_only?: boolean } | null)?.compile_only === true) {
+      return evaluate(args, exec, workspace)
+    }
+    // Read and update the evaluation budget in order, even when a caller
+    // submits two evaluations of the same workspace before either finishes.
+    const key = statePath(workspace)
+    const previous = pendingEvaluations.get(key)
+    const result = Promise.resolve(previous).catch(() => undefined).then(() => evaluate(args, exec, workspace))
+    pendingEvaluations.set(key, result)
+    try {
+      return await result
+    } finally {
+      if (pendingEvaluations.get(key) === result) pendingEvaluations.delete(key)
+    }
   }
 }
 
@@ -364,9 +397,9 @@ export function apply(
       'Upload the current test package and evaluate it on the remote NPU host.',
       'Call order is fixed: submit_spec -> write_operator -> build_test_package -> run_evaluation;',
       'run_evaluation requires the package that build_test_package wrote under packages/<generationId>.',
-      'It uploads workspace/packages/<generationId> to <inbox>/<generationId> over SSH exec (base64 tar, no SFTP),',
+      'It uploads workspace/packages/<generationId> to a separate directory for each attempt over SSH exec (base64 tar, no SFTP),',
       'then on the remote host runs the package\'s build.sh, its run_once.sh, and the real msprof',
-      '(CSV under mindstudio_profiler_output/), and reads <outbox>/<generationId>/results.json.',
+      '(CSV under mindstudio_profiler_output/), and returns the remote report path in resultsPath.',
       'Nothing is compiled locally: this Windows side has no CANN toolchain.',
       'A missing build.sh/run_once.sh is reported as compile_fail with "package does not implement build contract v1".',
       'A placeholder golden.h (write_package_file) returns accuracy_fail with "golden not implemented", never pass.',
@@ -492,11 +525,10 @@ export function apply(
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    async execute(_args: unknown, exec?: ToolAgentContext) {
+    execute: serializeFormalEvaluations(config.workspace, async (_args, exec, workspace) => {
       const force = (_args as { force?: boolean } | null)?.force === true
       const compileOnly = (_args as { compile_only?: boolean } | null)?.compile_only === true
       const cfg = snapshot(config)
-      const workspace = resolveWorkspace(config.workspace, exec)
       const stateFile = statePath(workspace)
       let state = loadState(stateFile)
       // The first evaluation claims the task for this session. Without an
@@ -531,7 +563,10 @@ export function apply(
         if (cfg.host === '') return fail(unavailableReport(state.generationId, 'ssh host is empty'))
         throw new Error('build_test_package first')
       }
-      const currentHash = checkPackageHash(localPackageDir, state)
+      // compile_only is a diagnostic build: it writes no comparable evaluation
+      // result, so a stale hash must not block it (CAN-104). The full gate still
+      // applies to evaluations that consume budget.
+      const currentHash = compileOnly ? packageHash(localPackageDir) : checkPackageHash(localPackageDir, state)
       const kernelDtypes = (_args as { kernel_dtypes?: string[] } | null)?.kernel_dtypes
       if (kernelDtypes) {
         const localKernel = await checkKernel(localPackageDir, kernelDtypes)
@@ -552,7 +587,9 @@ export function apply(
           ...state.lastReport,
           duplicate: true,
           summary: `duplicate package: same content as the last evaluation; previous result: ${state.lastReport.summary}`,
-        }), workspace, state.generationId, cfg.outbox, null, state.lastReport.status !== 'timeout', cfg.inbox)
+        }), workspace, state.generationId, cfg.outbox, null, state.lastResultsPath === undefined
+          ? (state.lastReport.status === 'timeout' ? null : posix.join(cfg.outbox, state.generationId, 'results.json'))
+          : state.lastResultsPath, cfg.inbox)
       }
       const reason = stopReason(state, policyOf(config))
       const forcedAfterStop = force && canForceEvaluation(state, policyOf(config))
@@ -590,20 +627,22 @@ export function apply(
         error => `remote evaluation interrupted: ${errorMessage(error)}. Check the remote host and rerun run_evaluation.`,
       ).finally(() => files.close().catch(() => {}))
       if (typeof outcome === 'string') return pending(outcome)
-      const { report, state: next, resultWritten, resultGenerationId } = outcome
+      const { report, state: next, resultWritten, resultsPath = null } = outcome
       if (report.status === 'error' && !resultWritten) return pending(report.summary)
       if (force && report.runRecord !== undefined) report.runRecord.params.forced = true
-      if (compileOnly) return { ...withPaths(report, workspace, resultGenerationId ?? state.generationId, cfg.outbox, null, resultWritten),
-        packageDir: localPackageDir, compileOnly: true }
+      if (compileOnly) return { ...withPaths(report, workspace, state.generationId, cfg.outbox, null, resultsPath, cfg.inbox),
+        compileOnly: true }
       const latest = loadState(stateFile)
       if (latest.generationId === state.generationId && latest.packageHash === state.packageHash) {
         saveState(stateFile, {
           ...next,
-          // Legacy hand-built packages do not acquire a build fingerprint by measurement.
-          packageHash: state.packageHash ?? null,
+          // This is a cache of the package just evaluated, not an authorization
+          // source (CAN-104). Keep it aligned with what was measured.
+          packageHash: currentHash,
           forcedRunsAfterStop: (state.forcedRunsAfterStop ?? 0) + (forcedAfterStop ? 1 : 0),
           pendingStage: null,
           lastEvaluatedHash: currentHash,
+          lastResultsPath: resultsPath,
           ownerSessionId: owner ?? state.ownerSessionId ?? null,
           // One retry is owed for this report, and only for it.
           pendingSteer: !forcedAfterStop,
@@ -611,8 +650,8 @@ export function apply(
           lastSteerAt: 0,
         })
       }
-      return withPaths(observed(report), workspace, state.generationId, cfg.outbox, null, resultWritten, cfg.inbox)
-    },
+      return withPaths(observed(report), workspace, state.generationId, cfg.outbox, null, resultsPath, cfg.inbox)
+    }),
   }))
   ctx.tools.register(defineTool({
     name: 'preflight_evaluation',
@@ -682,8 +721,8 @@ export function apply(
       'Copy one file from the remote NPU host into the local workspace over SSH exec + base64 (no SFTP).',
       'remotePath must be absolute; reads are limited to the configured outbox and the current',
       'or known historical generation inbox plus explicitly configured readRoots. Symlink escapes are rejected.',
-      'Use it to pull msprof CSVs or runner logs back after run_evaluation; for example',
-      'remotePath="/tmp/canness-a/outbox/<generationId>/results.json" and localPath="results/<generationId>.json".',
+      'Use it to pull msprof CSVs or runner logs back after run_evaluation.',
+      'To download the report, pass the returned resultsPath as remotePath.',
       'localPath is relative to the workspace; it defaults to remote-files/<basename>.',
     ].join(' '),
     parameters: {

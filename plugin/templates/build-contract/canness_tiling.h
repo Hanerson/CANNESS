@@ -66,7 +66,27 @@ public:
     }
 
     // Indices follow serialized attrs order, then attrs_derived order. Prefer names.
-    __aicore__ inline CannessDeviceAttr find(const char* key) const {
+    // Templating on the pointee type binds both device string literals
+    // (`const __gm__ char*`) and local `char[]` keys without an address-space
+    // conversion. Do not split this into two overloads: on CANN 8.0.1/9.2.1
+    // `__gm__` expands to an attribute, attributes do not participate in
+    // overload resolution, and the second overload becomes a redeclaration.
+    template <typename CharT>
+    __aicore__ inline CannessDeviceAttr find(const CharT* key) const {
+        return findKey(key);
+    }
+
+    __aicore__ inline __gm__ const uint8_t* name(const CannessDeviceAttr& attr) const {
+        return attr.nameOffset == 0 ? nullptr : base_ + attr.nameOffset;
+    }
+
+    __aicore__ inline __gm__ const uint8_t* text(const CannessDeviceAttr& attr) const {
+        return attr.textOffset == 0 ? nullptr : base_ + attr.textOffset;
+    }
+
+private:
+    template <typename KeyT>
+    __aicore__ inline CannessDeviceAttr findKey(const KeyT* key) const {
         for (uint32_t i = 0; i < count(); ++i) {
             const auto attr = get(i);
             const auto bytes = name(attr);
@@ -79,14 +99,5 @@ public:
         return missing;
     }
 
-    __aicore__ inline __gm__ const uint8_t* name(const CannessDeviceAttr& attr) const {
-        return attr.nameOffset == 0 ? nullptr : base_ + attr.nameOffset;
-    }
-
-    __aicore__ inline __gm__ const uint8_t* text(const CannessDeviceAttr& attr) const {
-        return attr.textOffset == 0 ? nullptr : base_ + attr.textOffset;
-    }
-
-private:
     GM_ADDR base_;
 };
