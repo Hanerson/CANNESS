@@ -81,9 +81,22 @@ function clangModelsAddressSpace(clangPath:string):boolean{
     return spawnSync(clangPath,['-std=c++17','-fsyntax-only',probe],{encoding:'utf8',windowsHide:true}).status===0
   }finally{rmSync(dir,{recursive:true,force:true})}
 }
-const clangModelsGm=hasClang&&clangModelsAddressSpace(clang)
+// Some Windows runners ship a clang older than the installed MSVC STL accepts
+// (e.g. LLVM 20 with an STL requiring clang 22). The probe includes <cstdint>
+// like the generated header does, so those runners skip instead of failing on
+// the toolchain mismatch.
+function clangCompilesHostStl(clangPath:string):boolean{
+  const dir=mkdtempSync(join(tmpdir(),'canness-clang-stl-'))
+  try{
+    const probe=join(dir,'probe.cpp')
+    writeFileSync(probe,'#include <cstdint>\nint main() { return 0; }\n')
+    return spawnSync(clangPath,['-std=c++17','-fsyntax-only',probe],{encoding:'utf8',windowsHide:true}).status===0
+  }finally{rmSync(dir,{recursive:true,force:true})}
+}
+const clangCompilesStl=hasClang&&clangCompilesHostStl(clang)
+const clangModelsGm=clangCompilesStl&&clangModelsAddressSpace(clang)
 const testWithClangGm=(clangModelsGm?test:test.skip)
-const testWithClang=(hasClang?test:test.skip)
+const testWithClang=(clangCompilesStl?test:test.skip)
 function compileGmProbe(gmDefinition:string){
   const workspace=mkdtempSync(join(tmpdir(),'canness-gm-find-'))
   const spec=parseSpec({operator_name:'add',operator_type:'elementwise',input_specs:[{name:'x',shape:['16'],dtype:'float16'}],output_specs:[{name:'y',shape:['16'],dtype:'float16'}],target_platform:{chip:'Ascend910B2'},performance_target:{metric:'kernel_time',target_us:50}})
