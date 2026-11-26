@@ -44,6 +44,21 @@ test('parseAnalysis accepts only the real msprof source', () => {
   expect(parseAnalysis({ source: 'nope', bottleneck: 'memory', summary: 'x', op: null })).toBeNull()
 })
 
+test('parseAnalysis retains the self-reported kernel budget and tolerates omitted evidence', () => {
+  const analysis = { source: 'msprof', bottleneck: 'scalar', summary: 'csv', op: null }
+  const kernelBudget = {
+    source: 'correctness-stdout',
+    elementBasis: 'output elements',
+    blocks: [{ blockIndex: 0, level2Calls: 2, elements: 8, callElements: 16 }],
+    level2Calls: 2, elements: 8, callElements: 16,
+    perElementCalls: 0.25, averageElementsPerCall: 8,
+  }
+  expect(parseAnalysis({ ...analysis, kernelBudget })?.kernelBudget).toEqual(kernelBudget)
+  expect(parseAnalysis(analysis)?.kernelBudget).toBeUndefined()
+  expect(parseAnalysis({ ...analysis, kernelBudget: { ...kernelBudget, level2Calls: true } })?.kernelBudget)
+    .toBeUndefined()
+})
+
 test('parseReport keeps a valid runRecord and drops an incomplete one', () => {
   const parsed = parseReport({
     generationId: 'gen-1',

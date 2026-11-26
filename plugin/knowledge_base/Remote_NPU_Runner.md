@@ -41,7 +41,7 @@
 | `main.cpp` | LF；ACL 骨架：按 spec 的输入/输出个数与 dtype 分配、填充、launch、`aclrtSynchronizeDevice`、误差统计 |
 | `golden.h` | 模型唯一可写的包内文件（`write_package_file` 白名单）；模板先给占位实现 |
 | `canness_tiling.h` | 通用 `CannessTilingData { totalLength, blockLength, tileLength }` + `GET_TILING_DATA`；`GET_TILING_DATA` 带 `#ifndef` 守卫，kernel 自带的 shim 不会被覆盖 |
-| `config.json` | `maxAbsErr` 按 dtype 推导：fp16 `2^-10`、bf16 `2^-7`、fp32 `2^-13`；另有 `params`（blockDim / tileSize / blockLength / totalElements） |
+| `config.json` | `maxAbsErr` 按 dtype 推导；`params` 保存 blockDim / tileSize / blockLength / totalElements，`launch` 保存生效配置，`requestedLaunch` 保存 spec 显式指定的覆盖项 |
 
 **kernel 入口约定**：`op_kernel/kernel.cpp` 必须导出固定符号
 `extern "C" __global__ __aicore__ void canness_kernel(...)`，参数顺序为
@@ -63,6 +63,52 @@
   `package does not implement build contract v1`。
 - `build.sh` 未打印可执行文件路径 / 打印的路径不存在 → `compile_fail`。
 
+### 实际 tiling 与 Level-2 调用预算（可选）
+
+通过 `repair_package` 自定义正确性驱动时，可在一次正确性检查的 stdout 中额外打印一行。下例对应 `block_dim: 2`：
+
+```text
+CANNESS_TILING_REPORT {"geometry":{"runRows":3,"cosWindowElements":384},"kernelBudget":{"elementBasis":"query elements","blocks":[{"blockIndex":0,"level2Calls":3,"elements":14,"callElements":30},{"blockIndex":1,"level2Calls":1,"elements":2,"callElements":2}]}}
+```
+
+- 报告描述一个 kernel launch。若驱动执行多次 launch，只为一个代表性 launch 输出一次该行。可以单独提供 `geometry` 或 `kernelBudget`。
+- `geometry` 保存由实际 tiling 和 `CannessAttrs` 推导出的参数。允许 1–32 个数值键，每个键以英文字母开头，最多 48 个英文字母、数字或下划线。
+- `blocks` 按 block ID 提供完整计数，包含尾块和空闲块。`elements` 是 `elementBasis` 指定的当前 block 工作元素数，`callElements` 逐次累加每个 Level-2 调用处理的元素数。每次调用的逻辑处理长度只计一次，避免把同一次二元调用的两个操作数重复计入。重复处理同一批元素的多次调用分别计入。`elementBasis` 最多 96 个可打印字符。
+- 示例的 `perElementCalls` 为 `4/16 = 0.25`，`averageElementsPerCall` 为 `32/4 = 8`。runner 先跨 block 求和再做除法。分母为零时返回 `null`。
+- 正确性通过后，runner 写入 `runRecord.params.tiling` 和 `runRecord.params.kernelBudget`。有性能分析时也写入 `analysis.kernelBudget`，来源为 `correctness-stdout`。重复、超过 16 KiB、格式错误或计数不完整的行会被忽略。`runRecord.params.launch` 单独记录 `config.json` 中的启动配置。
+
+#### 在 kernel 里上报（模板没有默认注入）
+
+模板不会替你计数，得自己加。最省事的方式是在 `Process()` 里用一个 compile-time 计数器包住每个 Level-2 调用，最后按 block 打印一次：
+
+```cpp
+// op_kernel/kernel.cpp
+namespace {
+__aicore__ inline int32_t BlockIndex()
+{
+    return static_cast<int32_t>(AscendC::GetBlockIdx());
+}
+
+// 每次 Level-2 调用加一次：把元素数记进 callElements
+constexpr int32_t kLevel2CallsPerRow = 8;
+
+__aicore__ inline void ReportBudget(int32_t rows, int64_t elements)
+{
+    if (BlockIndex() != 0) { return; }   // 只在 0 号 block 打印一个代表性 launch
+    AscendC::PRINTF("CANNESS_TILING_REPORT {\"geometry\":{\"tileRows\":%d},"
+                    "\"kernelBudget\":{\"elementBasis\":\"query elements\","
+                    "\"blocks\":[{\"blockIndex\":0,\"level2Calls\":%d,\"elements\":%lld,"
+                    "\"callElements\":%lld}]}}\n",
+                    rows, rows * kLevel2CallsPerRow, static_cast<long long>(elements),
+                    static_cast<long long>(elements) * kLevel2CallsPerRow);
+}
+}
+```
+
+- 多 block 时要为每个 block 各输出一条 `blocks` 项（`blockIndex` 必须从 0 连续），否则整行被忽略——尾块与空闲块也要包含。
+- `elements` 用固定口径（上例是 query 元素数）；`callElements` 逐次累加每次调用实际处理的元素数，同一次二元调用只计一次长度。
+- 该行只用于诊断，不影响精度与性能判定；不需要时不要打印。
+
 ## 3. runner 的调用方式
 
 `run_evaluation` 内部等价于：
@@ -81,11 +127,12 @@ timeout --kill-after=10s 1800s "$PY" /tmp/canness-a/runner-<uuid>.py \
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--runs` | `20` | 请求的应用迭代次数，慢用例可缩减，实际次数见 `runRecord.params.runs` |
-| `--device` | `7` | 导出为 `ASCEND_VISIBLE_DEVICES` |
-| `--lock` | `/tmp/canness/davinci7.lock` | `run_once.sh` 与 `msprof` 的 flock 文件；空字符串关闭 |
+| `--device` | `CANNESS_ASCEND_VISIBLE_DEVICES` 或 `7` | 导出为 `ASCEND_VISIBLE_DEVICES` |
+| `--lock` | `CANNESS_DAVINCI_LOCK` 或 `/tmp/canness/davinci<device>.lock` | `run_once.sh` 与 `msprof` 的 flock 文件；空字符串关闭；设备列表沿用默认的 `davinci7.lock` |
 | `--set-env` | 环境变量或自动探测 | 指定 CANN `set_env.sh`，对应评测插件的 `setEnv` |
 | `--msprof` | `msprof` | 可换成绝对路径 |
 | `--bash` | `bash` | 跑包内脚本的 shell（Windows 本地做 fixture 测试时用绝对路径指向 Git Bash） |
+| `--accuracy-only` | 关闭 | 执行编译和正确性检查，跳过 profiling。与 `--compile-only` 互斥。 |
 
 ## 4. 运行环境（i10 的隐性步骤）
 

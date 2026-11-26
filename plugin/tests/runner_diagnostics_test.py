@@ -41,6 +41,47 @@ class Diagnostics(unittest.TestCase):
             self.assertEqual(r.toolchain_version('/missing', '/selected/bisheng', 'source selected; ', 'selected-bash'), 'Selected compiler 9')
             self.assertEqual(command.call_args.args[1], 'source selected; ')
 
+    def test_device_and_lock_overrides_preserve_default_and_explicit_empty_lock(self):
+        with patch.dict(r.os.environ, {}, clear=True):
+            self.assertEqual(r.resolve_device_settings(), ('7', '/tmp/canness/davinci7.lock'))
+            self.assertEqual(r.resolve_device_settings('2'), ('2', '/tmp/canness/davinci2.lock'))
+            self.assertEqual(r.resolve_device_settings('2', ''), ('2', ''))
+            self.assertEqual(r.resolve_device_settings('2,3'), ('2,3', '/tmp/canness/davinci7.lock'))
+        with patch.dict(r.os.environ, {'CANNESS_ASCEND_VISIBLE_DEVICES': '3', 'CANNESS_DAVINCI_LOCK': '/tmp/custom.lock'}):
+            self.assertEqual(r.resolve_device_settings(), ('3', '/tmp/custom.lock'))
+            self.assertEqual(r.resolve_device_settings('5'), ('5', '/tmp/custom.lock'))
+
+    def test_toolkit_discovery_preserves_the_submission_environment_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            toolkit = base / 'alternate'
+            toolkit.mkdir()
+            fallback = toolkit / 'set_env.sh'
+            fallback.touch()
+            with patch.dict(r.os.environ, {'ASCEND_HOME_PATH': str(toolkit)}), \
+                    patch.object(r, 'SYSTEM_SET_ENV', str(base / 'missing-system')):
+                selected, searched = r.discover_set_env('', home=base, toolkit_home='')
+                self.assertEqual(selected, str(fallback))
+                self.assertIn(str(fallback), searched)
+
+    def test_detect_soc_requires_product_evidence_for_selected_board(self):
+        args = self.args()
+        for output, expected in [('Chip Name : Ascend910_9362\n', 'Ascend910_9362'),
+                                 ('NPU Name : 910B2\n', 'Ascend910B2'),
+                                 ('Chip Name : Ascend910\nNPU Name : 9362\n', 'Ascend910_9362'),
+                                 ('Name : board rev B\n', None),
+                                 ('Chip Name : 910B2\nSoC Version : 950PR\n', None)]:
+            with self.subTest(output=output):
+                with patch.object(r, 'run_command', return_value=subprocess.CompletedProcess([], 0, output, '')) as command:
+                    self.assertEqual(r.detect_soc(args, None), expected)
+                    self.assertEqual(command.call_args_list[0].args[0], ['npu-smi', 'info', '-t', 'board', '-i', '7'])
+
+    def test_detect_soc_can_read_the_selected_npu_from_the_summary_table(self):
+        outputs = [subprocess.CompletedProcess([], 1, '', 'unsupported'), subprocess.CompletedProcess(
+            [], 0, '| 2     910B4 | OK |\n| 7     910B2 | OK |\n', '')]
+        with patch.object(r, 'run_command', side_effect=outputs):
+            self.assertEqual(r.detect_soc(self.args(), None), 'Ascend910B2')
+
     def test_profile_retains_raw_operator_statistic_columns(self):
         with tempfile.TemporaryDirectory() as directory:
             p = Path(directory)
@@ -125,5 +166,97 @@ class Diagnostics(unittest.TestCase):
         self.assertIn('aicoreTimeUs',profile['notCollected'])
         self.assertIn('blockDim',profile['notCollected'])
         self.assertIsNone(profile['op']['aicMacRatio'])
+
+    def evaluate_stdout(self, stdout, *, stderr='', returncode=0, accuracy_only=False):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory)
+            manifest = {'generationId': 'g', 'operatorName': 'op', 'performanceTargetUs': 1}
+            config = {'blockDim': 2, 'tileSize': 64,
+                      'launch': {'block_dim': 2, 'tile_length': 64, 'workspace_bytes': 0},
+                      'requestedLaunch': {'tile_length': 64}}
+            (package / 'manifest.json').write_text(json.dumps(manifest))
+            (package / 'config.json').write_text(json.dumps(config))
+            for name in ('build.sh', 'run_once.sh', 'exe'):
+                (package / name).touch()
+            summary = package / 'op_summary.csv'
+            summary.write_text('Op Name,Task Duration(us),aic_scalar_ratio\nop,5,0.95\n')
+
+            def command(argv, *args, **kwargs):
+                if str(argv[1]).endswith('build.sh'):
+                    return subprocess.CompletedProcess(argv, 0, 'exe\n', '')
+                if str(argv[1]).endswith('run_once.sh'):
+                    return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+                self.fail(f'unexpected command: {argv}')
+
+            profile, error = r.profile_from_csv(package, 'op')
+            with patch.object(r, 'run_command', side_effect=command), \
+                    patch.object(r, 'inspect_environment', return_value={'toolchain': 't'}), \
+                    patch.object(r, 'profile_executable', return_value=(profile, error, '')) as profiler:
+                report = r.evaluate(package, 'g', self.args(accuracy_only=accuracy_only))
+                if accuracy_only:
+                    profiler.assert_not_called()
+                return report
+
+    def test_reports_weighted_call_budget_and_keeps_geometry_distinct_from_launch_config(self):
+        report = self.evaluate_stdout(
+            'CANNESS_RESULT {"badCount":0,"total":17,"maxAbsErr":0,"maxRelErr":0}\n'
+            'CANNESS_TILING_REPORT {"geometry":{"runRows":3,"cosWindowElements":384},'
+            '"kernelBudget":{"elementBasis":"query elements","blocks":['
+            '{"blockIndex":1,"level2Calls":1,"elements":2,"callElements":2},'
+            '{"blockIndex":0,"level2Calls":3,"elements":14,"callElements":30}]}}\n'
+        )
+        self.assertEqual(report['status'], 'perf_fail')
+        params = report['runRecord']['params']
+        self.assertEqual(params['launch'], {'block_dim': 2, 'tile_length': 64, 'workspace_bytes': 0})
+        self.assertEqual(params['requestedLaunch'], {'tile_length': 64})
+        self.assertEqual(params['tiling'], {'runRows': 3, 'cosWindowElements': 384})
+        budget = report['analysis']['kernelBudget']
+        self.assertEqual(params['kernelBudget'], budget)
+        self.assertEqual(budget['source'], 'correctness-stdout')
+        self.assertEqual(budget['elementBasis'], 'query elements')
+        self.assertEqual([block['level2Calls'] for block in budget['blocks']], [3, 1])
+        self.assertEqual((budget['level2Calls'], budget['elements'], budget['callElements']), (4, 16, 32))
+        self.assertEqual((budget['perElementCalls'], budget['averageElementsPerCall']), (0.25, 8))
+        self.assertIn('grouping more elements per Level-2 call', report['analysis']['summary'])
+
+    def test_uses_no_budget_for_missing_invalid_ambiguous_or_unsuccessful_stdout(self):
+        success = 'CANNESS_RESULT {"badCount":0,"maxAbsErr":0}\n'
+        geometry = 'CANNESS_TILING_REPORT {"geometry":{"runRows":3}}\n'
+        for diagnostic in [
+            '', 'CANNESS_TILING_REPORT {\n', geometry + geometry,
+            'CANNESS_TILING_REPORT {"geometry":{"runRows":NaN}}\n',
+            'CANNESS_TILING_REPORT {"geometry":{"runRows":2,"runRows":1}}\n',
+            'CANNESS_TILING_REPORT ' + (' ' * 20000) + '{"geometry":{"runRows":3}}\n',
+            'CANNESS_TILING_REPORT {"kernelBudget":{"elementBasis":"x","blocks":[{'
+            '"blockIndex":0,"level2Calls":0,"elements":2,"callElements":0}]}}\n',
+        ]:
+            with self.subTest(diagnostic=diagnostic[:80]):
+                report = self.evaluate_stdout(success + diagnostic, stderr=geometry)
+                self.assertEqual(report['status'], 'perf_fail')
+                self.assertNotIn('kernelBudget', report['analysis'])
+                self.assertNotIn('tiling', report['runRecord']['params'])
+
+        for stdout, returncode, status in [(success, 1, 'error'),
+                                           ('CANNESS_RESULT {"badCount":1,"maxAbsErr":1}\n', 0, 'accuracy_fail')]:
+            report = self.evaluate_stdout(stdout + geometry, returncode=returncode)
+            self.assertEqual(report['status'], status)
+            self.assertNotIn('tiling', report['runRecord']['params'])
+
+    def test_accuracy_only_preserves_comparison_without_profiling(self):
+        accuracy = 'CANNESS_RESULT {"badCount":0,"total":17,"maxAbsErr":0.0001,"maxRelErr":0.0002}\n'
+        report = self.evaluate_stdout(accuracy, accuracy_only=True)
+        self.assertEqual(report['status'], 'pass')
+        self.assertEqual(report['correctness'], {'ok': True, 'maxRelativeError': 0.0002})
+        self.assertIsNone(report['performance']['kernelTimeUs'])
+        self.assertIsNone(report['analysis'])
+        self.assertIn('accuracy-only', report['summary'])
+        params = report['runRecord']['params']
+        self.assertEqual(params['phase'], 'accuracy-only')
+        self.assertEqual((params['badCount'], params['total'], params['maxAbsErr']), (0, 17, 0.0001))
+        self.assertIsNone(params['phaseTimingsMs']['profileMs'])
+
+        failed = self.evaluate_stdout(accuracy.replace('"badCount":0', '"badCount":2'), accuracy_only=True)
+        self.assertEqual(failed['status'], 'accuracy_fail')
+        self.assertEqual(failed['runRecord']['params']['badCount'], 2)
 
 if __name__ == '__main__': unittest.main()

@@ -8,7 +8,8 @@ What it does for one package:
   2. runs the package's own ``build.sh`` (the last stdout line is the
      executable path) — a missing script is a ``compile_fail``, never guessed;
   3. runs the package's own ``run_once.sh`` and reads its
-     ``CANNESS_RESULT {...}`` line for maxAbsErr / maxRelErr / badCount;
+     ``CANNESS_RESULT {...}`` line for maxAbsErr / maxRelErr / badCount and
+     an optional ``CANNESS_TILING_REPORT {...}`` line for kernel diagnostics;
   4. profiles the executable with the host's real ``msprof`` for ``--runs``
      iterations, pre-creating the output directory and reading the CSV under
      ``mindstudio_profiler_output/``;
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import os
@@ -57,6 +59,9 @@ DEFAULT_RUNS = 20
 DEFAULT_MAX_ABS_ERR = 1e-3
 CONTRACT_ERROR = 'package does not implement build contract v1'
 LOG_LIMIT = 20000
+TILING_REPORT_LIMIT = 16 * 1024
+MAX_LAUNCH_BLOCKS = 128
+MAX_SAFE_INTEGER = (1 << 53) - 1
 CSV_DIR = 'mindstudio_profiler_output'
 # The published Ascend 910 memory hierarchy lists GM->UB at 1.2 TB/s.
 # This is for the original 910, not 910B. Unknown chips stay null until an
@@ -137,7 +142,35 @@ def run_params(manifest: dict, config: dict) -> dict:
         for source in (config, manifest):
             if key in source and key not in params:
                 params[key] = source[key]
+    for key in ('launch', 'requestedLaunch', 'tiling', 'kernelBudget'):
+        params.pop(key, None)
+    launch = launch_fields(config.get('launch'))
+    for key, aliases in {'block_dim': ('blockDim', 'block_dim'),
+                         'tile_length': ('tileSize', 'tile_size')}.items():
+        if key not in launch:
+            for source in (config, config.get('params'), manifest, manifest.get('params')):
+                if isinstance(source, dict):
+                    value = next((source[name] for name in aliases if count(source.get(name), minimum=1)), None)
+                    if value is not None:
+                        launch[key] = value
+                        break
+    if launch:
+        params['launch'] = launch
+    requested = launch_fields(config.get('requestedLaunch'))
+    if requested:
+        params['requestedLaunch'] = requested
     return params
+
+
+def count(value, minimum: int = 0) -> bool:
+    return type(value) is int and minimum <= value <= MAX_SAFE_INTEGER
+
+
+def launch_fields(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    return {key: raw[key] for key, minimum in (('block_dim', 1), ('tile_length', 1), ('workspace_bytes', 0))
+            if count(raw.get(key), minimum)}
 
 
 def tensor_bytes(manifest: dict) -> int | None:
@@ -225,6 +258,14 @@ def discover_set_env(explicit: str, home: Path | None = None,
         return tuple(int(part) for part in re.findall(r'\d+', path.parent.name))
     candidates.extend(sorted(versioned, key=version_key, reverse=True))
     candidates.append(Path(SYSTEM_SET_ENV))
+    ascend_home = os.environ.get('ASCEND_HOME_PATH', '')
+    if ascend_home:
+        candidates.append(Path(ascend_home).expanduser() / 'set_env.sh')
+    candidates.extend(Path(path) for path in (
+        '/home/developer/Ascend/ascend-toolkit/set_env.sh',
+        '/usr/local/Ascend/ascend-toolkit/latest/set_env.sh',
+        '/opt/Ascend/ascend-toolkit/set_env.sh',
+    ))
     searched: list[str] = []
     for path in candidates:
         name = str(path)
@@ -233,7 +274,7 @@ def discover_set_env(explicit: str, home: Path | None = None,
         searched.append(name)
         if path.is_file():
             return name, searched
-    searched.insert(-1, str(home / 'Ascend' / 'cann-*' / 'set_env.sh'))
+    searched.insert(searched.index(str(Path(SYSTEM_SET_ENV))), str(home / 'Ascend' / 'cann-*' / 'set_env.sh'))
     return None, searched
 
 
@@ -243,6 +284,16 @@ def shell_env_prefix(set_env: str | None, device: str) -> str:
         prefix += f'source {shlex.quote(bash_path(set_env))}; '
     prefix += f'export ASCEND_VISIBLE_DEVICES={shlex.quote(device)}; '
     return prefix
+
+
+def resolve_device_settings(device: str | None = None, lock: str | None = None) -> tuple[str, str]:
+    if device is None:
+        device = os.environ.get('CANNESS_ASCEND_VISIBLE_DEVICES', DEFAULT_DEVICE)
+    if lock is None:
+        device_id = (device.lstrip('0') or '0') if re.fullmatch(r'[0-9]+', device) else None
+        default_lock = f'/tmp/canness/davinci{device_id}.lock' if device_id is not None else DEFAULT_LOCK
+        lock = os.environ.get('CANNESS_DAVINCI_LOCK', default_lock)
+    return device, lock
 
 
 def run_command(
@@ -305,8 +356,39 @@ def inspect_environment(args: argparse.Namespace) -> dict:
 
 
 def preflight(args: argparse.Namespace) -> int:
-    print(json.dumps(inspect_environment(args)))
+    facts = inspect_environment(args)
+    facts['detectedSoc'] = detect_soc(args, facts['setEnv'])
+    print(json.dumps(facts))
     return 0
+
+
+def detect_soc(args: argparse.Namespace, set_env: str | None) -> str | None:
+    if not re.fullmatch(r'[0-9]+', args.device):
+        return None
+    prefix = shell_env_prefix(set_env, args.device)
+    product = r'(?:Ascend[ \t]*)?(910(?:B[0-9A-Z]*|_[0-9]{4})?|950[0-9A-Z_]*)'
+
+    def npu_smi(*options: str) -> str:
+        try:
+            inspected = run_command(['npu-smi', 'info', *options], prefix, 5, bash_exe=args.bash)
+        except (OSError, subprocess.TimeoutExpired):
+            return ''
+        return (inspected.stdout or '') if inspected.returncode == 0 else ''
+
+    board = npu_smi('-t', 'board', '-i', args.device)
+    names = set(re.findall(rf'^[ \t]*(?:Chip Name|SoC Version|NPU Name)[ \t]*:[ \t]*{product}[ \t]*$',
+                           board.upper(), re.MULTILINE | re.IGNORECASE))
+    # Board output can split a CANN SoC name across its Chip Name and NPU Name fields.
+    suffixes = re.findall(r'^[ \t]*NPU NAME[ \t]*:[ \t]*([0-9]{4})[ \t]*$', board.upper(), re.MULTILINE)
+    if len(names) == 1:
+        name = next(iter(names))
+        return 'Ascend' + (f'{name}_{suffixes[0]}' if len(suffixes) == 1 and '_' not in name else name)
+    device_id = args.device.lstrip('0') or '0'
+    summary = npu_smi().upper()
+    names = set(re.findall(rf'^\|[ \t]*{device_id}[ \t]+{product}[ \t]*\|',
+                           summary, re.MULTILINE | re.IGNORECASE))
+    names = {'Ascend' + name for name in names}
+    return next(iter(names)) if len(names) == 1 else None
 
 
 def parse_canness_result(stdout: str) -> dict | None:
@@ -320,6 +402,81 @@ def parse_canness_result(stdout: str) -> dict | None:
             return None
         return data if isinstance(data, dict) else None
     return None
+
+
+def unique_object(pairs: list[tuple]) -> dict:
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError('duplicate JSON key')
+    return obj
+
+
+def parse_kernel_budget(raw, configured_blocks: int | None) -> dict | None:
+    if not isinstance(raw, dict) or raw.keys() != {'elementBasis', 'blocks'}:
+        return None
+    basis = raw['elementBasis']
+    blocks = raw['blocks']
+    if (not isinstance(basis, str) or not 1 <= len(basis) <= 96 or not basis.isprintable()
+            or not basis.strip() or not isinstance(blocks, list) or not 1 <= len(blocks) <= MAX_LAUNCH_BLOCKS
+            or (configured_blocks is not None and len(blocks) != configured_blocks)):
+        return None
+    metrics = ('level2Calls', 'elements', 'callElements')
+    for block in blocks:
+        if (not isinstance(block, dict) or block.keys() != {'blockIndex', *metrics}
+                or not all(count(value) for value in block.values())
+                or (block['level2Calls'] == 0 and block['callElements'] != 0)):
+            return None
+    blocks = sorted(blocks, key=lambda block: block['blockIndex'])
+    if any(index != block['blockIndex'] for index, block in enumerate(blocks)):
+        return None
+    totals = {key: sum(block[key] for block in blocks) for key in metrics}
+    if not all(count(value) for value in totals.values()):
+        return None
+    calls = totals['level2Calls']
+    elements = totals['elements']
+    return {
+        'source': 'correctness-stdout', 'elementBasis': basis.strip(), 'blocks': blocks, **totals,
+        'perElementCalls': calls / elements if elements else None,
+        'averageElementsPerCall': totals['callElements'] / calls if calls else None,
+    }
+
+
+def parse_tiling_report(stdout: str, configured_blocks: int | None) -> dict | None:
+    prefix = 'CANNESS_TILING_REPORT '
+    payload = None
+    for line in io.StringIO(stdout):
+        if not line.startswith(prefix):
+            continue
+        if payload is not None or len(line) > TILING_REPORT_LIMIT:
+            return None
+        payload = line[len(prefix):]
+        if len(payload.encode('utf-8', 'replace')) > TILING_REPORT_LIMIT:
+            return None
+    if payload is None:
+        return None
+    try:
+        raw = json.loads(payload, object_pairs_hook=unique_object)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(raw, dict) or not raw or raw.keys() - {'geometry', 'kernelBudget'}:
+        return None
+    result = {}
+    if 'geometry' in raw:
+        geometry = raw['geometry']
+        if not isinstance(geometry, dict) or not 1 <= len(geometry) <= 32:
+            return None
+        for key, value in geometry.items():
+            if (not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,47}', key)
+                    or type(value) not in (int, float)
+                    or not -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER):
+                return None
+        result['tiling'] = geometry
+    if 'kernelBudget' in raw:
+        budget = parse_kernel_budget(raw['kernelBudget'], configured_blocks)
+        if budget is None:
+            return None
+        result['kernelBudget'] = budget
+    return result
 
 
 def normalized_header(value: str) -> str:
@@ -523,7 +680,7 @@ def enrich_launch_metadata(profile: dict, package: Path, params: dict) -> None:
     if block_dim is not None and block_dim.is_integer() and block_dim > 0:
         op['blockDimSource'] = 'msprof'
     else:
-        configured = number(params.get('blockDim', params.get('block_dim')))
+        configured = number(params.get('launch', {}).get('block_dim', params.get('blockDim', params.get('block_dim'))))
         valid = configured is not None and configured.is_integer() and configured > 0
         op['blockDim'] = int(configured) if valid else None
         op['blockDimSource'] = 'launch-config' if valid else None
@@ -664,18 +821,22 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     target = number(manifest.get('performanceTargetUs'))
     operator_name = manifest.get('operatorName') if isinstance(manifest.get('operatorName'), str) else generation
     params = run_params(manifest, config)
+    compile_only = getattr(args, 'compile_only', False)
+    accuracy_only = getattr(args, 'accuracy_only', False)
     if args.runs < 1 or args.runs > 100_000:
         report = make_report(generation, target, summary='--runs must be in 1..100000')
         report['runRecord'] = record(started, params, args)
         return report
     runs = args.runs
-    params['runs'] = runs
-    params['requestedRuns'] = args.runs
-    params['samplingBasis'] = 'fixed-requested-runs'
     params['device'] = args.device
-    params['warmupRuns'] = min(5, runs // 5)
-    params['metricBasis'] = 'msprof-task-duration-us'
-    params['phase'] = 'compile-only' if getattr(args, 'compile_only', False) else 'evaluation'
+    params['lockPath'] = args.lock or None
+    if not accuracy_only:
+        params['runs'] = runs
+        params['requestedRuns'] = args.runs
+        params['samplingBasis'] = 'fixed-requested-runs'
+        params['warmupRuns'] = min(5, runs // 5)
+        params['metricBasis'] = 'msprof-task-duration-us'
+    params['phase'] = 'compile-only' if compile_only else 'accuracy-only' if accuracy_only else 'evaluation'
     params['phaseTimingsMs'] = {'buildMs': None, 'accuracyMs': None, 'profileMs': None}
     args.environment_facts = inspect_environment(args)
     selected_env, searched_env = discover_set_env(args.set_env)
@@ -683,7 +844,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
 
     build = package / 'build.sh'
     run_once = package / 'run_once.sh'
-    if not build.is_file() or (not getattr(args, 'compile_only', False) and not run_once.is_file()):
+    if not build.is_file() or (not compile_only and not run_once.is_file()):
         report = make_report(generation, target, status='compile_fail', summary=CONTRACT_ERROR)
         report['runRecord'] = record(started, params, args)
         return report
@@ -745,7 +906,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         report['runRecord'] = record(started, params, args)
         return report
 
-    if getattr(args, 'compile_only', False):
+    if compile_only:
         report = make_report(generation, target, status='pass', compile_ok=True, compile_log=compile_log,
                              summary='compile-only passed; correctness and performance were not evaluated'
                                      + selfcheck_suffix)
@@ -804,6 +965,10 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     threshold = correctness_threshold(manifest, config)
     correctness_ok = (bad_count == 0 and golden not in ('placeholder', 'shape_error')
                       and (per_element or max_abs_err <= threshold))
+    params['badCount'] = int(bad_count)
+    params['maxAbsErr'] = max_abs_err
+    if total is not None and total.is_integer() and total > 0:
+        params['total'] = int(total)
     if not correctness_ok:
         placeholder = golden == 'placeholder' or int(bad_count) == -1
         shape_error = first_line(correctness_log.split('CANNESS_GOLDEN_ERROR ', 1)[-1]) if golden == 'shape_error' else ''
@@ -823,6 +988,18 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
             compile_log=f'{compile_log}\n{correctness_log}'.strip(),
             max_relative_error=max_rel_err, summary=summary,
         )
+        report['runRecord'] = record(started, params, args)
+        return report
+
+    tiling_report = parse_tiling_report(correctness_run.stdout or '', params.get('launch', {}).get('block_dim'))
+    if tiling_report is not None:
+        params.update(tiling_report)
+
+    if accuracy_only:
+        report = make_report(generation, target, status='pass', compile_ok=True,
+                             compile_log=f'{compile_log}\n{correctness_log}'.strip(), correctness_ok=True,
+                             max_relative_error=max_rel_err,
+                             summary='accuracy-only passed; profiling was skipped' + selfcheck_suffix)
         report['runRecord'] = record(started, params, args)
         return report
 
@@ -867,6 +1044,17 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
                         + (['rooflineUs'] if roofline_us is None else [])
                         + (['achievedBandwidthGBps'] if achieved_bw is None else []),
     }
+    if 'kernelBudget' in params:
+        budget = params['kernelBudget']
+        analysis['kernelBudget'] = budget
+        if (analysis['bottleneck'] == 'scalar' and budget['perElementCalls'] is not None
+                and budget['level2Calls'] > 0):
+            analysis['summary'] += (
+                f" Correctness run reported {budget['perElementCalls']:.4g} Level-2 calls per "
+                f"element ({budget['elementBasis']}), with {budget['averageElementsPerCall']:.4g} "
+                'elements processed per call on average. Check whether grouping more elements per Level-2 call '
+                'reduces scalar overhead.'
+            )
     if target is not None and kernel_time_us > target:
         status = 'perf_fail'
         summary = f'kernel {kernel_time_us:.3f}us exceeds target {target:g}us'
@@ -954,9 +1142,8 @@ def main() -> int:
     parser.add_argument('--loop', action='store_true', help='keep scanning until killed')
     parser.add_argument('--interval', type=int, default=2000, help='loop interval in milliseconds')
     parser.add_argument('--runs', type=int, default=DEFAULT_RUNS, help='msprof application iterations')
-    parser.add_argument('--device', default=os.environ.get('CANNESS_ASCEND_VISIBLE_DEVICES', DEFAULT_DEVICE))
-    parser.add_argument('--lock', default=os.environ.get('CANNESS_DAVINCI_LOCK', DEFAULT_LOCK),
-                        help='flock file shared with other NPU jobs; empty disables locking')
+    parser.add_argument('--device', help='ASCEND_VISIBLE_DEVICES (default: environment or 7)')
+    parser.add_argument('--lock', help='shared flock file (default: environment or per-device lock); empty disables locking')
     parser.add_argument('--set-env', default=os.environ.get('CANNESS_SET_ENV', ''),
                         help='explicit set_env.sh path (default: auto-detect)')
     parser.add_argument('--msprof', default=os.environ.get('CANNESS_MSPROF', 'msprof'))
@@ -965,9 +1152,12 @@ def main() -> int:
     parser.add_argument('--build-timeout', type=int, default=1800)
     parser.add_argument('--run-timeout', type=int, default=600)
     parser.add_argument('--msprof-timeout', type=int, default=1800)
-    parser.add_argument('--compile-only', action='store_true', help='build only; skip accuracy and profiling')
+    phases = parser.add_mutually_exclusive_group()
+    phases.add_argument('--compile-only', action='store_true', help='build only; skip accuracy and profiling')
+    phases.add_argument('--accuracy-only', action='store_true', help='build and check accuracy; skip profiling')
     parser.add_argument('--preflight', action='store_true', help='check the remote CANN toolchain without evaluating')
     args = parser.parse_args()
+    args.device, args.lock = resolve_device_settings(args.device, args.lock)
     if args.preflight:
         return preflight(args)
     if args.inbox is None or args.outbox is None:

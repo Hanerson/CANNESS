@@ -15,6 +15,24 @@ export interface MsprofOp {
   cubeUtilizationPct: number | null
 }
 
+interface KernelBlockBudget {
+  blockIndex: number
+  level2Calls: number
+  elements: number
+  callElements: number
+}
+
+export interface KernelBudget {
+  source: 'correctness-stdout'
+  elementBasis: string
+  blocks: KernelBlockBudget[]
+  level2Calls: number
+  elements: number
+  callElements: number
+  perElementCalls: number | null
+  averageElementsPerCall: number | null
+}
+
 export interface PerformanceAnalysis {
   source: 'msprof'
   bottleneck: 'cube' | 'memory' | 'scalar' | 'unknown'
@@ -24,9 +42,10 @@ export interface PerformanceAnalysis {
   rooflineUs?: number | null
   baselineUs?: number | null
   notCollected?: string[]
+  kernelBudget?: KernelBudget
 }
 
-/** The only accepted origin: numbers came from an actual msprof run. */
+/** The profiler metrics come from an actual msprof run. */
 const SOURCES = ['msprof'] as const
 const BOTTLENECKS = ['cube', 'memory', 'scalar', 'unknown'] as const
 
@@ -64,10 +83,43 @@ function parseOp(raw: unknown): MsprofOp | null {
   }
 }
 
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function parseKernelBudget(raw: unknown): KernelBudget | undefined {
+  if (!isRecord(raw) || raw.source !== 'correctness-stdout' || typeof raw.elementBasis !== 'string'
+    || raw.elementBasis.trim() === '' || Array.from(raw.elementBasis).length > 96 || /[\u0000-\u001f\u007f]/.test(raw.elementBasis)
+    || !Array.isArray(raw.blocks) || raw.blocks.length < 1 || raw.blocks.length > 128) return undefined
+
+  const blocks: KernelBlockBudget[] = []
+  let level2Calls = 0
+  let elements = 0
+  let callElements = 0
+  for (const [blockIndex, block] of raw.blocks.entries()) {
+    if (!isRecord(block) || block.blockIndex !== blockIndex || !isCount(block.level2Calls)
+      || !isCount(block.elements) || !isCount(block.callElements)
+      || (block.level2Calls === 0 && block.callElements !== 0)) return undefined
+    blocks.push({ blockIndex, level2Calls: block.level2Calls, elements: block.elements, callElements: block.callElements })
+    level2Calls += block.level2Calls
+    elements += block.elements
+    callElements += block.callElements
+  }
+  if (!isCount(level2Calls) || !isCount(elements) || !isCount(callElements)
+    || raw.level2Calls !== level2Calls || raw.elements !== elements || raw.callElements !== callElements) return undefined
+
+  const perElementCalls = elements === 0 ? null : level2Calls / elements
+  const averageElementsPerCall = level2Calls === 0 ? null : callElements / level2Calls
+  if (raw.perElementCalls !== perElementCalls || raw.averageElementsPerCall !== averageElementsPerCall) return undefined
+  return { source: 'correctness-stdout', elementBasis: raw.elementBasis, blocks, level2Calls, elements,
+    callElements, perElementCalls, averageElementsPerCall }
+}
+
 export function parseAnalysis(raw: unknown): PerformanceAnalysis | null {
   if (!isRecord(raw)) return null
   if (typeof raw.source !== 'string' || !(SOURCES as readonly string[]).includes(raw.source)) return null
   if (typeof raw.bottleneck !== 'string' || !(BOTTLENECKS as readonly string[]).includes(raw.bottleneck)) return null
+  const kernelBudget = parseKernelBudget(raw.kernelBudget)
   return {
     source: raw.source as PerformanceAnalysis['source'],
     bottleneck: raw.bottleneck as PerformanceAnalysis['bottleneck'],
@@ -77,5 +129,6 @@ export function parseAnalysis(raw: unknown): PerformanceAnalysis | null {
     rooflineUs: numOrNull(raw.rooflineUs),
     baselineUs: numOrNull(raw.baselineUs),
     ...(Array.isArray(raw.notCollected) ? { notCollected: raw.notCollected.filter((item): item is string => typeof item === 'string') } : {}),
+    ...(kernelBudget === undefined ? {} : { kernelBudget }),
   }
 }
