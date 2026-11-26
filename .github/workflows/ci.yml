@@ -43,5 +43,30 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
+      - name: Knowledge base
+        run: pnpm kb:validate
+
+      - name: Remote script syntax
+        shell: bash
+        run: |
+          python3 -m py_compile remote/runner.py remote/validate_submission.py
+          bash -n templates/cannbench/build.sh
+
       - name: Build
         run: pnpm build
+
+      - name: Built lib matches sources
+        shell: bash
+        run: |
+          # dsh loads lib/, so a stale build is a user-visible bug: exports and
+          # evaluations now refuse to run on it. Keep CI honest about that.
+          node -e '
+            import("./lib/package-files.js").then(module => {
+              const fingerprint = module.contractFingerprint();
+              if (fingerprint.staleBuild) {
+                console.error(fingerprint.warnings.join("\n"));
+                process.exit(1);
+              }
+              console.log(`codeSource=${fingerprint.codeSource} lib=${fingerprint.libHash.slice(0, 19)}`);
+            }).catch(error => { console.error(error); process.exit(1); });
+          '

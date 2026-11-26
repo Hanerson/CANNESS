@@ -4,6 +4,45 @@
 
 ## [Unreleased]
 
+这一轮把"目标硬件、能力边界、提交物验收"三件事从文档承诺变成插件能力，并让构建错误在导出前暴露。
+
+### 新增
+
+- **目标硬件声明与二次确认**：`target_platform` 支持 `arch_family`、`mode`（`pinned`/`portable`）与
+  `confirmation`；`submit_spec` 新增 `detected_soc`、`confirm_target`，探测型号与声明不一致（或首次声明
+  可移植目标）时先返回 `declared`/`detected`/`requiresConfirmation`，用户确认后才创建 generation。
+  910B 与 A3（910C）映射到 `dav-2201`，950 映射到 `dav-3510`。
+- **CANNBench 导出按微架构编译**：`build.sh` 用 `-xasc --npu-arch=…`，先用独立设备 TU 探测编译器方言，
+  910B 保留 `-x cce --cce-soc-version=` 回退；`--soc` 接受短名与完整部件名，不再有白名单式 `exit 2`；
+  构建结束把实际方言、参数与工具链写入 `dist/build-env.txt`。
+- **导出可覆盖构建脚本**：`export_submission({ build_script })` 支持算子级 `build.sh`，
+  `provenance.json` 记录脚本与模板 SHA-256；`export_submission({ target_soc })` 让可移植 generation
+  选择目标微架构。
+- **能力矩阵**：`spec.support` 声明 dtype × 属性组合、最小地址对齐与自定义 wrapper 参数，
+  导出时生成守卫，不支持的组合抛 `UnsupportedConfiguration`（与 `failed` 区分）。
+- **提交包验收**：`validate_submission({ cases_file })` 支持 CSv 驱动的多 case 回归（每 case 独立进程，
+  通过 `CANNESS_CASE_JSON` 传参），报告收敛为 `validated`/`partial`/`unsupported`/`blocked`/`failed`；
+  `run_evaluation({ submission })` 在精度通过后自动附上同一 generation、同一包哈希的验收结果。
+- **独立探针**：`probe_run({ kernel, golden, spec?, record? })` 在临时沙箱里构建并比对，不修改当前
+  generation、不消耗评测预算；`record` 可写入工作区知识库，用 `kb_search({ include_probes: true })` 检索。
+- **调用预算**：kernel 打印 `CANNESS_TILING_REPORT` 后，runner 解析为 `analysis.kernelBudget`
+  （每 block 的 Level-2 调用数、元素数、每次调用元素数）与 `runRecord.params.tiling`。
+- **设备与锁一致**：`run_evaluation` 与 `validate_submission` 共用 `--device` / `--lock`，
+  校验器与 runner 使用同一套 `ASCEND_VISIBLE_DEVICES` 与 `flock`。
+
+### 修复
+
+- 过期的 `lib` 现在是构建错误：`export_submission` 与 `run_evaluation` 在 `staleBuild` 时直接拒绝并提示
+  `pnpm build`，不再以 `unbound CANNBench template token {{TARGET_SOC}}` 的形式失败。
+- 自定义 wrapper 的 `interface.attrs` 必须是公开签名的参数（或声明在 `support.wrapper_attrs`），
+  否则导出报错——避免能力矩阵的行永远匹配不上，静默失去约束。
+- 校验器把设备故障（`device_fault`）与设备不可用（`device_unavailable`）分开报告，后者不再算失败。
+
+### 变更（破坏性）
+
+- `target_platform` 现在必须可解析：写 `arch_family`，或用 910B/A3/950 的短名/部件名；其余型号必须显式
+  声明 `mode: "portable"`。升级后首次 `submit_spec`/`export_submission` 可能因此被拒，按提示补声明即可。
+
 ## [0.5.0] - 2026-11-24
 
 修掉 2026-11-19 SwiGLU 实践里**阻塞全部评测**的四个 P0，并补上受支持的包修补通道。
