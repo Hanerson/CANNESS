@@ -3,10 +3,25 @@ import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join, posix } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { runnerScriptFile } from './eval-run.js'
 import { shellQuote, type RemoteHost } from './remote.js'
 import type { JsonValue } from './report.js'
 
-export interface SubmissionValidationInput { sourceDir: string; remoteRoot: string; setEnv?: string; testScript?: string; timeoutSec?: number }
+export interface SubmissionValidationInput {
+  sourceDir: string
+  remoteRoot: string
+  setEnv?: string
+  testScript?: string
+  timeoutSec?: number
+  casesFile?: string
+  caseTimeoutSec?: number
+  device?: string
+  deviceLock?: string
+}
+
+export function unverifiedSubmissionStages(): JsonValue {
+  return { build: { status: 'unverified' }, install: { status: 'unverified' }, call: { status: 'unverified' }, accuracy: { status: 'unverified' } }
+}
 function checkSources(root: string): void {
   const actual = new Set<string>()
   const walk = (dir: string, prefix = '') => {
@@ -30,22 +45,34 @@ function checkSources(root: string): void {
 export async function validateSubmission(files: RemoteHost, input: SubmissionValidationInput): Promise<JsonValue> {
   const timeout = Math.max(1, Math.min(3600, Math.round(input.timeoutSec ?? 600)))
   const remoteDir = posix.join(input.remoteRoot, `submission-validation-${randomUUID()}`)
-  const failure = (reason: string): JsonValue => ({ status: 'failed', correctness: 'unverified', remoteDir, reason })
+  const failure = (reason: string): JsonValue => ({ status: 'failed', correctness: 'unverified', stages: unverifiedSubmissionStages(), remoteDir, reason })
   const temp = mkdtempSync(join(tmpdir(), 'canness-submission-validation-'))
   try {
     checkSources(input.sourceDir)
+    if (input.device && !/^\d+$/.test(input.device)) throw new Error('device ID must be a nonnegative integer')
+    if (input.casesFile) {
+      if (!input.testScript) throw new Error('cases_file requires a test_script')
+      const stat = lstatSync(input.casesFile)
+      if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error('cases_file must be a regular CSV file of at most 1 MiB')
+    }
     await files.mkdirp(remoteDir)
     await files.uploadDir(input.sourceDir, posix.join(remoteDir, 'source'))
     const built = fileURLToPath(new URL('../../remote/validate_submission.py', import.meta.url))
     const runner = existsSync(built) ? built : fileURLToPath(new URL('../remote/validate_submission.py', import.meta.url))
     await files.put(runner, posix.join(remoteDir, 'validate_submission.py'))
+    await files.put(runnerScriptFile(), posix.join(remoteDir, 'runner.py'))
     if (input.testScript !== undefined) {
       writeFileSync(join(temp, 'test.py'), input.testScript)
       await files.put(join(temp, 'test.py'), posix.join(remoteDir, 'test.py'))
     }
+    if (input.casesFile) await files.put(input.casesFile, posix.join(remoteDir, 'cases.csv'))
     const command = `python3 ${shellQuote(posix.join(remoteDir, 'validate_submission.py'))} --root ${shellQuote(remoteDir)} --timeout-sec ${timeout}`
       + (input.setEnv ? ` --set-env ${shellQuote(input.setEnv)}` : '')
       + (input.testScript !== undefined ? ' --test-script test.py' : '')
+      + (input.device ? ` --device-id ${shellQuote(input.device)}` : '')
+      + (input.deviceLock !== undefined ? ` --lock ${shellQuote(input.deviceLock)}` : '')
+      + (input.casesFile ? ' --cases-file cases.csv' : '')
+      + (input.caseTimeoutSec === undefined ? '' : ` --case-timeout-sec ${Math.max(1, Math.min(3600, Math.round(input.caseTimeoutSec)))}`)
     const result = await files.exec(command)
     const line = result.stdout.split(/\r?\n/).filter(row => row.startsWith('CANNESS_SUBMISSION_REPORT ')).at(-1)
     if (!line) return failure(`runner exited ${result.code}: ${result.stderr.slice(-4000)}`)

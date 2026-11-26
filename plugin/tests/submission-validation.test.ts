@@ -33,3 +33,21 @@ test('tampered files are rejected before upload or execution', async () => {
   expect(remote.execCalls).toHaveLength(0)
   expect(remote.files.size).toBe(0)
 })
+
+test('passes shared device settings and stages the official CSV for the remote comparator', async () => {
+  const sourceDir = mkdtempSync(join(tmpdir(), 'submission-validation-'))
+  writeFileSync(join(sourceDir, 'provenance.json'), '{"files":{}}')
+  const casesFile = join(sourceDir, '..', `${sourceDir.split(/[\\/]/).at(-1)}.csv`)
+  const csv = 'operator,case_id,dtype,attrs\nScan,1,float16,{}\n'
+  writeFileSync(casesFile, csv)
+  const remote = new MemoryRemote()
+  remote.execHandler = () => ({ code: 0, stdout: 'CANNESS_SUBMISSION_REPORT {"status":"blocked","failureKind":"device_unavailable","correctness":"unverified"}\n', stderr: '' })
+  const report = await validateSubmission(remote, { sourceDir, remoteRoot: '/diagnostics', casesFile, testScript: 'print(1)', device: '3', deviceLock: '/tmp/ascend lock', caseTimeoutSec: 12 })
+  expect(report).toMatchObject({ status: 'blocked', failureKind: 'device_unavailable' })
+  expect(remote.execCalls[0]).toMatch(/--device-id '?3'? --lock '\/tmp\/ascend lock'/)
+  expect(remote.execCalls[0]).toContain('--case-timeout-sec 12')
+  expect(remote.execCalls[0]).toContain('--cases-file cases.csv')
+  const staged = [...remote.files.entries()].find(([path]) => path.endsWith('/cases.csv'))
+  expect(staged && Buffer.from(staged[1]).toString('utf8')).toBe(csv)
+  expect([...remote.files.keys()].some(path => path.endsWith('/runner.py'))).toBe(true)
+})
