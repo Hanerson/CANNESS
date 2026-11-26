@@ -10,9 +10,11 @@ export function sameSourceContract(left: OperatorSpec, right: OperatorSpec): boo
   const normalize = (value: unknown): unknown => Array.isArray(value) ? value.map(normalize)
     : value !== null && typeof value === 'object'
       ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, normalize(item)])) : value
-  const { performance_target: _left, ...a } = left
-  const { performance_target: _right, ...b } = right
-  return JSON.stringify(normalize(a)) === JSON.stringify(normalize(b))
+  const sourceContract = ({ performance_target: _timing, target_platform, ...rest }: OperatorSpec) => {
+    const { confirmation: _confirmation, ...platform } = target_platform
+    return { ...rest, target_platform: platform }
+  }
+  return JSON.stringify(normalize(sourceContract(left))) === JSON.stringify(normalize(sourceContract(right)))
 }
 export function carrySources(workspace: string, previous: string, next: string): boolean {
   const source = join(workspace, 'operators', previous)

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -9,7 +10,7 @@ import { newGenerationId } from './ids.js'
 import { buildTestPackage, checkKernelEntry, contractFingerprint, KERNEL_ENTRY, packageHash, repairPackage } from './package-files.js'
 import { parseProvenance } from './provenance.js'
 import { emptyState } from './policy.js'
-import { parseSpec } from './spec.js'
+import { compareTargetPlatform, parseSpec } from './spec.js'
 import { saveState } from './state-file.js'
 import { assertTaskOwnership, claimTaskOwnership, taskSessionId } from './task-ownership.js'
 import { exportSubmission } from './submission.js'
@@ -37,23 +38,33 @@ export function apply(ctx: Context, config: Config): void {
       'stall window carry over, so a new generation is a new artifact rather than a fresh allowance.',
       'Pass reset: true to start the budget over deliberately. Compatible source layers, golden.h and provenance carry forward independently of budget reset.',
       'A target_us larger than the previous spec\'s is recorded and reported as a relaxed target.',
+      'Declare 910B, A3 (ascend910_93), or 950 hardware in target_platform. Pass detected_soc from remote preflight to compare it with the declaration.',
+      'On a mismatch or a portable declaration, relay the comparison to the user and resubmit with confirm_target only after they confirm their intended hardware.',
     ].join(' '),
     parameters: {
       spec: { type: 'json', required: true, description: 'Operator spec JSON from design doc 02 section 3.1' },
       reset: { type: 'boolean', description: 'Restart the iteration budget instead of carrying it over.' },
+      detected_soc: { type: 'string', description: 'Detected SoC returned by remote preflight, used only as a suggestion.' },
+      confirm_target: { type: 'boolean', description: 'The user has confirmed the declared target or portable intent after reviewing the hardware comparison.' },
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          generationId: { type: 'string', required: true },
-          workspace: { type: 'string', required: true },
-          operator_name: { type: 'string', required: true },
-          carriedOver: { type: 'boolean', required: true },
-          carriedLayers: { type: 'boolean', required: true },
-          needsLayers: { type: 'boolean', required: true },
-          relaxedTargetFromUs: { required: true, oneOf: [{ type: 'number' }, { type: 'null' }] },
+          generationId: { type: 'string' },
+          workspace: { type: 'string' },
+          operator_name: { type: 'string' },
+          carriedOver: { type: 'boolean' },
+          carriedLayers: { type: 'boolean' },
+          needsLayers: { type: 'boolean' },
+          relaxedTargetFromUs: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+          requiresConfirmation: { type: 'boolean' },
+          declared: { type: 'json' },
+          detected: { type: 'json' },
+          detectedSoc: { type: 'json' },
+          ok: { type: 'boolean' },
+          hint: { type: 'string' },
         },
       },
       render: (_args, value) => render(value),
@@ -63,6 +74,17 @@ export function apply(ctx: Context, config: Config): void {
       const path = statePath(workspace)
       const prior = assertTaskOwnership(path, 'submit_spec', exec)
       const spec = parseSpec(args.spec)
+      const previousPlatform = prior.spec?.operator_name === spec.operator_name ? prior.spec.target_platform : undefined
+      const { confirmation, ...previousDeclaration } = previousPlatform ?? {}
+      const sameDeclaration = isDeepStrictEqual(previousDeclaration, spec.target_platform)
+      const detectedSoc = args.detected_soc ?? (sameDeclaration ? confirmation?.detectedSoc ?? undefined : undefined)
+      if (sameDeclaration && confirmation?.detectedSoc === (detectedSoc ?? null)) spec.target_platform.confirmation = confirmation
+      const target = compareTargetPlatform(spec.target_platform, detectedSoc)
+      if (!target.declared && spec.target_platform.mode !== 'portable') throw new Error(`Declare target_platform hardware. ${target.hint}`)
+      if (target.requiresConfirmation && args.confirm_target !== true) return target
+      if (args.confirm_target === true || (args.detected_soc !== undefined && !spec.target_platform.confirmation)) {
+        spec.target_platform.confirmation = { confirmed: args.confirm_target === true, detectedSoc: target.detectedSoc }
+      }
       const generationId = newGenerationId(randomUUID())
       // The budget is per operator, not per generation id: resubmitting the same
       // operator must not hand the loop a fresh allowance, or the stop
@@ -218,11 +240,13 @@ export function apply(ctx: Context, config: Config): void {
   }))
   ctx.tools.register(defineTool({
     name: 'export_submission',
-    description: 'Export the current same-shape operator package as CANNBench direct-launch source and zip. Works offline. Use callable to match the official task signature, e.g. exp. Build and verify the wheel on the target NPU.',
+    description: 'Export the current same-shape operator package as CANNBench direct-launch source and zip. Works offline. Use callable to match the official task signature, e.g. exp. Use build_script to replace the CANNBench build script. Build and verify the wheel on the target NPU.',
     parameters: {
       callable: { type: 'string', description: 'Public Python callable name. Defaults to the operator name in the spec.' },
       wrapper: { type: 'string', description: 'Complete task-specific cann_bench/__init__.py source. Requires an explicit signature and participates in provenance hashes.' },
       signature: { type: 'string', description: 'Expected public Python signature, e.g. cummin(input, dim). Custom wrappers must declare it.' },
+      build_script: { type: 'string', description: 'Complete export-specific build.sh source. It is normalized to LF and hashed in provenance.' },
+      target_soc: { type: 'string', description: 'Opt-in export target. Pinned generations accept the same microarchitecture. Portable generations can target 910B, A3 (ascend910_93), or 950.' },
     },
     output: {
       schema: {
@@ -235,6 +259,8 @@ export function apply(ctx: Context, config: Config): void {
           callable: { type: 'string', required: true },
           signature: { type: 'string', required: true },
           validation: { type: 'json' },
+          targetPlatform: { type: 'json' },
+          build: { type: 'json' },
         },
       },
       render: (_args, value) => render(value),
@@ -243,7 +269,9 @@ export function apply(ctx: Context, config: Config): void {
       const workspace = resolveWorkspace(config.workspace, exec)
       const state = claimTaskOwnership(statePath(workspace), 'export_submission', exec)
       if (state.generationId == null || state.spec == null) throw new Error('submit_spec first')
-      return exportSubmission(workspace, state.generationId, state.spec, args.callable, { wrapper: args.wrapper, signature: args.signature })
+      return exportSubmission(workspace, state.generationId, state.spec, args.callable, {
+        wrapper: args.wrapper, signature: args.signature, buildScript: args.build_script, targetSoc: args.target_soc,
+      })
     },
   }))
   ctx.tools.register(defineTool({
@@ -297,6 +325,7 @@ export function apply(ctx: Context, config: Config): void {
       'manifest.packageHash and the workspace state hash, so run_evaluation and export_submission accept the result.',
       'Paths are package-relative and must not escape the package. manifest.json is rewritten and cannot be patched.',
       'A later build_test_package still starts from operators/<generationId> and discards these edits.',
+      'Editing build.sh changes the evaluation build. Use export_submission with build_script to override the CANNBench export build.',
     ].join(' '),
     parameters: {
       drop: {
@@ -326,6 +355,7 @@ export function apply(ctx: Context, config: Config): void {
           packageHash: { type: 'string', required: true },
           dropped: { type: 'array', items: { type: 'string' }, required: true },
           written: { type: 'array', items: { type: 'string' }, required: true },
+          note: { type: 'string' },
         },
       },
       render: (_args, value) => render(value),
@@ -338,6 +368,13 @@ export function apply(ctx: Context, config: Config): void {
       const result = repairPackage(workspace, state.generationId, { drop: args.drop, write: args.write })
       const pendingStage = state.lastEvaluatedHash === result.packageHash && state.pendingStage == null ? null : 'run_evaluation'
       saveState(path, { ...state, packageHash: result.packageHash, pendingStage })
+      const changedBuild = [...result.written, ...result.dropped].some(path => {
+        const normalized = path.trim().replace(/\\/g, '/').replace(/^\.\//, '')
+        return (process.platform === 'win32' ? normalized.toLowerCase() : normalized) === 'build.sh'
+      })
+      if (changedBuild) {
+        return { ...result, note: 'Changed the evaluation build script. Use export_submission with build_script to override the CANNBench export build.' }
+      }
       return result
     },
   }))

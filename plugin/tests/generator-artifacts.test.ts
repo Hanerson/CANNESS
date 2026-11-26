@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, test } from 'vitest'
@@ -60,4 +60,47 @@ test('timing target changes preserve compatible sources independently of budget 
   expect(await call('submit_spec', { spec })).toMatchObject({ carriedLayers: false, needsLayers: true })
   await call('write_operator', { kernel, host: 'host', api: 'api', plugin: 'plugin' })
   expect(await call('submit_spec', { spec: { ...spec, performance_target: { metric: 'kernel_time', target_us: 40 } } })).toMatchObject({ carriedLayers: true, needsLayers: false, carriedOver: true })
+})
+
+test('submit_spec requires a recognizable declaration and a mismatched probe needs confirmation', async () => {
+  const { workspace, call } = setup()
+  const target = { ...spec, target_platform: { chip: 'A3', arch_family: 'ascend910_93', soc_version: 'Ascend910_9362' } }
+  await expect(call('submit_spec', { spec: { ...spec, target_platform: { chip: 'unknown' } } }))
+    .rejects.toThrow(/ascend910b.*ascend910_93.*ascend950/)
+  await expect(call('submit_spec', { spec: target, detected_soc: 'Ascend910B2' })).resolves.toMatchObject({
+    requiresConfirmation: true,
+    declared: { archFamily: 'ascend910_93', npuArch: 'dav-2201' },
+    detected: { archFamily: 'ascend910b', npuArch: 'dav-2201' },
+  })
+  const stateFile = join(workspace, '.canness', 'state.json')
+  expect(existsSync(stateFile)).toBe(false)
+  await expect(call('submit_spec', { spec: target, detected_soc: 'Ascend910B2', confirm_target: true })).resolves.toHaveProperty('generationId')
+  const { spec: stored } = JSON.parse(readFileSync(stateFile, 'utf8'))
+  expect(stored.target_platform.confirmation).toEqual({ confirmed: true, detectedSoc: 'Ascend910B2' })
+  await call('write_operator', { kernel, host: 'host', api: 'api', plugin: 'plugin' })
+  const { packageDir } = await call('build_test_package')
+  expect(JSON.parse(readFileSync(join(packageDir, 'config.json'), 'utf8'))).toMatchObject({
+    socVersion: 'Ascend910_9362', targetPlatform: stored.target_platform,
+  })
+})
+
+test('repair_package directs evaluation build changes to the explicit export override', async () => {
+  const { call } = setup()
+  await call('submit_spec', { spec })
+  await call('write_operator', { kernel, host: 'host', api: 'api', plugin: 'plugin' })
+  await call('build_test_package')
+  await expect(call('repair_package', { write: [{ path: './build.sh', content: '#!/bin/bash\n' }] }))
+    .resolves.toHaveProperty('note', expect.stringMatching(/evaluation.*export_submission.*build_script/))
+})
+
+test('an unchanged portable target carries its confirmation into the next generation', async () => {
+  const { call } = setup()
+  const portable = { ...spec, target_platform: { chip: 'Ascend910B2', mode: 'portable' } }
+  await expect(call('submit_spec', { spec: portable })).resolves.toMatchObject({ requiresConfirmation: true })
+  await expect(call('submit_spec', { spec: portable, confirm_target: true })).resolves.toHaveProperty('generationId')
+  await call('write_operator', { kernel, host: 'host', api: 'api', plugin: 'plugin' })
+  await expect(call('submit_spec', { spec: portable })).resolves.toMatchObject({ carriedLayers: true })
+  await call('build_test_package')
+  await expect(call('export_submission', { target_soc: 'ascend950', build_script: '#!/bin/bash\necho custom\n' }))
+    .resolves.toMatchObject({ targetPlatform: { selected: { npuArch: 'dav-3510' } }, build: { source: 'override' } })
 })
