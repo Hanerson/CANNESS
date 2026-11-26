@@ -222,3 +222,14 @@ test('custom wrapper exports shape-changing mixed output dtype variants and reje
 })
 
 
+
+test('the generated wrapper keeps the tiling block alive for the asynchronous launch', () => {
+  const { workspace, generation, spec } = exportFixture()
+  const { sourceDir } = exportSubmission(workspace, generation, spec, 'exp')
+  const source = readFileSync(join(sourceDir, 'cann_bench', '__init__.py'), 'utf8')
+  // The kernel reads the tiling block after the call returns; a per-call
+  // allocation gets recycled and the kernel builds its geometry from garbage.
+  expect(source).toContain('def _tiling_buffer(')
+  expect(source).toMatch(/_tiling = _tiling_buffer\(/)
+  expect(source).not.toMatch(/_tiling = _torch\.empty\(/)
+})

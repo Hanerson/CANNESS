@@ -19,6 +19,26 @@ def _bind(variant):
 _launchers = {dtype: _bind(variant) for dtype, variant in { {{PY_VARIANTS}} }.items()}
 
 
+def _tiling_buffer(device, capacity):
+    """One tiling block per device, kept for the process lifetime.
+
+    The kernel launch is asynchronous and reads the tiling block *after* this
+    function returns. A per-call allocation is therefore freed while the kernel
+    may still be reading it, and the caching allocator can hand the block to the
+    next allocation: the kernel then builds its geometry from recycled bytes.
+    That shows up as unrelated wrong results on large inputs, or as a device
+    fault in the middle of an unrelated launch.
+    """
+    created = _builtins.getattr(_tiling_buffer, "cache", None)
+    if created is None:
+        created = _tiling_buffer.cache = {}
+    key = (_builtins.id(device), capacity)
+    buffer = created.get(key)
+    if buffer is None:
+        buffer = created[key] = _torch.empty((capacity,), dtype=_torch.uint8, device=device)
+    return buffer
+
+
 def {{OPERATOR}}({{PY_PARAMS}}):
     """Launch the CANNESS kernel on contiguous NPU input tensors."""
     _tensors = ({{PY_INPUTS}},)
@@ -39,7 +59,7 @@ def {{OPERATOR}}({{PY_PARAMS}}):
         if _total:
             {{PY_ATTR_SETUP}}
             _capacity = {{TILING_CAPACITY}}{{PY_ATTR_BYTES}}
-            _tiling = _torch.empty((_capacity,), dtype=_torch.uint8, device=_first.device)
+            _tiling = _tiling_buffer(_first.device, _capacity)
             _stream = _torch_npu.npu.current_stream(_first.device).npu_stream
             _status = _launch(*(tensor.data_ptr() for tensor in (*_tensors, *_outputs)),
                               _total, _stream, _tiling.data_ptr(), _capacity{{PY_ATTR_ARGS}})
