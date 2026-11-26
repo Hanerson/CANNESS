@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { malformedReport, parseReport, stoppedReport, timeoutReport, type EvalReport, type JsonValue } from './report.js'
 import { applyReport, canForceEvaluation, stopReason, type PolicyConfig, type TaskState } from './policy.js'
 import { firstLines, shellQuote, waitForRemoteFile, type RemoteHost } from './remote.js'
-import { packageHash } from './package-files.js'
+import { packageHash, requireFreshBuild } from './package-files.js'
 
 /** Where `runner.py` sits relative to the built module (`lib/eval-run.js`). */
 const RUNNER_FROM_LIB = '../../remote/runner.py'
@@ -22,8 +22,11 @@ export interface RunInput {
   state: TaskState
   config: PolicyConfig
   setEnv?: string
+  device?: string
+  deviceLock?: string
   force?: boolean
   compileOnly?: boolean
+  accuracyOnly?: boolean
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   /** Per-run temporary-name source; tests pin it so command strings are stable. */
@@ -55,23 +58,33 @@ export function runnerCommand(input: {
   generationId: string
   timeoutSec: number
   setEnv?: string
+  device?: string
+  deviceLock?: string
   compileOnly?: boolean
+  accuracyOnly?: boolean
 }): string {
   const timeout = `if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout --kill-after=10s ${Math.max(1, Math.round(input.timeoutSec))}s"; else TIMEOUT=""; fi; `
   return `${findPython}${timeout}$TIMEOUT "$PY" ${shellQuote(input.runnerPath)}`
     + ` --inbox ${shellQuote(input.inbox)} --outbox ${shellQuote(input.outbox)}`
     + ` --generation ${shellQuote(input.generationId)} --once`
     + (input.setEnv ? ` --set-env ${shellQuote(input.setEnv)}` : '')
+    + deviceFlags(input)
     + (input.compileOnly ? ' --compile-only' : '')
+    + (input.accuracyOnly ? ' --accuracy-only' : '')
 }
 
 const findPython = 'PY=$(command -v python3 || command -v python) || { echo "python3 not found on remote" >&2; exit 127; }; '
 
+function deviceFlags(input: { device?: string; deviceLock?: string }): string {
+  return (input.device ? ` --device ${shellQuote(input.device)}` : '')
+    + (input.deviceLock ? ` --lock ${shellQuote(input.deviceLock)}` : '')
+}
+
 /** Run the runner's toolchain check from stdin, without creating remote files. */
-export async function preflightToolchain(files: RemoteHost, setEnv: string): Promise<JsonValue> {
+export async function preflightToolchain(files: RemoteHost, setEnv: string, device?: string, deviceLock?: string): Promise<JsonValue> {
   const script = readFileSync(runnerScriptFile()).toString('base64')
   const result = await files.exec(`${findPython}printf %s ${shellQuote(script)} | base64 -d | "$PY" - --preflight`
-    + (setEnv ? ` --set-env ${shellQuote(setEnv)}` : ''))
+    + (setEnv ? ` --set-env ${shellQuote(setEnv)}` : '') + deviceFlags({ device, deviceLock }))
   if (result.code !== 0) {
     throw new Error(firstLines(result.stderr, 4) || `CANN toolchain probe exited with code ${result.code}`)
   }
@@ -106,11 +119,13 @@ export async function runEvaluation(input: RunInput): Promise<{
   resultWritten: boolean
   resultsPath?: string
 }> {
+  requireFreshBuild()
   const reason = stopReason(input.state, input.config)
-  if (reason && !input.compileOnly && !(input.force && canForceEvaluation(input.state, input.config))) {
+  const diagnostic = input.compileOnly || input.accuracyOnly
+  if (reason && !diagnostic && !(input.force && canForceEvaluation(input.state, input.config))) {
     return { report: stoppedReport(input.generationId, reason), state: input.state, resultWritten: false }
   }
-  const fold = (report: EvalReport): TaskState => input.compileOnly ? input.state
+  const fold = (report: EvalReport): TaskState => diagnostic ? input.state
     : { ...applyReport({ ...input.state, packageHash: input.state.packageHash ?? packageHash(input.localPackageDir) }, report),
         forcedRunsAfterStop: (input.state.forcedRunsAfterStop ?? 0) + (reason && input.force ? 1 : 0) }
   const manifestPath = join(input.localPackageDir, 'manifest.json')
@@ -145,7 +160,10 @@ export async function runEvaluation(input: RunInput): Promise<{
       generationId: generation,
       timeoutSec: Math.round(input.timeoutMs / 1000),
       setEnv: input.setEnv,
+      device: input.device,
+      deviceLock: input.deviceLock,
       compileOnly: input.compileOnly,
+      accuracyOnly: input.accuracyOnly,
     }))
     if (started.code === 124) {
       const report = timeoutReport(input.generationId, Math.round(input.timeoutMs / 1000))

@@ -1,6 +1,6 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
-import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path'
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -18,8 +18,11 @@ import { stoppedReport, type EvalReport, type JsonValue } from './report.js'
 import { canForceEvaluation, stopReason, targetGap, type PolicyConfig, type StopReason, type TaskState } from './policy.js'
 import { resolveWorkspace, statePath } from './workspace.js'
 import { checkGolden, checkKernel } from './local-validation.js'
-import { validateSubmission } from './submission-validation.js'
+import { unverifiedSubmissionStages, validateSubmission } from './submission-validation.js'
 import { assertTaskOwnership, claimTaskOwnership } from './task-ownership.js'
+import { runIntrinsicProbe } from './intrinsic-probe.js'
+import { parseProbeConclusion, recordProbeConclusion } from './probe-knowledge.js'
+import { compareTargetPlatform, resolveSoc, type TargetPlatform } from './spec.js'
 
 export const name = 'canness-eval'
 export const inject = ['tools']
@@ -45,6 +48,9 @@ export interface Config {
   pollIntervalMs: Volatile<number>
   /** Empty means the remote runner auto-detects CANN's set_env.sh. */
   setEnv: Volatile<string>
+  /** Empty uses the remote runner default. */
+  device?: Volatile<string>
+  deviceLock?: Volatile<string>
   /** Explicit additional read-only remote roots. Empty by default. */
   readRoots?: Volatile<string[]>
   maxIterations: Volatile<number>
@@ -71,6 +77,8 @@ export const Config = z.object({
   timeoutSec: z.number().required().volatile(),
   pollIntervalMs: z.number().required().volatile(),
   setEnv: z.string().default('').volatile(),
+  device: z.string().default('').volatile(),
+  deviceLock: z.string().default('').volatile(),
   readRoots: z.array(z.string()).default([]).volatile(),
   maxIterations: z.number().required().volatile(),
   maxCompileRetries: z.number().required().volatile(),
@@ -127,6 +135,8 @@ function snapshot(config: Config) {
     timeoutSec: config.timeoutSec.get(),
     pollIntervalMs: config.pollIntervalMs.get(),
     setEnv: config.setEnv?.get?.() ?? '',
+    device: config.device?.get?.() ?? '',
+    deviceLock: config.deviceLock?.get?.() ?? '',
     readRoots: config.readRoots?.get?.() ?? [],
   }
 }
@@ -334,6 +344,52 @@ type RunEvaluationValue = EvalReport & {
   compileOnly?: boolean
   artifactsPersistent?: boolean
   artifactWarning?: string
+  submission?: JsonValue
+}
+
+const submissionParameters = {
+  source_dir: { type: 'string', required: true, description: 'Exported source directory inside the workspace, containing provenance.json.' },
+  test_script: { type: 'string', description: 'Python comparator. Invoke the installed cann_bench public callable, synchronize and compare with an independent reference. Emit CANNESS_VALIDATION JSON with boolean ok and optional numeric mere and mare.' },
+  cases_file: { type: 'string', description: 'Workspace CSV with a case_id column. Requires test_script. Each row is passed as CANNESS_CASE_JSON to a fresh Python process.' },
+  case_timeout_sec: { type: 'number', description: 'Per-case timeout in seconds (default 120, bounded by the total validation timeout).' },
+} as const
+
+type SubmissionArgs = {
+  source_dir: string
+  test_script?: string
+  cases_file?: string
+  case_timeout_sec?: number
+}
+
+function workspaceInput(workspace: string, path: string, label: string): string {
+  const absolute = resolve(workspace, path)
+  const within = relative(realpathSync(workspace), realpathSync(absolute))
+  if (within === '..' || within.startsWith(`..${sep}`) || isAbsolute(within)) throw new Error(`${label} must stay inside the workspace`)
+  return absolute
+}
+
+function prepareSubmission(workspace: string, args: SubmissionArgs) {
+  if (args.cases_file && !args.test_script?.trim()) throw new Error('cases_file requires a test_script')
+  return {
+    sourceDir: workspaceInput(workspace, args.source_dir, 'source_dir'),
+    testScript: args.test_script,
+    casesFile: args.cases_file ? workspaceInput(workspace, args.cases_file, 'cases_file') : undefined,
+    caseTimeoutSec: args.case_timeout_sec,
+  }
+}
+
+function targetComparison(platform: TargetPlatform, detectedSoc: string | undefined): JsonValue {
+  const { declared, detected, ...comparison } = compareTargetPlatform(platform, detectedSoc)
+  return { ...comparison, declared: declared ? { ...declared } : null, detected: detected ? { ...detected } : null }
+}
+
+function readSubmissionTarget(workspace: string, sourceDir: string) {
+  const path = workspaceInput(workspace, join(sourceDir, 'provenance.json'), 'submission provenance')
+  const selected = JSON.parse(readFileSync(path, 'utf8')).targetPlatform?.selected
+  if (selected == null) return null
+  const target = resolveSoc(typeof selected.soc === 'string' ? selected.soc : undefined)
+  if (target === null || target.npuArch !== selected.npuArch) throw new Error('submission provenance contains an invalid target selection')
+  return target
 }
 
 function withPaths(
@@ -391,6 +447,19 @@ export function apply(
 ): void {
   if (dial === undefined) registerProbeCommand(ctx)
   else registerProbeCommand(ctx, dial)
+  async function validateExportedSubmission(prepared: ReturnType<typeof prepareSubmission>, cfg: ReturnType<typeof snapshot>): Promise<JsonValue> {
+    const connection = await openEvaluationRemote(ctx, connect, cfg, tunnel)
+    if ('summary' in connection) return {
+      status: 'failed', correctness: 'unverified', stages: unverifiedSubmissionStages(), reason: connection.summary,
+    }
+    try {
+      return await validateSubmission(connection.files, {
+        ...prepared, remoteRoot: cfg.inbox, setEnv: cfg.setEnv, timeoutSec: cfg.timeoutSec,
+        device: cfg.device, deviceLock: cfg.deviceLock || undefined,
+      })
+    } finally { await connection.files.close().catch(() => {}) }
+  }
+
   ctx.tools.register(defineTool({
     name: 'run_evaluation',
     description: [
@@ -403,7 +472,8 @@ export function apply(
       'Nothing is compiled locally: this Windows side has no CANN toolchain.',
       'A missing build.sh/run_once.sh is reported as compile_fail with "package does not implement build contract v1".',
       'A placeholder golden.h (write_package_file) returns accuracy_fail with "golden not implemented", never pass.',
-      'An unchanged package returns the previous report with duplicate:true without connecting; use force:true to remeasure.',
+      'An unchanged package reuses its previous measurement with duplicate:true; use force:true to remeasure.',
+      'Optionally attach validation for an export of the same package after kernel correctness passes.',
       'The result always carries workspace, packageDir and resultsPath, plus status / compile.log /',
       'correctness.maxRelativeError / performance.kernelTimeUs / analysis / summary.',
       'Connection and transport failures leave pendingStage:run_evaluation. Restore the connection and retry the same package.',
@@ -413,6 +483,7 @@ export function apply(
       compile_only: { type: 'boolean', description: 'Diagnostic build only. Does not run accuracy/msprof, consume evaluation budgets, or overwrite the last evaluation result.' },
       golden_fixtures: { type: 'string', description: 'Optional workspace-relative reference vector JSON. A failing local golden check prevents remote execution without spending budget.' },
       kernel_dtypes: { type: 'array', items: { type: 'string' }, description: 'Optional dtype variants for limited local host-stub kernel syntax lint before SSH. Does not validate target API support.' },
+      submission: { type: 'object', additionalProperties: false, properties: submissionParameters },
     },
     output: {
       schema: {
@@ -463,6 +534,25 @@ export function apply(
                   achievedBandwidthGBps: { oneOf: [{ type: 'number' }, { type: 'null' }] },
                   rooflineUs: { oneOf: [{ type: 'number' }, { type: 'null' }] },
                   baselineUs: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+                  kernelBudget: {
+                    type: 'object', additionalProperties: false, properties: {
+                      source: { type: 'string', const: 'correctness-stdout', required: true },
+                      elementBasis: { type: 'string', required: true },
+                      blocks: { type: 'array', required: true, items: {
+                        type: 'object', additionalProperties: false, properties: {
+                          blockIndex: { type: 'integer', required: true },
+                          level2Calls: { type: 'integer', required: true },
+                          elements: { type: 'integer', required: true },
+                          callElements: { type: 'integer', required: true },
+                        },
+                      } },
+                      level2Calls: { type: 'integer', required: true },
+                      elements: { type: 'integer', required: true },
+                      callElements: { type: 'integer', required: true },
+                      perElementCalls: { oneOf: [{ type: 'number' }, { type: 'null' }], required: true },
+                      averageElementsPerCall: { oneOf: [{ type: 'number' }, { type: 'null' }], required: true },
+                    },
+                  },
                   notCollected: { type: 'array', items: { type: 'string' } },
                   op: {
                     required: true,
@@ -515,6 +605,7 @@ export function apply(
           policyEvidence: { type: 'json' },
           artifactsPersistent: { type: 'boolean' },
           artifactWarning: { type: 'string' },
+          submission: { type: 'json' },
           localGolden: { type: 'json' },
           localKernel: { type: 'json' },
           workspace: { type: 'string', required: true },
@@ -528,6 +619,8 @@ export function apply(
     execute: serializeFormalEvaluations(config.workspace, async (_args, exec, workspace) => {
       const force = (_args as { force?: boolean } | null)?.force === true
       const compileOnly = (_args as { compile_only?: boolean } | null)?.compile_only === true
+      const submission = (_args as { submission?: SubmissionArgs } | null)?.submission
+      if (compileOnly && submission) throw new Error('submission validation requires an accuracy evaluation')
       const cfg = snapshot(config)
       const stateFile = statePath(workspace)
       let state = loadState(stateFile)
@@ -567,6 +660,21 @@ export function apply(
       // result, so a stale hash must not block it (CAN-104). The full gate still
       // applies to evaluations that consume budget.
       const currentHash = compileOnly ? packageHash(localPackageDir) : checkPackageHash(localPackageDir, state)
+      const prepared = submission && prepareSubmission(workspace, submission)
+      if (prepared) {
+        const path = workspaceInput(workspace, join(prepared.sourceDir, 'provenance.json'), 'provenance.json')
+        const provenance = JSON.parse(readFileSync(path, 'utf8'))
+        if (provenance.generationId !== state.generationId || provenance.packageHash !== currentHash) {
+          throw new Error('submission must contain an export of the same generation and package hash')
+        }
+      }
+      const attachSubmission = async (report: RunEvaluationValue): Promise<RunEvaluationValue> => {
+        if (!prepared) return report
+        const validation = report.correctness.ok
+          ? await validateExportedSubmission(prepared, cfg)
+          : { status: 'not_run', reason: 'kernel correctness did not pass' }
+        return { ...report, submission: validation }
+      }
       const kernelDtypes = (_args as { kernel_dtypes?: string[] } | null)?.kernel_dtypes
       if (kernelDtypes) {
         const localKernel = await checkKernel(localPackageDir, kernelDtypes)
@@ -583,13 +691,13 @@ export function apply(
       }
       if (state.lastEvaluatedHash === currentHash && state.lastReport !== null && state.pendingStage == null && !force && !compileOnly) {
         saveState(stateFile, { ...state, pendingSteer: false })
-        return withPaths(observed({
+        return attachSubmission(withPaths(observed({
           ...state.lastReport,
           duplicate: true,
           summary: `duplicate package: same content as the last evaluation; previous result: ${state.lastReport.summary}`,
         }), workspace, state.generationId, cfg.outbox, null, state.lastResultsPath === undefined
           ? (state.lastReport.status === 'timeout' ? null : posix.join(cfg.outbox, state.generationId, 'results.json'))
-          : state.lastResultsPath, cfg.inbox)
+          : state.lastResultsPath, cfg.inbox))
       }
       const reason = stopReason(state, policyOf(config))
       const forcedAfterStop = force && canForceEvaluation(state, policyOf(config))
@@ -619,6 +727,8 @@ export function apply(
         timeoutMs: cfg.timeoutSec * 1000,
         intervalMs: cfg.pollIntervalMs,
         setEnv: cfg.setEnv,
+        device: cfg.device,
+        deviceLock: cfg.deviceLock,
         state: { ...state, packageHash: currentHash },
         force,
         compileOnly,
@@ -650,7 +760,7 @@ export function apply(
           lastSteerAt: 0,
         })
       }
-      return withPaths(observed(report), workspace, state.generationId, cfg.outbox, null, resultsPath, cfg.inbox)
+      return attachSubmission(withPaths(observed(report), workspace, state.generationId, cfg.outbox, null, resultsPath, cfg.inbox))
     }),
   }))
   ctx.tools.register(defineTool({
@@ -662,6 +772,7 @@ export function apply(
     ].join(' '),
     parameters: {
       remote: { type: 'boolean', description: 'Check the SSH endpoint and CANN toolchain as well as package files.' },
+      submission_source_dir: { type: 'string', description: 'Optional exported source directory. Read its selected target and compare with the remote architecture when requested.' },
       golden_fixtures: { type: 'string', description: 'Optional workspace-relative reference vector JSON for compiling and checking the real golden locally.' },
       kernel_dtypes: { type: 'array', items: { type: 'string' }, description: 'Optional dtype variants for limited host-stub kernel syntax lint. No NPU connection required.' },
     },
@@ -685,11 +796,13 @@ export function apply(
       const state = loadState(statePath(workspace))
       const packageDir = state.generationId === null ? null : join(workspace, 'packages', state.generationId)
       const local = inspectLocalPackage(packageDir, state)
+      const selected = args.submission_source_dir ? readSubmissionTarget(workspace, args.submission_source_dir) : undefined
       let localChecks: JsonValue = args.golden_fixtures && packageDir
         ? { ...local, golden: await checkGolden(packageDir, localTargetFor(workspace, 'golden-fixtures.json', args.golden_fixtures)) }
         : local
       if (args.kernel_dtypes && packageDir) localChecks = { ...localChecks as Record<string, JsonValue>, kernel: await checkKernel(packageDir, args.kernel_dtypes) }
       if (localChecks !== null && typeof localChecks === 'object' && !Array.isArray(localChecks)) {
+        if (selected !== undefined) localChecks.submissionTarget = selected ? { ...selected } : null
         const checks = [localChecks.golden, localChecks.kernel].filter(value => value !== undefined)
         if (checks.some(value => value === null || typeof value !== 'object' || Array.isArray(value) || value.status !== 'pass')) localChecks.ok = false
       }
@@ -706,8 +819,13 @@ export function apply(
       }
       const { files } = connection
       try {
-        const cann = await preflightToolchain(files, cfg.setEnv)
-        return { ...base, remote: { endpoint, ssh: 'connected', cann, quota } }
+        const cann = await preflightToolchain(files, cfg.setEnv, cfg.device, cfg.deviceLock)
+        const detectedSoc = cann && typeof cann === 'object' && !Array.isArray(cann) && typeof cann.detectedSoc === 'string'
+          ? cann.detectedSoc : undefined
+        const remote: Record<string, JsonValue> = { endpoint, ssh: 'connected', cann, quota }
+        if (state.spec) remote.target = targetComparison(state.spec.target_platform, detectedSoc)
+        if (selected) remote.submissionTarget = targetComparison({ chip: selected.soc }, detectedSoc)
+        return { ...base, remote }
       } catch (error) {
         return { ...base, remote: { endpoint, ssh: 'connected', cann: { ready: false, error: errorMessage(error) }, quota } }
       } finally {
@@ -776,25 +894,52 @@ export function apply(
     },
   }))
   ctx.tools.register(defineTool({
-    name: 'validate_submission',
-    description: 'Validate an exported source tree independently of evaluation budgets: verify hashes, build a wheel remotely, install into an isolated venv and optionally execute a task-specific golden comparator. Without a comparator correctness remains unverified. Never installs into the global Python environment.',
+    name: 'probe_run',
+    description: 'Build and check a temporary intrinsic probe from a kernel and an independent golden on the NPU. Uses the configured device and lock. Does not consume evaluation iterations or change the active generation. Supply a spec for different inputs or to work without an active generation.',
     parameters: {
-      source_dir: { type: 'string', required: true, description: 'Exported source directory inside the workspace, containing provenance.json.' },
-      test_script: { type: 'string', description: 'Complete Python comparator. Must emit exactly one CANNESS_VALIDATION JSON with ok:true after checking installed callable against an independent reference.' },
+      kernel: { type: 'string', required: true, description: 'Complete direct-launch kernel source.' },
+      golden: { type: 'string', required: true, description: 'Complete independent golden.h reference.' },
+      spec: { type: 'json', description: 'Optional probe spec. Defaults to the active spec. Performance target is ignored.' },
+      record: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Optional workspace knowledge entry, recorded only after the probe passes.',
+        properties: {
+          title: { type: 'string', required: true },
+          conclusion: { type: 'string', required: true },
+        },
+      },
     },
     output: { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args, exec?: ToolAgentContext) {
       const workspace = resolveWorkspace(config.workspace, exec)
-      const source = resolve(workspace, args.source_dir)
-      const relativeSource = relative(realpathSync(workspace), realpathSync(source))
-      if (relativeSource.startsWith('..') || isAbsolute(relativeSource)) throw new Error('source_dir must stay inside the workspace')
+      const spec = args.spec ?? loadState(statePath(workspace)).spec
+      if (spec == null) throw new Error('probe_run requires a spec or an active generation')
+      const note = args.record && parseProbeConclusion(args.record)
       const cfg = snapshot(config)
       const connection = await openEvaluationRemote(ctx, connect, cfg, tunnel)
-      if ('summary' in connection) return { status: 'failed', correctness: 'unverified', reason: connection.summary }
+      if ('summary' in connection) return { report: unavailableReport(null, connection.summary), resultsPath: null } as unknown as JsonValue
       try {
-        return await validateSubmission(connection.files, { sourceDir: source, remoteRoot: cfg.inbox,
-          setEnv: cfg.setEnv, testScript: args.test_script, timeoutSec: cfg.timeoutSec })
-      } finally { await connection.files.close().catch(() => {}) }
+        const probe = await runIntrinsicProbe({
+          files: connection.files, inbox: cfg.inbox, outbox: cfg.outbox, setEnv: cfg.setEnv,
+          device: cfg.device, deviceLock: cfg.deviceLock, timeoutMs: cfg.timeoutSec * 1000, intervalMs: cfg.pollIntervalMs,
+        }, { kernel: args.kernel, golden: args.golden, spec })
+        const knowledgePath = note && probe.report.status === 'pass' && probe.report.correctness.ok
+          ? recordProbeConclusion(workspace, note, probe) : null
+        return { ...probe, knowledgePath } as unknown as JsonValue
+      } finally {
+        await connection.files.close().catch(() => {})
+      }
+    },
+  }))
+  ctx.tools.register(defineTool({
+    name: 'validate_submission',
+    description: 'Accept an exported submission independently of evaluation budgets. Reports wheel build, isolated install, invocation of the installed public callable, and comparison against a task-specific reference. With an official cases CSV it reports isolated per-case accuracy and coverage.',
+    parameters: submissionParameters,
+    output: { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args, exec?: ToolAgentContext) {
+      const workspace = resolveWorkspace(config.workspace, exec)
+      return validateExportedSubmission(prepareSubmission(workspace, args), snapshot(config))
     },
   }))
 }

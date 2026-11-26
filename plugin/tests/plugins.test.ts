@@ -8,7 +8,8 @@ import * as generator from '../src/generator.ts'
 import * as evalPlugin from '../src/eval.ts'
 import * as loop from '../src/loop.ts'
 import { emptyState, type PolicyConfig } from '../src/policy.ts'
-import { buildTestPackage, writeOperator } from '../src/package-files.ts'
+import { buildTestPackage, packageHash, writeOperator } from '../src/package-files.ts'
+import { sha256 } from '../src/provenance.ts'
 import { parseSpec } from '../src/spec.ts'
 import { MemoryRemote, type RemoteHost } from '../src/remote.ts'
 import type { EvalReport } from '../src/report.ts'
@@ -381,6 +382,49 @@ test('run_evaluation returns workspace, packageDir and resultsPath', async () =>
   expect(JSON.parse(readFileSync(downloaded.path, 'utf8'))).toMatchObject({ generationId: pkg.generationId, status: 'pass' })
 })
 
+test('an explicitly requested submission check attaches to the matching evaluation without spending another iteration', async () => {
+  const pkg = readyPackage()
+  const stateFile = join(pkg.workspace, '.canness', 'state.json')
+  const source = join(pkg.workspace, 'exported')
+  mkdirSync(source)
+  const body = '#!/bin/bash\n'
+  writeFileSync(join(source, 'build.sh'), body)
+  const provenance = {
+    generationId: pkg.generationId,
+    packageHash: 'wrong-hash',
+    files: { 'build.sh': sha256(body) },
+  }
+  writeFileSync(join(source, 'provenance.json'), JSON.stringify(provenance))
+  const remote = new MemoryRemote()
+  let validations = 0
+  remote.execHandler = command => {
+    if (command.includes('validate_submission.py')) {
+      validations++
+      return { code: 0, stdout: 'CANNESS_SUBMISSION_REPORT {"status":"installed","correctness":"unverified"}\n', stderr: '' }
+    }
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  remote.appearOnRead(evaluationResultPath(pkg.generationId), Buffer.from(JSON.stringify({
+    ...failReport('perf_fail'),
+    compile: { ok: true, log: '' },
+    correctness: { ok: true, maxRelativeError: 0 },
+    performance: { kernelTimeUs: 200, targetUs: 150 },
+  })), 1)
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }), async () => remote)
+  const run = ctx.toolsRegistered[0]!
+  const args = { submission: { source_dir: 'exported' } }
+  await expect(run.execute(args)).rejects.toThrow(/same generation and package hash/)
+  expect(remote.execCalls).toEqual([])
+  provenance.packageHash = packageHash(join(pkg.workspace, 'packages', pkg.generationId))
+  writeFileSync(join(source, 'provenance.json'), JSON.stringify(provenance))
+  const outcome = await run.execute(args)
+  expect(outcome).toMatchObject({ status: 'perf_fail', submission: { status: 'installed', correctness: 'unverified' } })
+  expect(await run.execute(args)).toMatchObject({ duplicate: true, submission: { status: 'installed' } })
+  expect(validations).toBe(2)
+  expect(loadState(stateFile).validIterations).toBe(1)
+})
+
 test('fetch_remote_file copies a remote file into the workspace', async () => {
   const pkg = readyPackage()
   const remote = new MemoryRemote()
@@ -565,6 +609,25 @@ test('preflight validates the local package without dialing or writing a result'
     remote: null,
   })
   expect(connected).toBe(false)
+})
+
+test('remote preflight compares an exported portable selection with the detected architecture', async () => {
+  const pkg = readyPackage()
+  const source = join(pkg.workspace, 'exported')
+  mkdirSync(source)
+  writeFileSync(join(source, 'provenance.json'), JSON.stringify({
+    targetPlatform: { mode: 'portable', selected: { soc: 'ascend950', npuArch: 'dav-3510' } },
+  }))
+  const remote = new MemoryRemote()
+  remote.execHandler = () => ({ code: 0, stdout: '{"ready":true,"detectedSoc":"Ascend910B2"}', stderr: '' })
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }), async () => remote)
+  const check = ctx.toolsRegistered.find(tool => tool.name === 'preflight_evaluation')!
+  await expect(check.execute({ remote: true, submission_source_dir: 'exported' })).resolves.toMatchObject({
+    remote: { submissionTarget: {
+      ok: false, declared: { npuArch: 'dav-3510' }, detected: { npuArch: 'dav-2201' },
+    } },
+  })
 })
 
 test('remote preflight reads toolchain facts without uploading a package or consuming a run', async () => {
