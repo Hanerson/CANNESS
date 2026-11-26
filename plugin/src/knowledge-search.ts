@@ -72,14 +72,14 @@ function scopes(entry: KnowledgeEntry, args: KnowledgeQuery): number {
   return specific
 }
 
-function searchStructured(root: URL | string, args: KnowledgeQuery): KnowledgeResults {
+function searchStructured(root: URL | string, args: KnowledgeQuery, additional: readonly KnowledgeEntry[] = []): KnowledgeResults {
   const query = terms(args.query ?? '')
   if (args.query !== undefined && !query.size) throw new Error('query must contain a searchable term')
   const operator = args.operator_name === undefined ? undefined : normalize(args.operator_name)
   if (operator === '') throw new Error('operator_name must contain a letter or number')
 
   const ranked: { entry: KnowledgeEntry; specificity: number; score: number; operatorMatch: boolean }[] = []
-  for (const entry of loadKnowledgeEntries(root)) {
+  for (const entry of [...loadKnowledgeEntries(root), ...additional]) {
     if (args.kind && entry.kind !== args.kind) continue
     const names = entry.operator === undefined ? [] : [entry.operator, ...(entry.aliases ?? [])]
     const operatorMatch = operator !== undefined && names.some(name => normalize(name) === operator)
@@ -131,10 +131,10 @@ export function searchKnowledge(root: URL | string, operatorName: string): strin
   return hits.join('\n').slice(0, outputBudget)
 }
 
-export function queryKnowledge(root: URL | string, args: KnowledgeQuery): string | KnowledgeResults {
+export function queryKnowledge(root: URL | string, args: KnowledgeQuery, additional?: readonly KnowledgeEntry[]): string | KnowledgeResults {
   if (!args.operator_name && !args.query) throw new Error('Specify operator_name or query')
-  if (args.operator_name !== undefined && Object.keys(args).every(key => key === 'operator_name')) {
+  if (additional === undefined && args.operator_name !== undefined && Object.keys(args).every(key => key === 'operator_name')) {
     return searchKnowledge(root, args.operator_name)
   }
-  return searchStructured(root, args)
+  return searchStructured(root, args, additional)
 }

@@ -1,16 +1,20 @@
 import type { Context } from '@deepseek-ai/cordis'
+import { existsSync } from 'node:fs'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { entryKinds, evidenceTypes } from './knowledge-entry.js'
+import { entryKinds, evidenceTypes, loadKnowledgeEntries } from './knowledge-entry.js'
 import { queryKnowledge } from './knowledge-search.js'
+import { probeKnowledgeRoot } from './probe-knowledge.js'
+import { resolveWorkspace } from './workspace.js'
 
 export const name = 'canness-knowledge'
 export const inject = ['tools']
 
-export interface Config { kbRoot: string }
+export interface Config { kbRoot: string; workspace?: string }
 
 export const Config: z<Config> = z.object({
   kbRoot: z.string().required(),
+  workspace: z.string().default(''),
 })
 
 const stringList = { type: 'array', items: { type: 'string' } } as const
@@ -23,6 +27,7 @@ const parameters = {
   cann_version: { type: 'string', description: 'Exact CANN version when known.' },
   kind: { type: 'string', enum: entryKinds, description: 'Restrict to one knowledge entry kind.' },
   limit: { type: 'integer', description: 'Maximum hits, from 1 to 8. Default: 4.' },
+  include_probes: { type: 'boolean', description: 'Also search explicitly recorded probe results in this workspace.' },
 } as const
 
 export function apply(ctx: Context, config: Config): void {
@@ -84,7 +89,7 @@ export function apply(ctx: Context, config: Config): void {
       ] },
       render: (_args, value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
     },
-    async execute(args) {
+    async execute(args, exec) {
       for (const [key, value] of Object.entries(args)) {
         if (!Object.hasOwn(parameters, key)) throw new Error(`unknown parameter ${key}`)
         if (typeof value !== 'string') continue
@@ -92,7 +97,10 @@ export function apply(ctx: Context, config: Config): void {
         if (!value.trim() || value.length > max) throw new Error(`${key} must have 1–${max} characters and not be blank`)
       }
       if (args.limit !== undefined && (args.limit < 1 || args.limit > 8)) throw new Error('limit must be from 1 to 8')
-      return queryKnowledge(config.kbRoot, args)
+      const { include_probes, ...query } = args
+      if (!include_probes) return queryKnowledge(config.kbRoot, query)
+      const root = probeKnowledgeRoot(resolveWorkspace(config.workspace, exec))
+      return queryKnowledge(config.kbRoot, query, existsSync(root) ? loadKnowledgeEntries(root) : [])
     },
   }))
 }
