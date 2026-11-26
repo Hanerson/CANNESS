@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+﻿import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -95,30 +95,38 @@ testWithPython('generated wrapper rejects undeclared combinations and misalignme
   }
 })
 
-test('a custom wrapper must expose every declared interface attribute', () => {
+test('support rows may only reference attributes the guard can observe', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-support-attrs-'))
   try {
     const generation = 'gen-13572468'
-    const spec = parseSpec({ ...base, support: { wrapper_attrs: ['rotaryMode'], configurations: [{ attrs: { rotaryMode: 'interleaved' } }] } })
-    writeOperator(workspace, generation, {
-      kernel: 'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR x, GM_ADDR out, GM_ADDR tiling) {}',
-      host: '', api: '', plugin: '',
-    })
-    buildTestPackage(workspace, generation, spec)
     const wrapper = 'def rotary(input, layout=0, rotaryMode="half"):\n    raise NotImplementedError\n'
     const signature = 'rotary(input, layout=0, rotaryMode="half")'
-    // `mode` is declared in interface.attrs but the wrapper exposes `rotaryMode`:
-    // a support row mentioning `mode` could never match, so refuse the export.
-    expect(() => exportSubmission(workspace, generation, spec, 'rotary', { wrapper, signature }))
-      .toThrow(/interface.attrs mode are not parameters of the public signature/)
-    const renamed = parseSpec({
-      ...base, attrs: { layout: 0, rotaryMode: 'half' }, interface: { attrs: ['layout'], dtypes: ['fp32', 'bf16'] },
-      support: { wrapper_attrs: ['rotaryMode'], configurations: [{ attrs: { layout: 0, rotaryMode: 'half' } }] },
+    const make = (support: unknown) => {
+      const spec = parseSpec({ ...base, support })
+      writeOperator(workspace, generation, {
+        kernel: 'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR x, GM_ADDR out, GM_ADDR tiling) {}',
+        host: '', api: '', plugin: '',
+      })
+      buildTestPackage(workspace, generation, spec)
+      return spec
+    }
+    // `mode` is a compiled attribute the wrapper never exposes: a row keyed on
+    // `mode` can never match, so refuse the export instead of shipping a guard
+    // that silently stops constraining it.
+    const unobservable = make({ wrapper_attrs: ['rotaryMode'], configurations: [{ attrs: { mode: 'half' } }] })
+    expect(() => exportSubmission(workspace, generation, unobservable, 'rotary', { wrapper, signature }))
+      .toThrow(/cannot observe.*mode|cannot observe/)
+    // Signature parameters and fixed compiled attributes are both reachable, so
+    // an interface.attrs list that keeps `mode` (compiled) is fine.
+    const mixed = parseSpec({
+      ...base, attrs: { layout: 0, mode: 'half' }, interface: { attrs: ['layout'], dtypes: ['fp32', 'bf16'] },
+      support: { wrapper_attrs: ['rotaryMode'], configurations: [{ attrs: { layout: 0, rotaryMode: 'half', mode: 'half' } }] },
     })
-    buildTestPackage(workspace, generation, renamed)
-    const { sourceDir } = exportSubmission(workspace, generation, renamed, 'rotary', { wrapper, signature })
+    buildTestPackage(workspace, generation, mixed)
+    const { sourceDir } = exportSubmission(workspace, generation, mixed, 'rotary', { wrapper, signature })
     expect(readFileSync(join(sourceDir, 'cann_bench', '__init__.py'), 'utf8')).toContain('rotaryMode')
   } finally {
     rmSync(workspace, { recursive: true, force: true })
   }
 })
+

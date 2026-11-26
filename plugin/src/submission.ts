@@ -240,16 +240,19 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
   const signature = options.signature ?? generatedSignature
   if (!signature.startsWith(`${filename}(`) || !signature.endsWith(')') || /[\r\n]/.test(signature)) throw new Error('invalid public signature')
   if (options.wrapper !== undefined) {
-    // The support guard reads runtime attributes from the bound call arguments,
-    // so every declared interface attribute must be a parameter of the custom
-    // wrapper (or be declared as wrapper_attrs). Otherwise a matrix row that
-    // mentions it can never match and the guard silently stops constraining it.
+    // A support row is matched against the attributes the guard reads from the
+    // bound call plus the fixed (compiled) attributes. A row that mentions an
+    // attribute the guard can never observe would silently stop constraining it,
+    // so require every row key to be reachable.
     const parameters = signatureParameters(signature)
-    const declaredAttrs = new Set(spec.support?.wrapper_attrs ?? [])
-    const missing = (spec.interface?.attrs ?? []).filter(name => !parameters.has(name) && !declaredAttrs.has(name))
-    if (missing.length) {
-      throw new Error(`interface.attrs ${missing.join(', ')} are not parameters of the public signature; `
-        + 'rename them to the wrapper parameter names or declare support.wrapper_attrs')
+    const fixedNames = new Set(Object.keys(spec.attrs ?? {}).filter(name =>
+      !(spec.interface?.attrs ?? Object.keys(spec.attrs ?? {})).includes(name)))
+    const unreachable = [...new Set((spec.support?.configurations ?? [])
+      .flatMap(row => Object.keys(row.attrs ?? {}))
+      .filter(name => !parameters.has(name) && !fixedNames.has(name)))]
+    if (unreachable.length) {
+      throw new Error(`support.configurations reference ${unreachable.join(', ')}, which the guard cannot observe; `
+        + 'use a public signature parameter (list extra ones in support.wrapper_attrs) or a fixed attribute')
     }
   }
   const template = options.buildScript === undefined ? normalizeEol(readFileSync(join(TEMPLATE, 'build.sh'), 'utf8')) : null
