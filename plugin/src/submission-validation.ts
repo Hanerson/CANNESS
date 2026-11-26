@@ -75,7 +75,13 @@ export async function validateSubmission(files: RemoteHost, input: SubmissionVal
       + (input.caseTimeoutSec === undefined ? '' : ` --case-timeout-sec ${Math.max(1, Math.min(3600, Math.round(input.caseTimeoutSec)))}`)
     const result = await files.exec(command)
     const line = result.stdout.split(/\r?\n/).filter(row => row.startsWith('CANNESS_SUBMISSION_REPORT ')).at(-1)
-    if (!line) return failure(`runner exited ${result.code}: ${result.stderr.slice(-4000)}`)
+    if (!line) {
+      // An empty reply with exit 0 means the channel dropped mid-run, which a
+      // bare "runner exited 0:" cannot convey. Report what actually came back.
+      return failure(`no CANNESS_SUBMISSION_REPORT line: runner exited ${result.code}, `
+        + `stdout ${result.stdout.length}B, stderr ${result.stderr.length}B`
+        + (result.stderr ? `; stderr tail: ${result.stderr.slice(-2000)}` : ''))
+    }
     const report = JSON.parse(line.slice('CANNESS_SUBMISSION_REPORT '.length))
     if (result.code !== 0 && report.status !== 'failed') return failure(`runner exited ${result.code}`)
     return { ...report, remoteDir }
