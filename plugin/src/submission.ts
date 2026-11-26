@@ -2,9 +2,10 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { launchGeometry, LAYER_FILES, normalizeEol, packageHash, renderBuildContract } from './package-files.js'
+import { isDeepStrictEqual } from 'node:util'
+import { launchGeometry, LAYER_FILES, normalizeEol, packageHash, renderBuildContract, requireFreshBuild } from './package-files.js'
 import { sha256 } from './provenance.js'
-import { normalizedDtype, type OperatorSpec } from './spec.js'
+import { declaredTarget, normalizedDtype, resolveSoc, TARGET_OPTIONS, type OperatorSpec } from './spec.js'
 
 const TEMPLATE = fileURLToPath(new URL('../templates/cannbench/', import.meta.url))
 const MAX_ARCHIVE_BYTES = 50_000_000
@@ -19,8 +20,8 @@ function publicIdentifier(value: string): boolean {
   return /^[a-zA-Z][a-zA-Z0-9_]*$/.test(value) && !PYTHON_RESERVED.has(value)
 }
 
-function render(name: string, values: Record<string, string>): string {
-  return normalizeEol(readFileSync(join(TEMPLATE, name), 'utf8'))
+function render(name: string, values: Record<string, string>, body = readFileSync(join(TEMPLATE, name), 'utf8')): string {
+  return normalizeEol(body)
     .replace(/\{\{([A-Z0-9_]+)\}\}/g, (token, key: string) => {
       const value = values[key]
       if (value === undefined) throw new Error(`unbound CANNBench template token ${token}`)
@@ -42,7 +43,7 @@ function pythonValue(value: string | number | boolean): string {
   return JSON.stringify(value)
 }
 
-function submissionValues(spec: OperatorSpec, callable: string, socVersion: string, custom = false): Record<string, string> {
+function submissionValues(spec: OperatorSpec, callable: string, custom = false): Record<string, string> {
   if (!publicIdentifier(callable)) throw new Error('callable must be a public Python identifier')
   const inputNames = spec.input_specs.map(tensor => tensor.name)
   const attrs = Object.entries(spec.attrs ?? {})
@@ -57,7 +58,6 @@ function submissionValues(spec: OperatorSpec, callable: string, socVersion: stri
   if (!custom && tensors.some(tensor => JSON.stringify(tensor.shape) !== JSON.stringify(shape))) {
     throw new Error('automatic CANNBench export currently supports same-shape inputs and outputs')
   }
-  if (!/^[A-Za-z0-9._-]+$/.test(socVersion)) throw new Error('invalid CANNBench SoC')
   const dtype = tensors.map(tensor => {
     const type = DTYPES[normalizedDtype(tensor.dtype)]
     if (type === undefined) throw new Error(`unsupported CANNBench dtype: ${tensor.dtype}`)
@@ -118,7 +118,6 @@ function submissionValues(spec: OperatorSpec, callable: string, socVersion: stri
     else if (optional && !custom) throw new Error('required interface attributes must precede attributes with defaults')
   }
   return {
-    SOC_VERSION: socVersion,
     OPERATOR: callable,
     PY_OPERATOR: JSON.stringify(callable),
     PY_PARAMS: signature,
@@ -146,12 +145,43 @@ function submissionValues(spec: OperatorSpec, callable: string, socVersion: stri
   }
 }
 
-export interface ExportOptions { wrapper?: string; signature?: string }
+export interface ExportOptions { wrapper?: string; signature?: string; buildScript?: string; targetSoc?: string }
+
+/** Parameter names of `name(a, b=1, c="x")`, ignoring defaults and annotations. */
+function signatureParameters(signature: string): Set<string> {
+  const open = signature.indexOf('(')
+  const body = signature.slice(open + 1, signature.lastIndexOf(')'))
+  const names = new Set<string>()
+  let depth = 0
+  let quote: string | null = null
+  let current = ''
+  for (const character of body) {
+    if (quote !== null) {
+      current += character
+      if (character === quote) quote = null
+      continue
+    }
+    if (character === '"' || character === "'") { quote = character; current += character; continue }
+    if ('([{'.includes(character)) depth += 1
+    if (')]}'.includes(character)) depth -= 1
+    if (character === ',' && depth === 0) { addSignatureParameter(names, current); current = ''; continue }
+    current += character
+  }
+  addSignatureParameter(names, current)
+  return names
+}
+
+function addSignatureParameter(names: Set<string>, text: string): void {
+  const name = text.split(/[=:]/, 1)[0]?.trim().replace(/^\*+/, '') ?? ''
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) names.add(name)
+}
 
 export function exportSubmission(workspace: string, generationId: string, spec: OperatorSpec, callable?: string, options: ExportOptions = {}) {
+  requireFreshBuild()
   if (options.wrapper !== undefined && (!options.wrapper.trim() || !options.signature?.trim())) {
     throw new Error('custom wrapper requires nonempty source and an explicit public signature')
   }
+  if (options.buildScript !== undefined && !options.buildScript.trim()) throw new Error('build_script must be nonempty')
   if (!/^gen-[a-f0-9]{8}$/i.test(generationId)) throw new Error('invalid generation ID')
   const pkg = join(workspace, 'packages', generationId)
   const manifestPath = join(pkg, 'manifest.json')
@@ -161,7 +191,26 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
   if (manifest.packageHash !== hash) throw new Error('package changed after build_test_package; rebuild the package before export')
   const filename = callable ?? spec.operator_name
   const config = JSON.parse(readFileSync(join(pkg, 'config.json'), 'utf8'))
-  const values = submissionValues(spec, filename, config.socVersion, options.wrapper !== undefined)
+  const platform = spec.target_platform
+  const configTarget = resolveSoc(typeof config.socVersion === 'string' ? config.socVersion : undefined)
+  const declared = declaredTarget(platform) ?? (config.targetPlatform === undefined ? configTarget : null)
+  const mode = platform.mode ?? 'pinned'
+  if ((config.targetPlatform !== undefined && !isDeepStrictEqual(config.targetPlatform, platform)) ||
+      (declared && configTarget?.npuArch !== declared.npuArch) ||
+      (config.targetPlatform !== undefined && declared && declared.soc !== declared.archFamily && configTarget?.soc !== declared.soc)) {
+    throw new Error('target_platform disagrees with package config.json; rebuild the package before export')
+  }
+  if (mode === 'pinned' && !declared) throw new Error(`Declare target_platform hardware: ${TARGET_OPTIONS}`)
+  const requested = resolveSoc(options.targetSoc)
+  if (options.targetSoc !== undefined && requested === null) throw new Error(`unsupported target_soc ${options.targetSoc}; expected ${TARGET_OPTIONS}`)
+  if (mode === 'pinned' && requested && requested.npuArch !== declared?.npuArch) {
+    throw new Error(`target_soc ${requested.soc} uses ${requested.npuArch}; this generation declares ${declared?.npuArch}. Use ${TARGET_OPTIONS}.`)
+  }
+  const selected = requested ?? (mode === 'pinned' ? declared : null)
+  const targetPlatform = { mode, declaration: platform, declared, selected }
+  const values = submissionValues(spec, filename, options.wrapper !== undefined)
+  values.TARGET_SOC = selected?.soc ?? ''
+  values.TARGET_NPU_ARCH = selected?.npuArch ?? ''
   const tensors = [...spec.input_specs, ...spec.output_specs]
   const dtype = (name: string) => {
     const result = DTYPES[normalizedDtype(name)]
@@ -190,15 +239,47 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
   }
   const signature = options.signature ?? generatedSignature
   if (!signature.startsWith(`${filename}(`) || !signature.endsWith(')') || /[\r\n]/.test(signature)) throw new Error('invalid public signature')
+  if (options.wrapper !== undefined) {
+    // The support guard reads runtime attributes from the bound call arguments,
+    // so every declared interface attribute must be a parameter of the custom
+    // wrapper (or be declared as wrapper_attrs). Otherwise a matrix row that
+    // mentions it can never match and the guard silently stops constraining it.
+    const parameters = signatureParameters(signature)
+    const declaredAttrs = new Set(spec.support?.wrapper_attrs ?? [])
+    const missing = (spec.interface?.attrs ?? []).filter(name => !parameters.has(name) && !declaredAttrs.has(name))
+    if (missing.length) {
+      throw new Error(`interface.attrs ${missing.join(', ')} are not parameters of the public signature; `
+        + 'rename them to the wrapper parameter names or declare support.wrapper_attrs')
+    }
+  }
+  const template = options.buildScript === undefined ? normalizeEol(readFileSync(join(TEMPLATE, 'build.sh'), 'utf8')) : null
+  const buildScript = template === null ? normalizeEol(options.buildScript!) : render('build.sh', values, template)
+  const scriptSha256 = sha256(buildScript)
+  const build = template === null ? { source: 'override', dialect: 'custom', scriptSha256, templateSha256: null }
+    : { source: 'template', dialect: 'compiler-probe', scriptSha256, templateSha256: sha256(template) }
+  let wrapper = options.wrapper ?? render('operator.py', values)
+  if (spec.support !== undefined) {
+    if (filename === 'UnsupportedConfiguration') throw new Error('callable conflicts with the exported support error type')
+    if (spec.support.wrapper_attrs && options.wrapper === undefined) throw new Error('support.wrapper_attrs requires a custom wrapper')
+    const runtimeAttrs = [...new Set([...(spec.interface?.attrs ?? Object.keys(spec.attrs ?? {})), ...(spec.support.wrapper_attrs ?? [])])]
+    const fixedAttrs = Object.fromEntries(Object.entries(spec.attrs ?? {}).filter(([key]) => !runtimeAttrs.includes(key)))
+    const supportSettings = {
+      support: spec.support, inputs: spec.input_specs.map(input => input.name), runtimeAttrs, fixedAttrs,
+    }
+    wrapper = `${wrapper.trimEnd()}\n\n${render('support.py', {
+      OPERATOR: filename,
+      PY_SUPPORT: pythonValue(JSON.stringify(supportSettings)),
+    })}`
+  }
   const root = join(workspace, 'submissions')
   mkdirSync(root, { recursive: true })
   const staging = mkdtempSync(join(root, `${generationId}-`))
   try {
     const sourceDir = join(staging, 'source')
     const files: Record<string, Buffer | string> = {
-      'build.sh': render('build.sh', values),
+      'build.sh': buildScript,
       'setup.py': render('setup.py', values),
-      'cann_bench/__init__.py': options.wrapper ?? render('operator.py', values),
+      'cann_bench/__init__.py': wrapper,
       'csrc/launch.cpp': render('launch.cpp', values),
     }
     for (const name of [LAYER_FILES.kernel, 'canness_tiling.h', 'canness_tiling_common.h', 'canness_tiling_host.h']) {
@@ -218,6 +299,8 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
       generationId, packageHash: hash, callable: filename, signature, dtypes: variants ?? tensors.map(tensor => tensor.dtype),
       bindings: options.wrapper ? 'user-provided wrapper with CANNESS direct launch library' : 'CANNESS-generated direct launch',
       publicSignatureHash: sha256(signature), validation: { status: 'unverified', reason: 'export does not compile or execute the submission' },
+      targetPlatform, build,
+      ...(spec.support ? { support: spec.support } : {}),
       compiledLayers: manifest.compiledLayers ?? [LAYER_FILES.kernel], documentedOnlyLayers: manifest.documentedOnlyLayers ?? [], files: fileHashes, layers: manifest.provenance ?? null,
     }, null, 2)
     for (const [name, content] of Object.entries(files)) {
@@ -232,7 +315,7 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
       : spawnSync('zip', ['-q', archivePath, ...Object.keys(files)], { cwd: sourceDir, encoding: 'utf8' })
     if (archive.status !== 0) throw new Error(`could not create CANNBench zip: ${archive.error?.message ?? archive.stderr.trim()}`)
     if (statSync(archivePath).size > MAX_ARCHIVE_BYTES) throw new Error('CANNBench zip exceeds 50 MB')
-    return { sourceDir, archivePath, packageDir: pkg, callable: filename, signature, validation: { status: 'unverified' as const } }
+    return { sourceDir, archivePath, packageDir: pkg, callable: filename, signature, targetPlatform, build, validation: { status: 'unverified' as const } }
   } catch (error) {
     rmSync(staging, { recursive: true, force: true })
     throw error

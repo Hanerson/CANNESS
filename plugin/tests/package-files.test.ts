@@ -5,7 +5,8 @@ import { expect, test } from 'vitest'
 import { newGenerationId } from '../src/ids.ts'
 import {
   buildContractTemplateDir, buildTestPackage, checkKernelEntry, CONTRACT_FILES, KERNEL_ENTRY, LAYER_FILES,
-  maxAbsErrForDtype, normalizeEol, packageHash, readTemplateBody, renderBuildContract, repairPackage, writeOperator,
+  maxAbsErrForDtype, normalizeEol, packageHash, readTemplateBody, renderBuildContract, repairPackage, staleBuildMessage,
+  writeOperator,
 } from '../src/package-files.ts'
 import { parseSpec } from '../src/spec.ts'
 import { emptyState } from '../src/policy.ts'
@@ -101,6 +102,13 @@ test('writeOperator and buildTestPackage lay down the four layers and manifest',
     layers: Object.values(LAYER_FILES),
   })
   expect(readFileSync(join(pkg, 'op_plugin/plugin.py'), 'utf8')).toBe('P')
+})
+
+test('the config records effective launch geometry and explicit spec overrides', () => {
+  const { pkg } = packageFor({ ...specFor('float16'), launch: { block_dim: 7, workspace_bytes: 32 } })
+  const config = JSON.parse(readFileSync(join(pkg, 'config.json'), 'utf8'))
+  expect(config.launch).toEqual({ block_dim: 7, tile_length: 1024, workspace_bytes: 32 })
+  expect(config.requestedLaunch).toEqual({ block_dim: 7, workspace_bytes: 32 })
 })
 
 test('package attests layer content and links exact reuse to an earlier generation', () => {
@@ -339,4 +347,15 @@ test('repairPackage keeps provenance hashes in sync with rewritten layer files',
   expect(entry.sha256).toBe(sha256(normalizeEol(repaired)))
   expect(entry.modifiedByRepair).toBe(true)
   expect(manifest.packageHash).toBe(packageHash(pkg))
+})
+
+test('a stale lib is a build error, not an unbound template token', () => {
+  expect(staleBuildMessage({ codeSource: 'src', staleBuild: false, warnings: [] })).toBeNull()
+  const message = staleBuildMessage({
+    codeSource: 'lib', staleBuild: true,
+    warnings: ['Plugin sources are newer than or missing from the built lib (spec.ts); run pnpm build in the plugin directory before generating packages.'],
+  })
+  expect(message).toContain('Plugin sources are newer than or missing from the built lib')
+  expect(message).toContain('pnpm build')
+  expect(message).toMatch(/predates the plugin sources/)
 })

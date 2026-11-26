@@ -1,4 +1,4 @@
-# AscendC 编译与直连运行（910B / CANN 9.1）
+# AscendC 编译与直连运行（910B、A3、950）
 
 不依赖 msopgen 工程、直接把 `kernel.cpp` 编译成可执行程序的最小路径。适用于「本地无 CANN、远端只有 NPU + 编译器」的场景。
 
@@ -23,7 +23,27 @@ CANN 9.1 的头文件位置（不是老的 tikcfw 单一路径）：
 /usr/local/Ascend/cann-9.1.0/include
 ```
 
-## 编译命令（关键）
+## 选择 SoC 与编译参数
+
+| 平台 | CANNBench `--soc` 短名 | 部件名示例 | 现代毕昇编译参数 |
+| --- | --- | --- | --- |
+| 910B | `ascend910b` | `Ascend910B2`、`Ascend910B4` | `-xasc --npu-arch=dav-2201` |
+| A3 / 910C | `ascend910_93` | `Ascend910_9362` | `-xasc --npu-arch=dav-2201` |
+| 950PR / 950DT | `ascend950` | `Ascend950PR_9579` | `-xasc --npu-arch=dav-3510` |
+
+910B 和 A3 共享 c220 微架构。CANN 9.2.1 上已验证这两个目标短名都能用 `dav-2201` 编译。A3 的 CANNBench 对照包 `job_0d0d14053670` 也使用这组参数。950 的映射供选目标使用，实际编译和运行要在目标工具链和设备上验证。
+
+导出脚本优先使用调用方的 `--soc`，其次使用导出时明确选定的 SoC。可移植导出没有选定 SoC 时依次尝试 `torch.npu.get_device_name(0)` 和 `npu-smi`。`npu-smi` 可能只显示 `Ascend910`，这个名称无法区分 910B 和 A3，应显式传 `--soc`。通过预检获得的型号用于提示。发现探测型号与声明不同，或选择可移植模式时，先请用户确认预期目标再创建 generation。
+
+工具链支持现代参数时，kernel 和 launch 源文件使用同一微架构参数。例如，A3 和 910B 都可以用下列命令编译 kernel。
+
+```bash
+bisheng -xasc --npu-arch=dav-2201 -std=c++17 \
+  -include /path/to/gelu_tiling.h \
+  -c -I... kernel.cpp -o kernel.o
+```
+
+已验证的旧版 910B2 工具链（CANN 8.0.1）需要 `-x cce` 和完整部件名。导出脚本先用独立源文件探测编译器支持的参数，再编译算子。旧版运行库通过 `--cce-fatobj-link` 链接。
 
 ```bash
 bisheng -x cce -std=c++17 \
@@ -33,10 +53,10 @@ bisheng -x cce -std=c++17 \
   -c -I... kernel.cpp -o kernel.o
 ```
 
-- `--cce-soc-core-type=VecCore` 是**向量核**的唯一合法值；`AiCore` / `VectorCore` / `AIC` / `AIV` 都报 `soc_core_type ... is not supported`。
+- 旧版 `--cce-soc-core-type=VecCore` 是**向量核**的合法值。`AiCore` / `VectorCore` / `AIC` / `AIV` 都报 `soc_core_type ... is not supported`。
 - `--cce-aiv` 单独使用不会改变产物（同一份 `.o` 的 md5 不变），不要依赖它。
 - 链接需要 `-lascendcl -lruntime`，否则 `rtDevBinaryRegister` / `rtKernelLaunch` 未定义。
-- 910B2 和 910B4 都可选 `--cce-soc-version=Ascend910B2|Ascend910B4`。
+- 旧版 `--cce-soc-version` 要和工具链支持的部件及实际目标匹配。910B4 用 `Ascend910B4`，A3 的工具链可能拒绝 `Ascend910B2`。
 
 ## 与插件构建契约的接口
 
@@ -101,9 +121,10 @@ struct GeluTilingData {
 ## 编译 + 链接（可执行）
 
 ```bash
-bisheng -x cce -std=c++17 --cce-soc-version=Ascend910B2 --cce-soc-core-type=VecCore \
+flags=(-xasc --npu-arch=dav-2201 -std=c++17)
+bisheng "${flags[@]}" \
   -include gelu_tiling.h -c -I... kernel.cpp -o k.o
-bisheng -x cce -std=c++17 --cce-soc-version=Ascend910B2 --cce-soc-core-type=VecCore \
+bisheng "${flags[@]}" \
   -c -I... main.cpp -o main.o
 bisheng main.o k.o -o demo \
   -L$CANN/aarch64-linux/lib64 -L$CANN/aarch64-linux/devlib \

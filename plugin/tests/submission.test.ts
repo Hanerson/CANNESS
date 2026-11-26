@@ -1,6 +1,7 @@
+﻿import { spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { expect, test } from 'vitest'
 import { buildTestPackage, repairPackage, writeOperator } from '../src/package-files.ts'
 import { parseSpec } from '../src/spec.ts'
@@ -8,6 +9,114 @@ import { exportSubmission } from '../src/submission.ts'
 import { sha256 } from '../src/provenance.ts'
 
 const KERNEL = 'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR in0, GM_ADDR out0, GM_ADDR tiling) {}'
+
+function exportFixture(target_platform = { chip: 'Ascend910B2' } as Record<string, string>) {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-export-'))
+  const generation = 'gen-deadbeef'
+  const spec = parseSpec({
+    operator_name: 'Exp', operator_type: 'elementwise',
+    input_specs: [{ name: 'input', shape: ['16'], dtype: 'float32' }],
+    output_specs: [{ name: 'output', shape: ['16'], dtype: 'float32' }],
+    target_platform, performance_target: { metric: 'kernel_time', target_us: 50 },
+  })
+  writeOperator(workspace, generation, { kernel: KERNEL, host: '', api: '', plugin: '' })
+  buildTestPackage(workspace, generation, spec)
+  return { workspace, generation, spec }
+}
+
+test('portable export binds the selected architecture and hashes an explicit build override', () => {
+  const { workspace, generation, spec } = exportFixture({ chip: 'Ascend910B2', mode: 'portable' })
+  const script = '#!/bin/bash\r\necho custom\r\n'
+  const original = exportSubmission(workspace, generation, spec, 'exp', { targetSoc: 'Ascend910_9362' })
+  const custom = exportSubmission(workspace, generation, spec, 'exp', { targetSoc: 'ascend950', buildScript: script })
+  const read = (path: string) => JSON.parse(readFileSync(join(path, 'provenance.json'), 'utf8'))
+  const build = readFileSync(join(custom.sourceDir, 'build.sh'), 'utf8')
+  expect(build).toBe('#!/bin/bash\necho custom\n')
+  expect(read(custom.sourceDir)).toMatchObject({
+    targetPlatform: { mode: 'portable', selected: { archFamily: 'ascend950', npuArch: 'dav-3510' } },
+    build: { source: 'override', scriptSha256: sha256(build) }, files: { 'build.sh': sha256(build) },
+  })
+  expect(read(original.sourceDir)).toMatchObject({
+    targetPlatform: { selected: { archFamily: 'ascend910_93', npuArch: 'dav-2201' } },
+    build: { source: 'template', dialect: 'compiler-probe', templateSha256: expect.stringMatching(/^[a-f0-9]{64}$/) },
+  })
+})
+
+test('rejects an incompatible export target for a pinned generation', () => {
+  const { workspace, generation, spec } = exportFixture()
+  expect(() => exportSubmission(workspace, generation, spec, 'exp', { targetSoc: 'ascend950' }))
+    .toThrow(/dav-3510.*dav-2201/)
+})
+
+const bash = process.platform === 'win32'
+  ? resolve(spawnSync('git', ['--exec-path'], { encoding: 'utf8' }).stdout?.trim() ?? '', '../../..', 'bin/bash.exe')
+  : 'bash'
+const bashAvailable = spawnSync(bash, ['-c', '[[ ${BASH_VERSINFO[0]} -ge 4 ]]']).status === 0
+
+function runBuild(soc: string, compilerMode: string, mode: 'pinned' | 'portable' = 'pinned') {
+  const { workspace, generation, spec } = exportFixture({ chip: 'Ascend910B2', mode })
+  const { sourceDir } = exportSubmission(workspace, generation, spec, 'exp')
+  writeFileSync(join(sourceDir, 'fake-bisheng'), [
+    '#!/usr/bin/env bash',
+    'printf "%s\\n" "$*" >> compiler.log',
+    'if [[ "$*" == *-xasc* && "$FAKE_COMPILER_MODE" == legacy ]]; then exit 87; fi',
+    'if [[ "$*" == *csrc/op_kernel/kernel.cpp* && "$FAKE_COMPILER_MODE" == broken-source ]]; then',
+    '  echo "kernel has a real compile error" >&2; exit 42',
+    'fi',
+    'exit 0',
+  ].join('\n'), { mode: 0o755 })
+  const result = spawnSync(bash, ['build.sh', `--soc=${soc}`], {
+    cwd: sourceDir, encoding: 'utf8',
+    env: { ...process.env, CANNESS_BISHENG: './fake-bisheng', PYTHON: 'true', FAKE_COMPILER_MODE: compilerMode },
+  })
+  const logPath = join(sourceDir, 'compiler.log')
+  const calls = existsSync(logPath) ? readFileSync(logPath, 'utf8').trim().split('\n') : []
+  return { ...result, calls, sourceDir }
+}
+
+test.skipIf(!bashAvailable).each(['ascend910b', 'ascend910_93'])('builds %s using the modern microarchitecture flags', soc => {
+  const { status, stdout, stderr, calls, sourceDir } = runBuild(soc, 'modern')
+  expect(status, stderr).toBe(0)
+  expect(stdout).toMatch(/dialect=modern.*dav-2201/)
+  const kernel = calls.find(call => call.includes('csrc/op_kernel/kernel.cpp'))
+  expect(kernel).toContain('-xasc -std=c++17 -fPIC --npu-arch=dav-2201')
+  expect(kernel).not.toContain('--cce-soc-version=')
+  // The archive carries what the target build actually chose.
+  const env = readFileSync(join(sourceDir, 'dist', 'build-env.txt'), 'utf8')
+  expect(env).toContain('npu_arch=dav-2201')
+  expect(env).toMatch(/^dialect=modern$/m)
+  expect(env).toContain('-xasc -std=c++17 -fPIC --npu-arch=dav-2201')
+})
+
+test.skipIf(!bashAvailable)('probes compiler support before using legacy 910B flags', () => {
+  const { status, stdout, stderr, calls } = runBuild('ascend910b', 'legacy')
+  expect(status, stderr).toBe(0)
+  expect(stdout).toMatch(/dialect=legacy.*Ascend910B2/)
+  expect(calls.filter(call => call.includes('csrc/op_kernel/kernel.cpp'))).toEqual([
+    expect.stringContaining('-x cce -std=c++17 -fPIC --cce-soc-version=Ascend910B2 --cce-soc-core-type=VecCore'),
+  ])
+})
+
+test.skipIf(!bashAvailable)('does not retry a kernel source error with a different compiler dialect', () => {
+  const { status, stderr, calls } = runBuild('ascend910b', 'broken-source')
+  expect(status).toBe(42)
+  expect(stderr).toContain('kernel has a real compile error')
+  expect(calls.filter(call => call.includes('csrc/op_kernel/kernel.cpp'))).toHaveLength(1)
+  expect(calls.join('\n')).not.toContain('--cce-soc-version=')
+})
+
+test.skipIf(!bashAvailable)('does not invoke the compiler when a pinned export receives an incompatible SoC', () => {
+  const { status, stderr, calls } = runBuild('Ascend950PR_9579', 'modern')
+  expect(status).toBe(2)
+  expect(stderr).toMatch(/Ascend950PR_9579 uses dav-3510.*targets dav-2201/)
+  expect(calls).toEqual([])
+})
+
+test.skipIf(!bashAvailable)('accepts the 950 part name on a portable export', () => {
+  const { status, stderr, calls } = runBuild('Ascend950PR_9579', 'modern', 'portable')
+  expect(status, stderr).toBe(0)
+  expect(calls.find(call => call.includes('csrc/op_kernel/kernel.cpp'))).toContain('--npu-arch=dav-3510')
+})
 
 test('exports a CANNBench source zip with the tested kernel and a generated launch wrapper', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-export-'))
@@ -111,3 +220,5 @@ test('custom wrapper exports shape-changing mixed output dtype variants and reje
   expect(readFileSync(join(artifact.sourceDir,'csrc/float16/canness_tiling.h'),'utf8')).toContain('using DTYPE_Y = half;')
   expect(JSON.parse(readFileSync(join(artifact.sourceDir,'provenance.json'),'utf8')).signature).toBe('reduce(input)')
 })
+
+

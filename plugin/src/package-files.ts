@@ -5,7 +5,7 @@ import {
 import { createHash } from 'node:crypto'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { normalizedDtype, type FloatInputValue, type OperatorSpec, type TensorSpec } from './spec.js'
+import { declaredTarget, normalizedDtype, type FloatInputValue, type OperatorSpec, type TensorSpec } from './spec.js'
 import { lineOverlap, parseProvenance, sha256, type Origin } from './provenance.js'
 
 export const LAYER_FILES = {
@@ -243,8 +243,15 @@ function safeCommentName(value: string): string {
 }
 
 function socVersion(spec: OperatorSpec): string {
-  const value = spec.target_platform.soc_version
-  return typeof value === 'string' && /^[A-Za-z0-9._-]+$/.test(value) ? value : DEFAULT_SOC_VERSION
+  const target = declaredTarget(spec.target_platform)
+  if (!target) {
+    const legacy = spec.target_platform.soc_version
+    return typeof legacy === 'string' && /^[A-Za-z0-9._-]+$/.test(legacy) ? legacy : DEFAULT_SOC_VERSION
+  }
+  if (target.soc === 'ascend910b') return DEFAULT_SOC_VERSION
+  if (target.soc === 'ascend910_93') return 'Ascend910_93'
+  if (target.soc === 'ascend950') return 'Ascend950'
+  return target.soc
 }
 
 function renderTemplate(body: string, values: Record<string, string>): string {
@@ -341,6 +348,25 @@ export function contractFingerprint(runtimeModuleUrl: string = import.meta.url):
     warnings,
     pluginVersion: packageMeta.version ?? 'unknown',
   }
+}
+
+/**
+ * A stale lib silently runs old code against new templates: exports then fail
+ * deep inside template rendering (`unbound CANNNBench template token ...`) and
+ * evaluations measure a different build than the one that was reviewed.
+ * Report it as a build error instead, before anything is produced.
+ */
+export function staleBuildMessage(fingerprint: {
+  codeSource: 'src' | 'lib'; staleBuild: boolean; warnings: string[]
+}): string | null {
+  if (!fingerprint.staleBuild) return null
+  return `${fingerprint.warnings.join(' ')} Refusing to run: the executing ${fingerprint.codeSource} predates the plugin sources.`
+}
+
+/** Throws when the code that is running was not built from the current sources. */
+export function requireFreshBuild(runtimeModuleUrl: string = import.meta.url): void {
+  const message = staleBuildMessage(contractFingerprint(runtimeModuleUrl))
+  if (message !== null) throw new Error(message)
 }
 
 function writeContractSelfCheck(dest: string, spec: OperatorSpec): void {
@@ -551,14 +577,17 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
   const inputValues = spec.input_specs.flatMap(tensor => tensor.input_values?.length
     ? [{ name: tensor.name, values: tensor.input_values }]
     : [])
-  const { totalElements, blockDim, blockLength, tileSize } = launchGeometry(spec)
+  const { totalElements, blockDim, blockLength, tileSize, workspaceBytes } = launchGeometry(spec)
   const config = {
     maxAbsErr: tolerances[0]!.abs,
     accuracyComparison: 'per-element',
     dtype: spec.output_specs[0]?.dtype ?? spec.input_specs[0]!.dtype,
     socVersion: socVersion(spec),
+    targetPlatform: spec.target_platform,
     blockDim,
     tileSize,
+    launch: { block_dim: blockDim, tile_length: tileSize, workspace_bytes: workspaceBytes },
+    ...(spec.launch ? { requestedLaunch: spec.launch } : {}),
     params: {
       blockDim,
       tileSize,
@@ -584,6 +613,7 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
     attrsDerived: spec.attrs_derived ?? {},
     accuracyMode: spec.accuracyMode ?? 'elementwise',
     chip: spec.target_platform.chip,
+    targetPlatform: spec.target_platform,
     buildContract: 'v1',
     contract,
     layers: Object.values(LAYER_FILES),
