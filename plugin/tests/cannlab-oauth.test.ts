@@ -6,9 +6,11 @@
  */
 
 import { createServer } from 'node:http'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { buildAuthorizeUrl, interactiveLogin } from '../src/cannlab/oauth.js'
+import { connect } from '../src/cannlab/connect.js'
 import type { Fetcher } from '../src/cannlab/api.js'
+import type { TokenStore } from '../src/cannlab/tokens.js'
 
 /** A fetch answer built from a JSON body. */
 function json(body: unknown, status = 200): Awaited<ReturnType<Fetcher>> {
@@ -117,5 +119,60 @@ describe('interactiveLogin', () => {
     }, 60_000, second.signal)
     setTimeout(() => { second.abort() }, 20)
     await expect(retry).rejects.toThrow('cancelled')
+  })
+})
+
+function storedSession(): TokenStore {
+  let refreshToken: string | undefined = 'saved-token'
+  return {
+    read: async () => refreshToken,
+    write: async value => { refreshToken = value },
+    clear: async () => { refreshToken = undefined },
+    describe: () => 'test credential',
+  }
+}
+
+describe('stored OAuth session', () => {
+  it('persists the rotated refresh token before proceeding to instance lookup', async () => {
+    const tokenStore = storedSession()
+    const openBrowser = vi.fn(async () => false)
+    await expect(connect({
+      tokenStore, logPath: null, keyDir: '', openBrowser, onEvent: () => {},
+      fetcher: async (input, options) => {
+        const url = new URL(input)
+        if (url.searchParams.get('grant_type') === 'refresh_token') {
+          expect(url.searchParams.get('refresh_token')).toBe('saved-token')
+          return json({ access_token: 'live-access-token', refresh_token: 'rotated-token' })
+        }
+        expect(url.pathname.endsWith('/instances')).toBe(true)
+        expect(options?.headers).toMatchObject({ 'access-token': 'live-access-token' })
+        expect(await tokenStore.read()).toBe('rotated-token')
+        return json({ error_code: '1401' })
+      },
+    })).rejects.toThrow('list instances: error_code 1401')
+    expect(openBrowser).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['a failed refresh', json({ error: 'invalid_grant' }, 401)],
+    ['an empty access token', json({ access_token: '', refresh_token: 'unusable-rotation' })],
+  ] as const)('requires sign-in after %s', async (_name, refreshResponse) => {
+    const tokenStore = storedSession()
+    const controller = new AbortController()
+    const steps: string[] = []
+    const fetcher = vi.fn<Fetcher>(async () => refreshResponse)
+    const openBrowser = vi.fn(async () => {
+      controller.abort()
+      return true
+    })
+    await expect(connect({
+      tokenStore, logPath: null, keyDir: '', signal: controller.signal,
+      fetcher, openBrowser, onEvent: event => { steps.push(event.step) },
+    })).rejects.toThrow('cancelled')
+    expect(openBrowser).toHaveBeenCalledOnce()
+    expect(steps).toContain('login-required')
+    expect(steps).not.toContain('login-ok')
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(await tokenStore.read()).toBe('saved-token')
   })
 })

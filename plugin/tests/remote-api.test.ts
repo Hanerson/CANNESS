@@ -13,12 +13,13 @@ import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AddressInfo } from 'node:net'
+import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import {
-  apply, CANNLAB_CONNECT_PATH, CANNLAB_DISCONNECT_PATH, CANNLAB_STATUS_PATH, PROBE_PATH,
-  type Config,
+  apply, CANNLAB_CONNECT_PATH, CANNLAB_DISCONNECT_PATH, CANNLAB_STATUS_PATH, PROBE_PATH, Config,
 } from '../src/remote-api.js'
+import * as connectApi from '../src/cannlab/connect.js'
 import type { CannlabFrame } from '../src/cannlab/types.js'
 
 // Tests must never read the developer's real Harness home: one successful
@@ -36,7 +37,7 @@ interface Route {
 /** A composition that answers the four services `apply` reads. */
 function fakeComposition(options: {
   reject?: boolean
-  credentials?: { resolve(): Promise<{ value: string } | undefined>, set(): Promise<void>, unset(): Promise<void> }
+  credentials?: { resolve(ref: string): Promise<{ value: string } | undefined>, set(): Promise<void>, unset(): Promise<void> }
   webServer?: { register(route: Route): () => void }
 } = {}) {
   const routes: Route[] = []
@@ -87,18 +88,35 @@ async function serve(routes: Route[]): Promise<{ base: string, close: () => Prom
 }
 
 /** The configuration a test uses; the cache and key directories stay unused. */
-const config: Config = {
+const config = {
   tokenRef: 'CANNLAB_GITCODE_TOKEN',
   cacheRoot: '',
   keyDir: '',
   logPath: join(mkdtempSync(join(tmpdir(), 'canness-api-')), 'connect.log'),
   instance: '',
-}
+} satisfies Config
 
 /** Captured before any test stubs the global, for requests that must be real. */
 const realFetch = globalThis.fetch
 
-afterEach(() => { vi.unstubAllGlobals() })
+async function signedInFrom(routes: Route[]): Promise<boolean> {
+  const response = { setHeader() {}, end: vi.fn() }
+  await routes.find(route => route.path === CANNLAB_STATUS_PATH)!.handler({ method: 'GET' }, response)
+  return JSON.parse(response.end.mock.calls[0][0]).signedIn as boolean
+}
+
+async function postConnect(routes: Route[]): Promise<void> {
+  const request = Object.assign(Readable.from([Buffer.from('{}')]), {
+    method: 'POST', headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+  })
+  const response = { setHeader() {}, flushHeaders() {}, write() {}, end() {} }
+  await routes.find(route => route.path === CANNLAB_CONNECT_PATH)!.handler(request, response)
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+})
 
 describe('trust fence', () => {
   it('rejects every route before its handler runs', async () => {
@@ -247,65 +265,51 @@ describe('disconnect route', () => {
 })
 
 describe('connect route', () => {
-  it('survives config values that are not the strings their schema declares', async () => {
+  it('uses the five values from the installed Schemastery config', async () => {
+    const settings = {
+      tokenRef: 'CANNLAB_GITCODE_TOKEN',
+      cacheRoot: join(process.env.DSH_HOME!, 'configured-cache'),
+      keyDir: join(process.env.DSH_HOME!, 'configured-key-dir'),
+      logPath: join(process.env.DSH_HOME!, 'configured-log.txt'),
+      instance: 'configured-instance',
+    }
+    const schemaConfig = Config(settings)
+    expect(schemaConfig.tokenRef.get()).toBe(settings.tokenRef)
+    const connect = vi.spyOn(connectApi, 'connect').mockRejectedValue(new Error('test stopped before sign-in'))
     const credentials = {
-      resolve: async () => undefined,
+      resolve: async (ref: string) => ref === settings.tokenRef ? { value: 'fixture-token' } : undefined,
       set: async () => {},
       unset: async () => {},
     }
-    // No stored session, so the flow reaches the OAuth step and asks for a
-    // browser — which must be the point it stops at, not the config read.
-    let opened = ''
-    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
-      const body = input.includes('oauth/token')
-        ? { access_token: 'at-123' }
-        : { error_code: '1401', result: null }
-      return { ok: true, status: 200, text: async () => JSON.stringify(body), arrayBuffer: async () => new ArrayBuffer(0) }
-    }))
-    const clientFetch = realFetch
-
     const { ctx, routes } = fakeComposition({ credentials })
-    // The regression this pins: a volatile config value can arrive as an
-    // opaque object. Before the fix it reached `node:path`, and every attempt
-    // died with `"path" argument must be of type string. Received an instance
-    // of Object` before it could even write its first log line.
-    apply(ctx, {
-      tokenRef: { opaque: true } as unknown as string,
-      cacheRoot: { opaque: true } as unknown as string,
-      keyDir: { opaque: true } as unknown as string,
-      logPath: { opaque: true } as unknown as string,
-      instance: { opaque: true } as unknown as string,
-    })
-    const server = await serve(routes)
-    try {
-      const response = await clientFetch(`${server.base}${CANNLAB_CONNECT_PATH}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
-        body: JSON.stringify({ instance: '' }),
-      })
-      expect(response.headers.get('content-type')).toContain('text/event-stream')
-      // Read only the opening frames: the flow is meant to block on the
-      // browser callback, so the stream never ends on its own.
-      const reader = response.body === null ? null : response.body.getReader()
-      expect(reader).not.toBeNull()
-      const decoder = new TextDecoder()
-      let buffered = ''
-      const deadline = Date.now() + 3000
-      while (!buffered.includes('login-awaiting') && Date.now() < deadline && reader !== null) {
-        const chunk = await reader.read()
-        if (chunk.done) break
-        buffered += decoder.decode(chunk.value, { stream: true })
-        opened = buffered
-      }
-      await reader?.cancel()
-      expect(buffered).toContain('checking-login')
-      expect(buffered).toContain('login-required')
-      expect(buffered).toContain('login-awaiting')
-      expect(buffered).not.toContain('"path" argument')
-    } finally {
-      await server.close()
+    apply(ctx, schemaConfig)
+    expect(await signedInFrom(routes)).toBe(true)
+    await postConnect(routes)
+    expect(connect).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      cacheRoot: settings.cacheRoot, keyDir: settings.keyDir, logPath: settings.logPath, selector: settings.instance,
+    }))
+  })
+
+  const blank = { tokenRef: '', cacheRoot: '', keyDir: '', logPath: '', instance: '' }
+  it.each([
+    ['opaque settings', Object.fromEntries(Object.keys(blank).map(key => [key, { opaque: true }])) as unknown as Config],
+    ['empty settings', Config(blank)],
+  ] as const)('uses file-backed credentials and default paths for %s', async (_name, settings) => {
+    const connect = vi.spyOn(connectApi, 'connect').mockRejectedValue(new Error('test stopped before sign-in'))
+    const credentials = {
+      resolve: async () => ({ value: 'fixture-token' }),
+      set: async () => {},
+      unset: async () => {},
     }
-    expect(opened).not.toContain('"path" argument')
+    const { ctx, routes } = fakeComposition({ credentials })
+    apply(ctx, settings)
+    expect(await signedInFrom(routes)).toBe(false)
+    await postConnect(routes)
+    const options = connect.mock.calls[0][0]
+    expect(options.keyDir).toBe(join(process.env.DSH_HOME!, 'canness', 'cannlab'))
+    expect(options.cacheRoot).toBeUndefined()
+    expect(options.logPath).toBeUndefined()
+    expect(options.selector).toBeUndefined()
   })
 
   it('streams event frames and one result frame over a real socket', async () => {

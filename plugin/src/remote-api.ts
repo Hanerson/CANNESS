@@ -17,7 +17,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join } from 'node:path'
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { createTokenStore, dshHome, FileTokenStore, type TokenStore } from './cannlab/tokens.js'
 import { connect, closeTunnel, currentTunnel } from './cannlab/connect.js'
@@ -41,15 +41,15 @@ export const CANNLAB_STATUS_PATH = '/canness/cannlab/status'
 /** The remote-connection plugin's configuration. */
 export interface Config {
   /** Credential reference holding the GitCode refresh token. */
-  tokenRef: string
+  tokenRef: string | Volatile<string>
   /** Directory the forwarding helper is downloaded into; empty uses the Harness home. */
-  cacheRoot: string
+  cacheRoot: string | Volatile<string>
   /** Directory temporary SSH keys are written under; empty uses the Harness home. */
-  keyDir: string
+  keyDir: string | Volatile<string>
   /** File the last connect attempt is recorded to; empty uses the Harness home. */
-  logPath: string
+  logPath: string | Volatile<string>
   /** Default environment selector; empty picks the only running environment. */
-  instance: string
+  instance: string | Volatile<string>
 }
 
 export const Config = z.object({
@@ -66,20 +66,13 @@ interface ConnectionLike {
 }
 
 /**
- * A string setting, or the fallback when the value is anything else.
- *
- * The Loader hands a plugin its *validated* config, and a `.volatile()` field
- * does not always arrive as the raw string: a volatile datum can surface as an
- * opaque object. Passing such a value into `node:path` is exactly how a
- * connect attempt used to die with `"path" argument must be of type string.
- * Received an instance of Object` before it could write its first log line.
- * Every config read therefore goes through here instead of trusting the type.
- * @param value - whatever the config carried for this key.
- * @param fallback - value to use when it is not a non-empty string.
- * @returns a usable string.
+ * Read the Schemastery volatile snapshot. Raw strings also work for direct
+ * mounts. Empty or malformed settings use the route's defaults.
  */
 function setting(value: unknown, fallback: string): string {
-  return typeof value === 'string' && value.length > 0 ? value : fallback
+  const snapshot: unknown = value !== null && typeof value === 'object'
+    && 'get' in value && typeof value.get === 'function' ? value.get() : value
+  return typeof snapshot === 'string' && snapshot.length > 0 ? snapshot : fallback
 }
 
 /**
@@ -170,8 +163,6 @@ function keyDirOf(config: Config): string {
 export function apply(ctx: Context, config: Config): void {
   const tokenStore = storeOf(ctx, config)
   const keyDir = keyDirOf(config)
-  // Resolved once, through {@link setting}: a config value is not trusted to
-  // be the type its schema declares.
   const resolved = {
     cacheRoot: setting(config.cacheRoot, ''),
     logPath: setting(config.logPath, ''),
