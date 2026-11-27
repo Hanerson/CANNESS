@@ -43,3 +43,14 @@ test('an asynchronous callable is rejected', () => {
 test('an empty wrapper is rejected', () => {
   expect(() => checkWrapperSource('   ', 'op', signature)).toThrow(/empty/)
 })
+
+test('a wrapper with non-ASCII text still passes on a non-UTF-8 console', () => {
+  const unicode = [
+    '"""Rotary — CANNBench 直连包。"""',
+    '',
+    'def op(x, layout=0):',
+    '    # 注释：保留 em dash 与中文',
+    '    return x',
+  ].join('\n')
+  expect(checkWrapperSource(unicode, 'op', signature).mode).toBe('python')
+})

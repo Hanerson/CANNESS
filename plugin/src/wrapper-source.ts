@@ -18,7 +18,7 @@ export interface WrapperCheck {
 const PROBE = String.raw`
 import ast, json, sys
 
-request = json.load(sys.stdin)
+request = json.loads(sys.stdin.buffer.read().decode("utf-8"))
 source, signature, callable_name = request["source"], request["signature"], request["callable"]
 try:
     module = ast.parse(source)
@@ -70,6 +70,9 @@ export function checkWrapperSource(source: string, callable: string, signature: 
     input: JSON.stringify({ source, signature, callable }),
     encoding: 'utf8',
     maxBuffer: 8 * 1024 * 1024,
+    // The wrapper may carry non-ASCII text; without this Windows reads stdin
+    // with the ANSI code page and hands ast.parse lone surrogates.
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
   })
   if (result.status !== 0) {
     throw new Error(`wrapper check failed to run: ${result.stderr.trim() || result.error?.message || result.status}`)
