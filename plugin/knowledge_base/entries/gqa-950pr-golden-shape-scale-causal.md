@@ -5,7 +5,6 @@
   "title": "GQA 官方契约：scaleValue<=0 取 1/sqrt(D)，causal 掩码按右下角对齐且要求 S<=S_kv",
   "kind": "contract",
   "operator": "GQA",
-  "hardware": ["950pr"],
   "dtypes": ["float16", "bfloat16"],
   "keywords": ["scaleValue", "1/sqrt(D)", "is_causal", "right-bottom", "右下角对齐", "S<=S_kv", "golden", "BSND", "N_q % N_kv"],
   "evidence": "specification",
@@ -26,7 +25,7 @@
 }
 ---
 
-**适用条件**：GQA 官方任务，query `[B,S,N_q,D]`、key/value `[B,S_kv,N_kv,D]`，dtype fp16/bf16；`scaleValue` 与 `is_causal` 为调用参数。
+**适用条件**：GQA 官方任务，query `[B,S,N_q,D]`、key/value `[B,S_kv,N_kv,D]`，dtype fp16/bf16；`scaleValue` 与 `is_causal` 为调用参数。 公式与语义来自任务规范；各型号的硬件实测需要独立证据。
 
 **结论**：`scaleValue <= 0`（默认 -1.0）时自动取 `1/sqrt(D)`；显式正值必须原样使用。`N_q` 必须能被 `N_kv` 整除，`G = N_q // N_kv`，每个 KV head 被 G 个 Q head 共享；`N_kv == N_q` 退化为 MHA，`N_kv == 1` 退化为 MQA。`is_causal=True` 时掩码按右下角对齐：`j > i + (S_kv - S)` 的位置在 softmax 前置 -inf，并要求 `S <= S_kv`；违反时部分 query 行被全屏蔽，softmax 出现 NaN。输出 shape `[B,S,N_q,D]`、dtype 与 query 相同。
 

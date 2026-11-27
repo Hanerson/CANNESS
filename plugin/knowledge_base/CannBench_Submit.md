@@ -1,27 +1,36 @@
 # CANNBench 提交（cannbench.com）
 
-把 CANNESS 生成的四层算子提交到 CANN Bench 打榜的完整路径。2026-11-04 用 Exp 实测通过
-（910C，20/20，score 65.41）。
+用 CANNESS 的 `export_submission` 生成 CANNBench `direct_launch` 源工程和 ZIP，在目标环境构建并运行对应版本的官方任务评测。
 
 ## 平台契约
 
 - 提交物是 **zip**（≤50 MB）；runner 解包后 `bash build.sh` 编译、装 wheel、跑精度+性能。
-- 评分：编译 0.2 + 精度 0.3 + 性能 0.5；性能是 HAP（对 baseline 与 `t_hw_us` 锚定）。
+- 评分规则以任务版本和运行模式为准。`--no-perf` 只报告编译、运行和功能分。
 - 编译失败整批 0 分——提交前必须在同架构机器上先跑通 `bash build.sh`。
 - 支持的脚手架：`aclnn_launch` / `direct_launch` / `tilelang_cann` / `triton_ascend`。
-  CANNESS 的四层最贴近 **direct_launch**（kernel + host tiling + plugin + python）。
+  CANNESS 自动导出 **direct_launch** 工程，包含算子 kernel、生成的启动代码和 Python 封装。
 
-## 四层 → direct_launch 映射
+## 现行 direct_launch 布局
 
-| CANNESS | 工程内 |
+| 工程路径 | 用途 |
 |---|---|
-| `op_kernel/kernel.cpp` | `csrc/ops/<op>/op_kernel/<op>_kernel.cpp` |
-| `op_host/host.cpp` | `csrc/ops/<op>/op_kernel/<op>_host.cpp` |
-| `op_api/api.cpp` | `csrc/ops/<op>/op_plugin/<op>_plugin.cpp` |
-| `op_plugin/plugin.py` | `cann_bench/__init__.py` |
+| `build.sh` | 选择目标平台和编译参数，构建 wheel |
+| `setup.py` | 定义 Python 包和构建入口 |
+| `cann_bench/__init__.py` | 导出公开 Python callable |
+| `csrc/launch.cpp` | 提供生成的 host launch 和 tiling 对接 |
+| `csrc/op_kernel/kernel.cpp` | 算子 kernel 源码 |
+| `csrc/canness_tiling.h`、`csrc/canness_tiling_common.h`、`csrc/canness_tiling_host.h` | 构建契约所需的 tiling 头文件 |
+| `csrc/<dtype>/canness_tiling.h` | 启用 dtype 变体时生成的 tiling 定义 |
+| `provenance.json` | 记录公开签名、目标平台、构建脚本和文件散列 |
 
-`op_host`/`op_kernel` 走 bisheng（`-xasc`），`op_api`/plugin 走 g++；tiling 定义在
-bisheng TU、被 g++ TU 调 `std::tuple` 返回值是可行的（官方 add 示例同样做法）。
+导出器以测试包中的 kernel 源码为输入，生成 `csrc/launch.cpp` 和默认的 `cann_bench/__init__.py`。已提供的 host、API 与 plugin 源码随原测试包保存，其散列和来源列入导出工程的 `provenance.json`。详见[导出实现](../src/submission.ts)。
+
+## Exp 评测记录
+
+| 记录 | 环境 | 模式和结果 | 证据 |
+|---|---|---|---|
+| 2026-11-04 历史记录 | 910C / CANN 9.0.0 | 官方评测 20/20，score 65.41；原始报告未找到，具体参数与计分明细待核实 | [Exp 实践笔记](Exp.md) |
+| v0.3.0 交付验收 | CANNLab NPU；同轮发布记录中的闭环环境为 Ascend910 / CANN 9.0.0 | 官方 `tasks-v2.1.0`，`--no-perf`，20/20，score 30（编译 5 + 运行 5 + 功能 20），官方性能分待验证 | [发布记录](../../CHANGELOG.md#030---2026-11-14)与[验收记录](../../tickets/TODO.md#有-cannlab-时一起验收) |
 
 ## 提交接口
 

@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, statSync, type Dirent } from 'node:fs'
-import { basename, join } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const entryKinds = ['contract', 'implementation', 'troubleshooting', 'benchmark'] as const
@@ -105,7 +105,7 @@ function readEntry(file: string): KnowledgeEntry {
 }
 
 export function knowledgeRootPath(root: URL | string): string {
-  return root instanceof URL ? fileURLToPath(root) : root
+  return resolve(root instanceof URL ? fileURLToPath(root) : root)
 }
 
 export function loadKnowledgeEntries(root: URL | string): KnowledgeEntry[] {
@@ -114,7 +114,13 @@ export function loadKnowledgeEntries(root: URL | string): KnowledgeEntry[] {
   let files: Dirent[]
   try { files = readdirSync(dir, { withFileTypes: true }) }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && statSync(rootPath).isDirectory()) return []
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      if (!statSync(rootPath, { throwIfNoEntry: false })?.isDirectory()) {
+        throw new Error(`Knowledge base root is missing or is not a directory: ${rootPath}`, { cause: error })
+      }
+      if (code === 'ENOENT') return []
+    }
     throw error
   }
   return files

@@ -1,27 +1,28 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { existsSync } from 'node:fs'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { entryKinds, evidenceTypes, loadKnowledgeEntries } from './knowledge-entry.js'
+import { entryKinds, evidenceTypes } from './knowledge-entry.js'
 import { queryKnowledge } from './knowledge-search.js'
-import { probeKnowledgeRoot } from './probe-knowledge.js'
+import { loadProbeKnowledge } from './probe-knowledge.js'
 import { resolveWorkspace } from './workspace.js'
 
 export const name = 'canness-knowledge'
 export const inject = ['tools']
 
-export interface Config { kbRoot: string; workspace?: string }
+export interface Config { kbRoot?: string; workspace?: string }
 
 export const Config: z<Config> = z.object({
-  kbRoot: z.string().required(),
+  kbRoot: z.string().default(''),
   workspace: z.string().default(''),
 })
+
+const bundledRoot = new URL('../knowledge_base/', import.meta.url)
 
 const stringList = { type: 'array', items: { type: 'string' } } as const
 const parameters = {
   operator_name: { type: 'string', description: 'Canonical operator name or alias, e.g. ArgMax.' },
   query: { type: 'string', description: 'Terms, code symbols, error text, or a diagnostic question. Max 500 characters.' },
-  hardware: { type: 'string', description: 'Hardware target, e.g. 950pr or 910b.' },
+  hardware: { type: 'string', description: 'Hardware target, e.g. Ascend910B2, 910B or 950pr. A 910B family search may include part-specific findings; each hit retains its declared scope.' },
   dtype: { type: 'string', description: 'Relevant input dtype, e.g. bf16.' },
   layout: { type: 'string', description: 'Relevant layout, e.g. contiguous or strided.' },
   cann_version: { type: 'string', description: 'Exact CANN version when known.' },
@@ -98,9 +99,9 @@ export function apply(ctx: Context, config: Config): void {
       }
       if (args.limit !== undefined && (args.limit < 1 || args.limit > 8)) throw new Error('limit must be from 1 to 8')
       const { include_probes, ...query } = args
-      if (!include_probes) return queryKnowledge(config.kbRoot, query)
-      const root = probeKnowledgeRoot(resolveWorkspace(config.workspace, exec))
-      return queryKnowledge(config.kbRoot, query, existsSync(root) ? loadKnowledgeEntries(root) : [])
+      const root = config.kbRoot || bundledRoot
+      if (!include_probes) return queryKnowledge(root, query)
+      return queryKnowledge(root, query, loadProbeKnowledge(resolveWorkspace(config.workspace, exec)))
     },
   }))
 }

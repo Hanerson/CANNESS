@@ -5,7 +5,6 @@
   "title": "Exp 官方契约：base<=0 走自然底数 exp(x*scale+shift)，base>0 走 exp((x*scale+shift)*ln(base))",
   "kind": "contract",
   "operator": "Exp",
-  "hardware": ["950pr"],
   "dtypes": ["float16", "float32", "bfloat16"],
   "keywords": ["base", "scale", "shift", "ln(base)", "natural base", "自然底数", "scale=0", "base^shift", "exp(shift)", "golden.py", "proto.yaml", "exp formula"],
   "evidence": "specification",
@@ -30,7 +29,7 @@
 }
 ---
 
-**适用条件**：Exp 官方任务，schema 为 `exp(Tensor x, float base=-1.0, float scale=1.0, float shift=0.0) -> Tensor y`，dtype 为 fp16/fp32/bf16。
+**适用条件**：Exp 官方任务，schema 为 `exp(Tensor x, float base=-1.0, float scale=1.0, float shift=0.0) -> Tensor y`，dtype 为 fp16/fp32/bf16。 公式与语义来自任务规范；各型号的硬件实测需要独立证据。
 
 **结论**：官方公式按底数分支：`base > 0` 时 `y = exp((x*scale + shift) * ln(base))`；`base <= 0` 时用自然底数，`y = exp(x*scale + shift)`。默认 `base=-1.0` 是自然 exp，不是无效值；输出 shape/dtype 与输入一致。特殊情况表里 `scale=0 且 x 有限（任意 base）→ base^shift` 与分段公式及 golden 冲突：golden 先算 `temp = scale*x + shift`，再按底数分支，所以 scale=0 时 `base <= 0` 的结果是 `exp(shift)`，只有 `base > 0` 才是 `base^shift`。其余特殊值：base<=0,scale=1,shift=0 → e^x；base>0,scale=1,shift=0 → base^x；base=1 且 x 有限 → 1；base=1 且 x 含 ±Inf/NaN → NaN。
 

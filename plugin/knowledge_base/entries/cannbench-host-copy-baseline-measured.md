@@ -4,6 +4,8 @@
   "id": "cannbench-host-copy-baseline-measured",
   "title": "实测：导出包每个 case 的 aclrtMemcpy 基线是 2，旧模板 per-launch 拷贝会到 11（阈值 5）",
   "kind": "benchmark",
+  "hardware": ["Ascend910B2"],
+  "cann_versions": ["9.2.1"],
   "keywords": ["aclrtMemcpy", "aclrtMemcpyAsync", "api_statistic", "Count > 5", "cpu_fallback_detected", "tiling 上传", "msprof", "导出包", "910B2"],
   "evidence": "reproduced",
   "sources": [

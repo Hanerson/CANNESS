@@ -14,6 +14,10 @@ function normalizeDtype(value: string): string {
   return Object.hasOwn(aliases, dtype) ? aliases[dtype] : dtype
 }
 
+function normalizeHardware(value: string): string {
+  return normalize(value).replace(/^ascend(?=910b\d*$|950(?:pr|dt)(?:\d+)?$)/, '')
+}
+
 export interface KnowledgeQuery {
   operator_name?: string
   query?: string
@@ -57,13 +61,19 @@ function matchCount(query: Set<string>, text: string): number {
 }
 
 function scopes(entry: KnowledgeEntry, args: KnowledgeQuery): number {
+  let specific = 0
+  if (args.hardware !== undefined && entry.hardware !== undefined) {
+    const wanted = normalizeHardware(args.hardware)
+    const declared = entry.hardware.map(normalizeHardware)
+    if (declared.includes(wanted)) specific += 2
+    else if (wanted === '910b' && declared.some(part => /^910b\d+$/.test(part))) specific += 1
+    else return -1
+  }
   const filters = [
-    [args.hardware, entry.hardware, normalize],
     [args.dtype, entry.dtypes, normalizeDtype],
     [args.layout, entry.layouts, normalize],
     [args.cann_version, entry.cann_versions, value => value.trim().normalize('NFKC').toLowerCase()],
   ] as const satisfies ReadonlyArray<readonly [string | undefined, string[] | undefined, (value: string) => string]>
-  let specific = 0
   for (const [wanted, known, canonical] of filters) {
     if (wanted === undefined || known === undefined) continue
     if (!known.some(value => canonical(value) === canonical(wanted))) return -1

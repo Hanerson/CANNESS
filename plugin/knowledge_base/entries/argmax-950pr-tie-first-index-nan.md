@@ -5,7 +5,6 @@
   "title": "ArgMax 官方契约：并列取最小下标，NaN 视为最大值且首个 NaN 获胜",
   "kind": "contract",
   "operator": "ArgMax",
-  "hardware": ["950pr"],
   "dtypes": ["float16", "float32", "bfloat16", "int32", "int64"],
   "layouts": ["contiguous"],
   "keywords": ["torch.argmax", "first index", "第一个最大值", "最小索引", "tie-break", "NaN", "index_gather", "desc.md", "并列"],
@@ -27,7 +26,7 @@
 }
 ---
 
-**适用条件**：ArgMax 官方任务（该参考包为 950PR），输入 dtype 为 fp16/fp32/bf16/int32/int64，rank 0–8；查询任意 dim 的返回下标时。
+**适用条件**：ArgMax 官方任务，输入 dtype 为 fp16/fp32/bf16/int32/int64，rank 0–8；查询任意 dim 的返回下标时。 公式与语义来自任务规范；各型号的硬件实测需要独立证据。
 
 **结论**：官方 desc.md 明文规定：`dim` 维上存在多个相同最大值时，返回第一个（最小索引）出现的位置，与 `torch.argmax` 一致；切片含 NaN 时 NaN 视为最大值，返回首个 NaN 的索引；±Inf 按正常大小参与比较。输出 `indices` 固定 int64；rank=0 的标量输入 `dim` 可取 0 或 -1，输出为值为 0 的 int64 标量。`proto.yaml` 说明官方 checker 不做逐元素并列顺序比对，而用 `index_gather`：`input.gather(dim, indices) == input.amax(dim, keepdim=True)`，因此「评测通过」只保证索引指向最大值，不保证最小索引；要满足契约仍需实现首个下标。
 

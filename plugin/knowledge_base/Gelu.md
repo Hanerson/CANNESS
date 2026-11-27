@@ -1,6 +1,6 @@
 # Gelu（tanh 近似，Ascend910B / CANN 9.1）
 
-适用：float16，`[B, N]`，示例 `[8, 4096]`；目标 910B2 / 910B4。
+适用：float16，`[B, N]`，示例 `[8, 4096]`；目标 910B2 / 910B4。本文的耗时、误差和 tiling 数字来自 Ascend910B / CANN 9.1 的历史测量。
 
 ## 公式
 
@@ -11,10 +11,13 @@ Gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 kernel 内不要直接依赖 `Tanh`：在 CANN 9.1 / 910B 上 `Tanh(float)` 会带来明显的 scalar 开销（实测 46.9us → 改用 `Exp` 后 32.2us）。推荐等价式：
 
 ```text
-y = 2 * sqrt(2/pi) * (x + 0.044715 * x^3)
-tanh(y) = 1 - 2 / (exp(2y) + 1)
-Gelu(x) = 0.5 * x * (1 + tanh(y))
+inner = sqrt(2/pi) * (x + 0.044715 * x^3)
+y = 2 * inner
+1 + tanh(inner) = 2 - 2 / (exp(y) + 1)
+Gelu(x) = 0.5 * x * (2 - 2 / (exp(y) + 1))
 ```
+
+例如 `x = 1` 时，直接计算 tanh 近似或使用下面的 `Exp` 等价式，结果都约为 `0.841192`。
 
 实现要点：
 
