@@ -233,3 +233,23 @@ test('the generated wrapper keeps the tiling block alive for the asynchronous la
   expect(source).toMatch(/_tiling = _tiling_buffer\(/)
   expect(source).not.toMatch(/_tiling = _torch\.empty\(/)
 })
+
+test('the exported launcher uploads the tiling block only when the attributes change', () => {
+  const { workspace, generation, spec } = exportFixture()
+  const { sourceDir } = exportSubmission(workspace, generation, spec, 'exp')
+  const launch = readFileSync(join(sourceDir, 'csrc', 'launch.cpp'), 'utf8')
+  // CANNBENCH reads api_statistic.csv and zeroes the whole operator when a
+  // single aclrtMemcpy* row exceeds five calls, so the copy cannot be per
+  // launch. It has to sit behind the attribute cache, after one device drain.
+  expect(launch).toContain('CannessTilingChanged')
+  expect(launch).toContain('aclrtSynchronizeDevice')
+  expect(launch.match(/aclrtMemcpy\(/g) ?? []).toHaveLength(1)
+  const guard = launch.indexOf('if (CannessTilingChanged(')
+  const drain = launch.indexOf('aclrtSynchronizeDevice')
+  const copy = launch.indexOf('aclrtMemcpy(')
+  expect(guard).toBeGreaterThan(-1)
+  expect(drain).toBeGreaterThan(guard)
+  expect(copy).toBeGreaterThan(drain)
+  // The launch itself stays unconditional: caching must not skip the kernel.
+  expect(launch.indexOf('canness_kernel<<<')).toBeGreaterThan(copy)
+})
