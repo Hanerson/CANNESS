@@ -2,7 +2,7 @@
 
 [English](README.en.md) · [文档索引](docs/README.md) · [更新日志](CHANGELOG.md) · [CI](https://github.com/Hanerson/CANNESS/actions/workflows/ci.yml)
 
-CANNESS 是面向昇腾 CANN 算子开发的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件。它把算子规格、四层实现、测试包、远端 NPU 评测和按预算迭代连成一条工作流，并可将符合当前导出契约的算子打包为 CANNBench 提交工程。
+CANNESS 是面向昇腾 CANN 算子开发的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件。它把算子规格、kernel 实现、测试包、远端 NPU 评测和按预算迭代连成一条工作流，并可将符合当前导出契约的算子打包为 CANNBench 提交工程。
 
 ## 快速开始
 
@@ -21,7 +21,7 @@ dsh plugin --profile canness-web add "/absolute/path/to/CANNESS/plugin"
 dsh --profile canness-web
 ```
 
-把安装路径换成实际绝对路径。Web 界面打开后，在 **设置 → CANNESS** 配置 SSH 或连接 CANNLab。从仓库根目录启动时可直接使用默认知识库路径。若从其他目录或 dsh 源码运行，按[安装与配置指南](docs/guides/setup.md)配置知识库绝对路径。
+把安装路径换成实际绝对路径。Web 界面打开后，在 **设置 → CANNESS** 配置 SSH 或连接 CANNLab。默认使用插件包内的知识库；自定义语料可按[安装与配置指南](docs/guides/setup.md)设置路径。
 
 可以先在会话中请求「调用 `kb_search` 查询 Exp」，验证插件已加载。测试包生成后，先运行 `preflight_evaluation()` 校验本地包，再按需通过 `preflight_evaluation({ remote: true })` 检查远端工具链。
 
@@ -31,7 +31,7 @@ dsh --profile canness-web
    或用 910B/A3/950 的短名/部件名；探测到的型号只作为建议，与声明不一致时 `submit_spec` 会先返回比较结果，
    由你确认后再传 `confirm_target: true` 创建 generation。可移植场景显式声明 `mode: "portable"`。
    用 `kb_search` 按算子、关键词、硬件、dtype 和布局获取带来源的知识条目。
-2. **生成与打包。** 用 `write_operator` 写入 kernel、host、API 和插件四层，通过 `write_package_file` 填写精度参考 `golden.h`，再用 `build_test_package` 生成可在目标机运行的测试包。需要声明能力边界时用 `spec.support` 写 dtype × 属性矩阵与对齐要求，导出时会生成守卫。
+2. **生成与打包。** 用 `write_operator` 写入 kernel，并可附上用于记录的 host、API 和插件源码。通过 `write_package_file` 填写精度参考 `golden.h`，再用 `build_test_package` 生成可在目标机运行的测试包。需要声明能力边界时用 `spec.support` 写 dtype × 属性矩阵与对齐要求，导出时会生成守卫。
 3. **评测与迭代。** `run_evaluation` 通过 SSH 调用远端 runner，编译算子，检查精度并读取真实 `msprof` 采样。连接中断后可在同一工作区重试。达到停机条件时结束迭代，自动续轮只针对本次评测所属会话。目标机上的方言与参数会写进 `dist/build-env.txt`，kernel 打印 `CANNESS_TILING_REPORT` 后报告会给出每 block 的调用预算。
 4. **导出与验收。** 用 `export_submission` 生成 CANNBench `direct_launch` 源工程、ZIP 和来源记录（可用 `build_script` 覆盖构建脚本、`target_soc` 选目标微架构）。在目标环境构建 wheel，再用对应版本的官方任务评测器验证；`validate_submission({ cases_file })` 可按官方 cases 逐条回归，`run_evaluation({ submission })` 会把验收并进同一份报告。
 

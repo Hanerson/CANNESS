@@ -25,7 +25,7 @@ Windows 路径可写成 `D:/projects/CANNESS/plugin`。使用 dsh 源码时，�
 
 ## 知识库与工作区路径
 
-bundle 的 `kbRoot` 默认是 `./plugin/knowledge_base`，相对于 dsh 进程的当前目录。若从其他目录启动，或使用自定义语料，在 `~/.dsh/profiles/canness-web/cordis.patch.yml` 为知识插件设绝对路径：
+插件默认读取安装包内的 `knowledge_base`。升级后，如果 profile 单独保留了旧的 `kbRoot: ./plugin/knowledge_base`，可移除所覆盖的路径以使用包内目录。使用自定义语料时，可在 `~/.dsh/profiles/canness-web/cordis.patch.yml` 为知识插件指定绝对路径。
 
 ```yaml
 - id: canness-knowledge
@@ -40,6 +40,8 @@ bundle 的 `kbRoot` 默认是 `./plugin/knowledge_base`，相对于 dsh 进程�
 ### 直接 SSH
 
 在设置卡填写 SSH 主机、端口、用户名和认证方式，再配置远端 `inbox` 与 `outbox`。使用对该账号可写的目录。自管目标机需要 Bash、Python、`base64`、`tar` 和包含 `bisheng`、`msprof` 的 CANN 环境。多套 toolkit 并存时可设 `setEnv` 选择其 `set_env.sh`。
+
+在高级设置填写经独立核验的 SSH 主机密钥指纹。若 CANN 只安装在容器内，可由管理员配置本机 SSH 转发并将插件指向转发后的端口，指纹应对应容器 SSH 服务。预检中的 `remote.endpoint` 是插件实际拨号的地址，`remote.cann.cannVersion`、`compilerVersion` 和 `toolkitHome` 用于核对进入的工具链。
 
 配置了 `privateKeyPath` 时使用私钥。否则通过 dsh 凭据引用 `CANNNESS_SSH_PASSWORD` 解析密码，引用名可经 `passwordEnv` 配置。设置卡保存密码到 dsh 凭据存储，配置中保留引用。设置卡的连接测试用于 TCP 连通检查；有测试包后可以用 `preflight_evaluation({ remote: true })` 核对 SSH 认证和工具链。
 

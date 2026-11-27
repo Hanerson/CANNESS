@@ -1,10 +1,10 @@
 # CANNESS 剩余待办
 
-核对基线为 `main@0ca2069`（v0.3.0）。根据原 `tickets.zip`、合入 `main` 的实现、工单报告和 CI，只保留尚未实现或缺少验收证据的事项。优先级按对日常开发和原事故复验的影响排序。[main CI](https://github.com/Hanerson/CANNESS/actions/runs/43437048089) · [工单报告](reports/)
+当前待办按 2026-11-27 的 `main@a86ca2c`（插件 v0.5.0，39 个 TypeScript 测试文件）核对。下列验收记录保留各次运行对应的版本或日期。[main CI](https://github.com/Hanerson/CANNESS/actions/runs/43437048089) · [工单报告](reports/)
 
 ## 先做
 
-- [x] **Windows 测试自动找到 Git Bash 工具（T-013）**。测试只为 Runner 子进程加入 Git Bash 自带工具目录。PowerShell 原有 PATH 下用 pnpm 11.1.2 和 npm 分别运行全量测试，均为 22 个测试文件、189 项通过。类型检查和构建通过。[Runner 测试](../plugin/tests/eval-runner.test.ts)
+- [x] **Windows 测试自动找到 Git Bash 工具（T-013）**。测试只为 Runner 子进程加入 Git Bash 自带工具目录。2026-11-13 的 `02857ad` 验收记录显示，PowerShell 原有 PATH 下用 pnpm 11.1.2 和 npm 分别运行全量测试，均为 22 个测试文件、189 项通过。类型检查和构建通过。[Runner 测试](../plugin/tests/eval-runner.test.ts)
 - [x] **真实 DSH 会话复验续轮（T-001 / T-002 / T-003）**。在 DSH 0.2.2-rc.2 的 `canness-web` profile 上，用隔离工作区创建两个真实会话。静置 10 分钟零提示。会话 A 通过 CANNLab SSH 得到新的 `perf_fail` 后，由验收脚本经 DSH 事件分派器触发回合结束，A 收到 1 次续轮，B 收到 0 次。同一报告再次触发回合结束没有多发提示。[续轮监听器](../plugin/src/loop.ts)
 
 ## 有 CANNLab 时一起验收

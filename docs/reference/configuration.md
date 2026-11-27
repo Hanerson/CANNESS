@@ -4,18 +4,21 @@ bundle 配置以 [cordis.patch.yml](../../plugin/cordis.patch.yml) 与各插件�
 
 ## 知识库与生成
 
-- `canness-knowledge.kbRoot` 为知识库根目录，bundle 默认 `./plugin/knowledge_base`。
+- `canness-knowledge.kbRoot` 可覆盖知识库根目录。缺省或留空时使用安装包内的 `knowledge_base`；显式相对路径按 dsh 进程的当前目录解析。
 - `canness-generator.workspace`、`canness-eval.workspace`、`canness-loop.workspace` 采用相同的工作区解析规则。默认工作区是会话工作目录本身——`operators/`、`packages/`、`submissions/`、`.canness/` 直接位于该目录，不再嵌套 `canness-workspace/`。拿不到绝对会话目录时退到进程 cwd；显式覆盖时相对路径按会话目录解析，三处应指向同一目录。详见[插件架构](../design/05-plugin-architecture.md#工作区)。
 
 ## 远端评测
 
 - `host`、`port`、`username` 指定 SSH 端点。bundle 默认主机和用户名为空，端口为 `22`。
 - `privateKeyPath` 默认空。配置私钥时优先使用私钥，否则从 `passwordEnv` 指定的 dsh 凭据引用解析密码。默认引用为 `CANNNESS_SSH_PASSWORD`。
+- 直接 SSH 和手工转发默认需要 `hostFingerprint`，填写通过受信任渠道取得的 OpenSSH `SHA256:…` 主机密钥指纹。旧配置确实需要临时放行时，可显式设置 `allowUnpinnedSsh: true`。通过设置卡创建的 CANNLab 托管转发沿用其连接方式。
+- `targetApproval` 是用户在设置卡中保存的目标确认编号。核对 `submit_spec` 返回的声明目标与探测硬件后再保存。清空编号会撤销后续提交的确认。
 - `inbox`、`outbox` 采用 bundle 的 `/tmp/canness-a/inbox` 与 `/tmp/canness-a/outbox`，可改为账号可写的远端绝对路径。
-- `timeoutSec` 默认 `1800`，`pollIntervalMs` 默认 `2000`，单位分别为秒和毫秒。
+- `timeoutSec` 默认 `1800` 秒，runner 在自检、构建、运行和 profiler 阶段共用该预算，远端外层给结束与写报告留出余量。提交验收也从配置读取时限，通过独立的 `--timeout-sec` 执行。`pollIntervalMs` 默认 `2000` 毫秒。
 - `setEnv` 默认空，由 runner 探测 CANN 环境脚本。多套工具链可用显式路径固定版本。
 - `device` 可指定一个远端设备编号，例如 `"7"`。`deviceLock` 可指定同一设备使用的远端共享锁路径。留空时读取远端 `CANNESS_ASCEND_VISIBLE_DEVICES` 和 `CANNESS_DAVINCI_LOCK`，再回退到设备 7 或所选设备对应的 `/tmp/canness/davinci<ID>.lock`。正式评测、提交验收和独立探针使用同一组设置。
 - `readRoots` 默认放行 CANN 安装树 `/usr/local/Ascend`，并从 `setEnv` 推导它所属的工具链根目录，因此知识库让你读 toolkit 头文件、示例或 profiler CSV 时不再需要额外配置；路径仍会规范化并拒绝符号链接逃逸，`/` 永远不放行。
+- `retainAttempts` 默认保留最近 8 个已完成的尝试，正式评测按 generation 计算，提交验收按 inbox 计算。`0` 禁用回收。没有完整结果文件的目录保留供排查，已完成且超出保留范围的目录和其远端路径会到期。
 - `canness-knowledge.workspace` 仅在搜索本地探针记录时使用。若评测插件显式覆盖了工作区，知识库插件也应指向同一目录。
 
 ## 迭代预算与停机

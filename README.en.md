@@ -2,7 +2,7 @@
 
 [简体中文](README.md) · [Documentation](docs/README.md) · [Changelog](CHANGELOG.md) · [CI](https://github.com/Hanerson/CANNESS/actions/workflows/ci.yml)
 
-CANNESS is a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plugin for Ascend CANN operator development. It turns an operator specification into a four-layer implementation and test package, evaluates it on a remote NPU, and iterates within a budget. It can also export operators that fit its current export contract as CANNBench submissions.
+CANNESS is a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plugin for Ascend CANN operator development. It turns an operator specification into a kernel and test package, evaluates it on a remote NPU, and iterates within a budget. It can also export operators that fit its current export contract as CANNBench submissions.
 
 ## Quick start
 
@@ -21,14 +21,14 @@ dsh plugin --profile canness-web add "/absolute/path/to/CANNESS/plugin"
 dsh --profile canness-web
 ```
 
-Replace the plugin path with your absolute checkout path. In the Web UI, open **Settings → CANNESS** to configure SSH or connect to CANNLab. The default knowledge path works when starting dsh from the repository root. For other launch directories or a dsh source checkout, set the absolute knowledge path as shown in the [setup guide](docs/guides/setup.md).
+Replace the plugin path with your absolute checkout path. In the Web UI, open **Settings → CANNESS** to configure SSH or connect to CANNLab. The plugin uses its bundled knowledge base by default. To use a custom knowledge base, set its path as shown in the [setup guide](docs/guides/setup.md).
 
 Ask the agent to call `kb_search` for Exp to check that the plugin loaded. After building a test package, use `preflight_evaluation()` to check it locally and `preflight_evaluation({ remote: true })` to check the remote toolchain.
 
 ## Workflow
 
 1. **Submit a specification and find evidence.** Use `submit_spec` to set the tensor contracts, target platform, and performance goal. Use `kb_search` to retrieve sourced entries by operator, keyword, hardware, dtype, and layout.
-2. **Generate and package.** Use `write_operator` to write the kernel, host, API, and plugin layers. Supply the correctness reference in `golden.h` with `write_package_file`, then run `build_test_package`.
+2. **Generate and package.** Use `write_operator` to write the kernel. You can also include host, API, and plugin source for reference. Supply the correctness reference in `golden.h` with `write_package_file`, then run `build_test_package`.
 3. **Evaluate and iterate.** `run_evaluation` invokes the remote runner over SSH, compiles the operator, checks correctness, and reads real `msprof` samples. Retry from the same workspace after a connection interruption. The loop stops under the configured policy and automatically retries only in the session that owns the evaluation.
 4. **Export and verify.** Use `export_submission` to produce a CANNBench `direct_launch` source tree, ZIP, and provenance record. Build the wheel in the target environment and verify it with the matching official task evaluator.
 

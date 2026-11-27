@@ -1,0 +1,58 @@
+{
+  "builtPluginOverForwardedSsh": {
+    "endpoint": "127.0.0.1:20022",
+    "ssh": "connected",
+    "cann": {
+      "ready": true,
+      "toolchain": "2026-10-23T10:55:39+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
+      "cannVersion": "9.2.1",
+      "compilerVersion": "2026-10-23T10:55:39+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
+      "toolkitHome": "/usr/local/Ascend/cann-9.2.1",
+      "socVersionEnv": null,
+      "setEnv": "/usr/local/Ascend/cann-9.2.1/set_env.sh",
+      "searchedEnv": [
+        "/usr/local/Ascend/cann-9.2.1/set_env.sh"
+      ],
+      "compiler": "/usr/local/Ascend/cann-9.2.1/bin/bisheng",
+      "msprof": "/usr/local/Ascend/cann-9.2.1/bin/msprof",
+      "issues": [],
+      "detectedSoc": "Ascend910B2"
+    }
+  },
+  "directHostRunner": {
+    "ready": true,
+    "toolchain": "2024-12-10T17:38:18+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
+    "cannVersion": "7.6.0.2.220",
+    "compilerVersion": "2024-12-10T17:38:18+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
+    "toolkitHome": "/usr/local/Ascend/ascend-toolkit/latest",
+    "socVersionEnv": null,
+    "setEnv": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+    "searchedEnv": [
+      "/usr/local/Ascend/ascend-toolkit/latest/set_env.sh",
+      "<remote-home>/Ascend/ascend-toolkit/set_env.sh",
+      "/usr/local/Ascend/ascend-toolkit/set_env.sh"
+    ],
+    "compiler": "/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin/bisheng",
+    "msprof": "/usr/local/Ascend/ascend-toolkit/latest/bin/msprof",
+    "issues": [],
+    "detectedSoc": "Ascend910B2"
+  },
+  "containerInheritedEnvironment": {
+    "ready": true,
+    "toolchain": "2026-10-23T10:55:39+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
+    "cannVersion": "9.2.1",
+    "compilerVersion": "2026-10-23T10:55:39+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
+    "toolkitHome": "/usr/local/Ascend/cann-9.2.1",
+    "socVersionEnv": "ascend910b1",
+    "setEnv": "/usr/local/Ascend/cann-9.2.1/set_env.sh",
+    "searchedEnv": [
+      "/usr/local/Ascend/cann-9.2.1/set_env.sh"
+    ],
+    "compiler": "/usr/local/Ascend/cann-9.2.1/bin/bisheng",
+    "msprof": "/usr/local/Ascend/cann-9.2.1/bin/msprof",
+    "issues": [
+      "SOC_VERSION=ascend910b1 differs from npu-smi chip Ascend910B2"
+    ],
+    "detectedSoc": "Ascend910B2"
+  }
+}

@@ -30,7 +30,7 @@ CANNESS 以 `dsh-canness` bundle 接入 DeepSeek Harness。dsh 提供会话、�
 
 `state.json` 保存当前 generation、规格、预算计数、包指纹、待评测阶段和最近的报告。每个工作区有一份当前任务状态。需要并行处理独立任务时，可使用不同的会话目录或独立配置的工作区。
 
-`operators/` 保存四层输入源码、可选 golden 和来源声明。构建工具为当前 generation 渲染测试驱动、编译脚本、配置和 manifest 到 `packages/`。本地预检与上传使用同一包指纹。可以在本地将支持的同形状算子导出到 `submissions/`，再到目标环境构建 CANNBench wheel。
+`operators/` 保存 kernel 和已提供的 host、API、plugin 源码，以及可选的 golden 和来源声明。构建工具将这些产物与测试驱动、编译脚本、配置和 manifest 打包到 `packages/`。默认 build 编译 kernel 和通用驱动，随包保留的其他源码列在 `documentedOnlyLayers`。本地预检与上传使用同一包指纹。支持的同形状算子可导出到 `submissions/`，再到目标环境构建 CANNBench wheel。
 
 ## 评测与续轮
 
