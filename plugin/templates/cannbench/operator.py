@@ -32,7 +32,9 @@ def _tiling_buffer(device, capacity):
     created = _builtins.getattr(_tiling_buffer, "cache", None)
     if created is None:
         created = _tiling_buffer.cache = {}
-    key = (_builtins.id(device), capacity)
+    # `id()` of a temporary torch.device is reused across calls, which would
+    # allocate a new tiling block (and so a new upload) on every launch.
+    key = (_builtins.str(device), capacity)
     buffer = created.get(key)
     if buffer is None:
         buffer = created[key] = _torch.empty((capacity,), dtype=_torch.uint8, device=device)

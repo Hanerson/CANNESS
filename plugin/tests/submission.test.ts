@@ -253,3 +253,13 @@ test('the exported launcher uploads the tiling block only when the attributes ch
   // The launch itself stays unconditional: caching must not skip the kernel.
   expect(launch.indexOf('canness_kernel<<<')).toBeGreaterThan(copy)
 })
+
+test('the tiling cache key survives across calls', () => {
+  const { workspace, generation, spec } = exportFixture()
+  const { sourceDir } = exportSubmission(workspace, generation, spec, 'exp')
+  const source = readFileSync(join(sourceDir, 'cann_bench', '__init__.py'), 'utf8')
+  // id() of a temporary torch.device object is reused between calls, so keying
+  // the cache on it allocates a new block (and uploads again) every launch.
+  expect(source).not.toContain('_builtins.id(device)')
+  expect(source).toContain('_builtins.str(device)')
+})
