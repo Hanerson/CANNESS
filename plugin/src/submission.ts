@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
-import { launchGeometry, LAYER_FILES, normalizeEol, packageHash, renderBuildContract, requireFreshBuild } from './package-files.js'
+import { launchGeometry, LAYER_FILES, normalizeEol, packageHash, renderBuildContract, requireFreshBuild, tensorElementCount } from './package-files.js'
 import { sha256 } from './provenance.js'
 import { declaredTarget, normalizedDtype, resolveSoc, TARGET_OPTIONS, type OperatorSpec } from './spec.js'
 import { describeFindings, lintSubmissionSources } from './submission-rules.js'
@@ -45,6 +45,21 @@ function pythonValue(value: string | number | boolean): string {
   return JSON.stringify(value)
 }
 
+/** Preflight the automatic wrapper's shape requirements. */
+export function automaticExportCompatibility(spec: OperatorSpec): { exportable: true } | { exportable: false; exportReason: string } {
+  const tensors = [...spec.input_specs, ...spec.output_specs]
+  try {
+    for (const tensor of tensors) tensorElementCount(tensor)
+  } catch (error) {
+    return { exportable: false, exportReason: error instanceof Error ? error.message : String(error) }
+  }
+  const shape = spec.input_specs[0]!.shape
+  if (tensors.some(tensor => !isDeepStrictEqual(tensor.shape, shape))) {
+    return { exportable: false, exportReason: 'automatic CANNBench export currently supports same-shape inputs and outputs' }
+  }
+  return { exportable: true }
+}
+
 function submissionValues(spec: OperatorSpec, callable: string, custom = false): Record<string, string> {
   if (!publicIdentifier(callable)) throw new Error('callable must be a public Python identifier')
   const inputNames = spec.input_specs.map(tensor => tensor.name)
@@ -55,10 +70,10 @@ function submissionValues(spec: OperatorSpec, callable: string, custom = false):
     throw new Error('CANNBench input and attribute names must be distinct public Python identifiers')
   }
   // Shape-changing kernels need a task-specific output/geometry adapter.
-  const shape = spec.input_specs[0]!.shape
   const tensors = [...spec.input_specs, ...spec.output_specs]
-  if (!custom && tensors.some(tensor => JSON.stringify(tensor.shape) !== JSON.stringify(shape))) {
-    throw new Error('automatic CANNBench export currently supports same-shape inputs and outputs')
+  if (!custom) {
+    const compatibility = automaticExportCompatibility(spec)
+    if (!compatibility.exportable) throw new Error(compatibility.exportReason)
   }
   const dtype = tensors.map(tensor => {
     const type = DTYPES[normalizedDtype(tensor.dtype)]

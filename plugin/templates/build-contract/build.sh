@@ -13,6 +13,7 @@ cd "$HERE"
 
 CANN="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 SOC_VERSION="{{SOC_VERSION}}"
+NPU_ARCH="{{NPU_ARCH}}"
 BISHENG="${CANNESS_BISHENG:-bisheng}"
 
 if ! command -v "$BISHENG" >/dev/null 2>&1; then
@@ -31,6 +32,8 @@ INCLUDES=(
   -I"$CANN/include"
 )
 FLAGS=(-x cce -std=c++17 "--cce-soc-version=$SOC_VERSION" --cce-soc-core-type=VecCore)
+printf 'CANNESS_BUILD dialect=legacy\nCANNESS_BUILD soc=%s\nCANNESS_BUILD npu_arch=%s\nCANNESS_BUILD flags=%s\n' \
+  "$SOC_VERSION" "$NPU_ARCH" "${FLAGS[*]}"
 
 # Kernel object: GET_TILING_DATA / DTYPE_X come from the generic shim.
 "$BISHENG" "${FLAGS[@]}" "${INCLUDES[@]}" -include "$HERE/canness_tiling.h" \

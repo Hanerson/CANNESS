@@ -1,6 +1,7 @@
 import builtins as _builtins
 import ctypes as _ct
 from pathlib import Path as _Path
+from threading import Lock as _Lock
 
 import torch as _torch
 import torch_npu as _torch_npu
@@ -17,28 +18,22 @@ def _bind(variant):
 
 
 _launchers = {dtype: _bind(variant) for dtype, variant in { {{PY_VARIANTS}} }.items()}
+_tiling_buffers = {}
+_tiling_lock = _Lock()
 
 
-def _tiling_buffer(device, capacity):
-    """One tiling block per device, kept for the process lifetime.
+def _tiling_buffer(device, capacity, dtype):
+    """Keep each launcher's tiling blocks alive for asynchronous device reads.
 
-    The kernel launch is asynchronous and reads the tiling block *after* this
-    function returns. A per-call allocation is therefore freed while the kernel
-    may still be reading it, and the caching allocator can hand the block to the
-    next allocation: the kernel then builds its geometry from recycled bytes.
-    That shows up as unrelated wrong results on large inputs, or as a device
-    fault in the middle of an unrelated launch.
+    Dtype variants live in separate libraries with separate upload caches.
+    Give each library its own device buffer so it can track its current bytes.
     """
-    created = _builtins.getattr(_tiling_buffer, "cache", None)
-    if created is None:
-        created = _tiling_buffer.cache = {}
-    # `id()` of a temporary torch.device is reused across calls, which would
-    # allocate a new tiling block (and so a new upload) on every launch.
-    key = (_builtins.str(device), capacity)
-    buffer = created.get(key)
-    if buffer is None:
-        buffer = created[key] = _torch.empty((capacity,), dtype=_torch.uint8, device=device)
-    return buffer
+    key = (_builtins.str(device), capacity, dtype)
+    with _tiling_lock:
+        buffer = _tiling_buffers.get(key)
+        if buffer is None:
+            buffer = _tiling_buffers[key] = _torch.empty((capacity,), dtype=_torch.uint8, device=device)
+        return buffer
 
 
 def {{OPERATOR}}({{PY_PARAMS}}):
@@ -61,7 +56,7 @@ def {{OPERATOR}}({{PY_PARAMS}}):
         if _total:
             {{PY_ATTR_SETUP}}
             _capacity = {{TILING_CAPACITY}}{{PY_ATTR_BYTES}}
-            _tiling = _tiling_buffer(_first.device, _capacity)
+            _tiling = _tiling_buffer(_first.device, _capacity, _first.dtype)
             _stream = _torch_npu.npu.current_stream(_first.device).npu_stream
             _status = _launch(*(tensor.data_ptr() for tensor in (*_tensors, *_outputs)),
                               _total, _stream, _tiling.data_ptr(), _capacity{{PY_ATTR_ARGS}})

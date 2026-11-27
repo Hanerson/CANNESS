@@ -5,7 +5,7 @@ import {
 import { createHash } from 'node:crypto'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { declaredTarget, normalizedDtype, type FloatInputValue, type OperatorSpec, type TensorSpec } from './spec.js'
+import { declaredTarget, normalizedDtype, resolveSoc, type FloatInputValue, type OperatorSpec, type TensorSpec } from './spec.js'
 import { lineOverlap, parseProvenance, sha256, type Origin } from './provenance.js'
 
 export const LAYER_FILES = {
@@ -81,7 +81,6 @@ export function checkKernelEntry(kernelBody: string): KernelEntryCheck {
 
 const TEMPLATE_RELATIVE = 'templates/build-contract'
 const DEFAULT_SOC_VERSION = 'Ascend910B2'
-const DEFAULT_TOTAL_ELEMENTS = 32768
 const DEFAULT_BLOCK_DIM = 16
 const DEFAULT_TILE_LENGTH = 1024
 const AGNOSTIC_THRESHOLD = 1e-3
@@ -115,7 +114,8 @@ function layerProvenance(workspace: string, generationId: string, root: string) 
   const previous = readdirSync(operators, { withFileTypes: true })
     .filter(entry => entry.isDirectory() && /^gen-[a-f0-9]{8}$/i.test(entry.name) && entry.name !== generationId)
     .map(entry => entry.name).sort()
-  return Object.fromEntries((Object.keys(LAYER_FILES) as LayerName[]).map(layer => {
+  const present = (Object.keys(LAYER_FILES) as LayerName[]).filter(layer => existsSync(join(root, LAYER_FILES[layer])))
+  return Object.fromEntries(present.map(layer => {
     const file = LAYER_FILES[layer]
     const body = readFileSync(join(root, file))
     const source = body.toString('utf8')
@@ -133,6 +133,15 @@ function layerProvenance(workspace: string, generationId: string, root: string) 
     }
     return [file, { sha256: sha256(body), declared: declared[layer] ?? null, similarity }]
   }))
+}
+
+function manifestLayers(files: string[]) {
+  const layers = Object.values(LAYER_FILES).filter(name => files.includes(name))
+  return {
+    layers,
+    compiledLayers: layers.filter(name => name === LAYER_FILES.kernel),
+    documentedOnlyLayers: layers.filter(name => name !== LAYER_FILES.kernel),
+  }
 }
 
 /** Resolve the template directory from `lib/` first, then the `src/` test layout. */
@@ -182,22 +191,21 @@ function cppString(value: string): string {
   return `"${escaped}"`
 }
 
-/** Numeric element count when every dimension is a literal; null otherwise. */
-function numericElementCount(tensor: TensorSpec): number | null {
+/** The build contract allocates concrete buffers, including one element for a scalar. */
+export function tensorElementCount(tensor: TensorSpec): number {
   let total = 1
-  for (const dimension of tensor.shape) {
-    if (!/^\d+$/.test(dimension.trim())) return null
+  for (const [axis, dimension] of tensor.shape.entries()) {
     const value = Number(dimension)
-    if (!Number.isSafeInteger(value) || value <= 0) return null
+    if (!/^\d+$/.test(dimension.trim()) || !Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`tensor ${JSON.stringify(tensor.name)} axis ${axis} has dimension ${JSON.stringify(dimension)}; `
+        + 'provide a concrete positive integer dimension before building a test package')
+    }
     total *= value
-    if (!Number.isSafeInteger(total)) return null
+    if (!Number.isSafeInteger(total)) {
+      throw new Error(`tensor ${JSON.stringify(tensor.name)} element count exceeds the safe integer range at axis ${axis}`)
+    }
   }
   return total
-}
-
-/** Symbolic shapes fall back to the Gelu-sized 32768-element buffer. */
-function elementCount(tensor: TensorSpec): number {
-  return numericElementCount(tensor) ?? DEFAULT_TOTAL_ELEMENTS
 }
 
 function outputTolerance(tensor: TensorSpec, accuracy: OperatorSpec['accuracy']): { abs: number; rel: number } {
@@ -219,7 +227,7 @@ function cppFloatSample(value: FloatInputValue): string {
 }
 
 function inputSetup(tensor: TensorSpec, index: number): string {
-  const size = elementCount(tensor)
+  const size = tensorElementCount(tensor)
   const values = tensor.input_values ?? []
   if (values.length > size) throw new Error(`input_specs.${index}.input_values exceeds the tensor element count`)
   const samples = values.length ? `, { ${values.map(cppFloatSample).join(', ')} }` : ''
@@ -227,7 +235,7 @@ function inputSetup(tensor: TensorSpec, index: number): string {
 }
 
 export function launchGeometry(spec: OperatorSpec) {
-  const totalElements = elementCount(spec.input_specs[0] ?? spec.output_specs[0]!)
+  const totalElements = tensorElementCount(spec.input_specs[0] ?? spec.output_specs[0]!)
   const blockDim = spec.launch?.block_dim ?? DEFAULT_BLOCK_DIM
   return {
     totalElements,
@@ -471,12 +479,11 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
   if (attrKeepdim !== undefined && !(typeof attrKeepdim === 'boolean' || attrKeepdim === 0 || attrKeepdim === 1)) {
     throw new Error('attrs.keepdim must be boolean or 0/1 for GoldenCtx')
   }
-  const shape = firstInput.shape.every(dimension => /^\d+$/.test(dimension.trim()))
-    ? firstInput.shape.map(dimension => Number(dimension)) : []
+  const shape = firstInput.shape.map(Number)
 
   const tensorSetup = [
     ...inputs.map(inputSetup),
-    ...outputs.map((tensor, index) => `Tensor out${index} = make_tensor(${cppDtype(tensor.dtype).enumerator}, ${elementCount(tensor)}, false);`),
+    ...outputs.map((tensor, index) => `Tensor out${index} = make_tensor(${cppDtype(tensor.dtype).enumerator}, ${tensorElementCount(tensor)}, false);`),
   ].join('\n    ')
   const inputList = `{ ${inputs.map((_tensor, index) => `&in${index}`).join(', ')} }`
   const outputList = `{ ${outputs.map((_tensor, index) => `&out${index}`).join(', ')} }`
@@ -495,8 +502,10 @@ export function renderBuildContract(spec: OperatorSpec, goldenOverride?: string)
     '(CANNESS_GM_ADDR)tiling_device',
   ].join(', ')
 
+  const targetSoc = socVersion(spec)
   const values: Record<string, string> = {
-    SOC_VERSION: socVersion(spec),
+    SOC_VERSION: targetSoc,
+    NPU_ARCH: resolveSoc(targetSoc)?.npuArch ?? '',
     DTYPE_X: cppDtype(firstInput.dtype).cpp,
     DTYPE_Y: cppDtype(firstOutput.dtype).cpp,
     OPERATOR_NAME: operatorName,
@@ -615,10 +624,9 @@ export function buildTestPackage(workspace: string, generationId: string, spec: 
     chip: spec.target_platform.chip,
     targetPlatform: spec.target_platform,
     buildContract: 'v1',
+    buildScript: { defaultSha256: sha256(rendered['build.sh']!) },
     contract,
-    layers: Object.values(LAYER_FILES),
-    compiledLayers: [LAYER_FILES.kernel],
-    documentedOnlyLayers: [LAYER_FILES.host, LAYER_FILES.api, LAYER_FILES.plugin],
+    ...manifestLayers(files),
     provenance,
     files,
   }
@@ -733,20 +741,24 @@ export function repairPackage(workspace: string, generationId: string, repair: P
     // package was assembled. Keep the declared/similarity history but point the
     // digest at the bytes actually shipped, so exported provenance.json layers
     // and files agree.
-    const provenance = manifest.provenance
-    if (provenance !== null && provenance !== undefined
-        && typeof provenance === 'object' && !Array.isArray(provenance)) {
-      for (const [name, entry] of Object.entries(provenance)) {
-        if (!writtenLayerKeys.has(layerKey(name))) continue
-        if (entry !== null && entry !== undefined && typeof entry === 'object' && !Array.isArray(entry)) {
-          const record = entry as Record<string, unknown>
-          record.sha256 = sha256(readFileSync(join(staging, name)))
-          record.modifiedByRepair = true
+    const layerFiles = manifestLayers(files)
+    const existing = manifest.provenance
+    const provenance = existing !== null && typeof existing === 'object' && !Array.isArray(existing)
+      ? existing as Record<string, unknown> : {}
+    for (const name of Object.values(LAYER_FILES)) {
+      if (!layerFiles.layers.includes(name)) {
+        delete provenance[name]
+      } else if (writtenLayerKeys.has(layerKey(name))) {
+        const entry = provenance[name]
+        provenance[name] = {
+          declared: null, similarity: null,
+          ...(entry !== null && typeof entry === 'object' && !Array.isArray(entry) ? entry : {}),
+          sha256: sha256(readFileSync(join(staging, name))), modifiedByRepair: true,
         }
       }
     }
     const { packageHash: _stale, ...rest } = manifest
-    const updated = { ...rest, files }
+    const updated = { ...rest, ...layerFiles, provenance, files }
     writeFileSync(stagingManifestPath, JSON.stringify(updated, null, 2))
     const hash = packageHash(staging)
     writeFileSync(stagingManifestPath, JSON.stringify({ ...updated, packageHash: hash }, null, 2))

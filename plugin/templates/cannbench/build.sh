@@ -140,7 +140,8 @@ else
     exit 2
   fi
   dialect="legacy"
-  echo "build.sh: dialect=legacy soc=$legacy_soc --cce-soc-version=$legacy_soc (architecture $npu_arch)"
+  soc="$legacy_soc"
+  echo "build.sh: dialect=legacy soc=$soc --cce-soc-version=$soc (architecture $npu_arch)"
   link_flags=(--cce-fatobj-link)
 fi
 

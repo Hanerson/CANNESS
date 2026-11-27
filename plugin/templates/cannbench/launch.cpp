@@ -5,6 +5,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "canness_tiling_host.h"
@@ -14,31 +15,22 @@ extern "C" __global__ [aicore] void canness_kernel({{KERNEL_ARGS_DECL}});
 
 namespace {
 
-std::mutex& CannessTilingLock() {
-    static std::mutex lock;
-    return lock;
+struct CannessTilingState {
+    std::mutex mutex;
+    std::vector<uint8_t> uploaded;
+};
+
+// Callers keep each buffer alive and associate it with one launcher library.
+// Map entries stay alive too, so same-buffer calls can lock a stable entry.
+CannessTilingState& CannessTilingBuffer(void* tilingDevice) {
+    static std::mutex mutex;
+    static std::map<void*, CannessTilingState> buffers;
+    std::lock_guard<std::mutex> lock(mutex);
+    return buffers.try_emplace(tilingDevice).first->second;
 }
 
-// tilingDevice -> the bytes already uploaded there. The official scorer reads
-// api_statistic.csv and treats any aclrtMemcpy* row with Count > 5 as a CPU
-// fallback, zeroing compile, function and performance for the whole operator.
-// A per-launch copy would reach that count after six iterations, so an
-// unchanged attribute set must not be uploaded again.
-std::map<void*, std::vector<uint8_t>>& CannessTilingCache() {
-    static std::map<void*, std::vector<uint8_t>> cache;
-    return cache;
-}
-
-// Returns true when the device copy must be refreshed. Keeps the cache and the
-// comparison under one lock so concurrent callers cannot interleave.
-bool CannessTilingChanged(void* tilingDevice, const std::vector<uint8_t>& host) {
-    std::lock_guard<std::mutex> guard(CannessTilingLock());
-    std::vector<uint8_t>& cached = CannessTilingCache()[tilingDevice];
-    if (cached.size() == host.size() && std::equal(host.begin(), host.end(), cached.begin())) {
-        return false;
-    }
-    cached = host;
-    return true;
+bool CannessTilingChanged(const CannessTilingState& state, const std::vector<uint8_t>& host) {
+    return state.uploaded != host;
 }
 
 }  // namespace
@@ -59,16 +51,20 @@ extern "C" int canness_launch({{TENSOR_PTRS}}, uint32_t total, void* stream,
         std::vector<uint8_t> host(size, 0);
         std::memcpy(host.data(), &header, sizeof(header));
         std::memcpy(host.data() + offset, packed.data(), packed.size());
-        if (CannessTilingChanged(tilingDevice, host)) {
-            // A blocking host-to-device copy is ordered against the default
-            // stream, not against work already queued on the launch stream. Drain
-            // once per attribute set so the first kernel cannot read a
-            // half-written block (this used to corrupt every launch on large
-            // inputs, and only the first one once the copy is cached).
+        auto& state = CannessTilingBuffer(tilingDevice);
+        // Keep the buffer locked through enqueue so another caller cannot
+        // upload new attributes between this call's upload and launch.
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (CannessTilingChanged(state, host)) {
+            // Drain previously queued readers before overwriting the buffer.
+            // Reuse identical bytes to stay within the scorer's copy budget.
             const auto drained = aclrtSynchronizeDevice();
             if (drained != ACL_SUCCESS) return static_cast<int>(drained);
+            // A failed copy can leave the device buffer partially overwritten.
+            state.uploaded.clear();
             const auto status = aclrtMemcpy(tilingDevice, tilingCapacity, host.data(), host.size(), ACL_MEMCPY_HOST_TO_DEVICE);
             if (status != ACL_SUCCESS) return static_cast<int>(status);
+            state.uploaded = std::move(host);
         }
         canness_kernel<<<blocks, nullptr, static_cast<aclrtStream>(stream)>>>({{KERNEL_ARGS_CALL}});
         return ACL_SUCCESS;

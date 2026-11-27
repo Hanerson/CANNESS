@@ -111,6 +111,29 @@ test('the config records effective launch geometry and explicit spec overrides',
   expect(config.requestedLaunch).toEqual({ block_dim: 7, workspace_bytes: 32 })
 })
 
+test.each([
+  ['secondary input', 'input_specs', 1, 'y'],
+  ['output', 'output_specs', 0, 'z'],
+] as const)('rejects a symbolic dimension on the %s before writing a package', (_label, field, index, name) => {
+  const { workspace, pkg } = packageFor()
+  const previousHash = packageHash(pkg)
+  const spec = specFor('float16')
+  spec[field][index]!.shape = ['8', 'B']
+  expect(() => buildTestPackage(workspace, 'gen-01234567', spec)).toThrow(new RegExp(`${name}.*axis 1.*B.*positive integer`))
+  expect(packageHash(pkg)).toBe(previousHash)
+})
+
+test('repair keeps the default build script identity separate from the replacement', () => {
+  const { workspace, pkg } = packageFor()
+  const buildPath = join(pkg, 'build.sh')
+  const manifestPath = join(pkg, 'manifest.json')
+  const defaultSha256 = sha256(readFileSync(buildPath))
+  expect(JSON.parse(readFileSync(manifestPath, 'utf8')).buildScript).toEqual({ defaultSha256 })
+  repairPackage(workspace, 'gen-01234567', { write: [{ path: 'build.sh', content: '#!/bin/bash\necho custom\n' }] })
+  expect(sha256(readFileSync(buildPath))).not.toBe(defaultSha256)
+  expect(JSON.parse(readFileSync(manifestPath, 'utf8')).buildScript).toEqual({ defaultSha256 })
+})
+
 test('package attests layer content and links exact reuse to an earlier generation', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-provenance-'))
   const layers = { kernel: VALID_KERNEL, host: 'host', api: 'api', plugin: 'plugin' }
@@ -347,6 +370,23 @@ test('repairPackage keeps provenance hashes in sync with rewritten layer files',
   expect(entry.sha256).toBe(sha256(normalizeEol(repaired)))
   expect(entry.modifiedByRepair).toBe(true)
   expect(manifest.packageHash).toBe(packageHash(pkg))
+})
+
+test('repairPackage tracks optional layer additions and removals', () => {
+  const { workspace, pkg } = packageFor()
+  const generation = 'gen-01234567'
+  const readManifest = () => JSON.parse(readFileSync(join(pkg, 'manifest.json'), 'utf8'))
+  repairPackage(workspace, generation, { drop: ['op_api'] })
+  const removed = readManifest()
+  expect(removed.layers).not.toContain(LAYER_FILES.api)
+  expect(removed.documentedOnlyLayers).not.toContain(LAYER_FILES.api)
+  expect(removed.provenance[LAYER_FILES.api]).toBeUndefined()
+  repairPackage(workspace, generation, { write: [{ path: LAYER_FILES.api, content: 'new API' }] })
+  const added = readManifest()
+  expect(added.documentedOnlyLayers).toContain(LAYER_FILES.api)
+  expect(added.provenance[LAYER_FILES.api]).toMatchObject({
+    sha256: sha256('new API'), declared: null, modifiedByRepair: true,
+  })
 })
 
 test('a stale lib is a build error, not an unbound template token', () => {

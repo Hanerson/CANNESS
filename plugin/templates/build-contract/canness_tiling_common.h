@@ -49,7 +49,7 @@ static_assert(sizeof(CannessAttrTable) == 8 && sizeof(CannessDeviceAttr) == 48,
 constexpr uint64_t CANNESS_ATTR_ALIGNMENT = 64;
 
 struct GoldenCtx {
-    const int64_t* shape;  // input 0; null when the spec is symbolic
+    const int64_t* shape;  // input 0; null for scalar inputs
     int32_t rank;
     int64_t attr_dim;
     int32_t attr_keepdim;

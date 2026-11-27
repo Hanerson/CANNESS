@@ -1,16 +1,17 @@
 ﻿import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { expect, test } from 'vitest'
 import { buildTestPackage, repairPackage, writeOperator } from '../src/package-files.ts'
 import { parseSpec } from '../src/spec.ts'
-import { exportSubmission } from '../src/submission.ts'
+import { automaticExportCompatibility, exportSubmission } from '../src/submission.ts'
 import { sha256 } from '../src/provenance.ts'
 
 const KERNEL = 'extern "C" __global__ __aicore__ void canness_kernel(GM_ADDR in0, GM_ADDR out0, GM_ADDR tiling) {}'
 
-function exportFixture(target_platform = { chip: 'Ascend910B2' } as Record<string, string>) {
+function exportFixture(target_platform = { chip: 'Ascend910B2' } as Record<string, string>, attrs?: { mode: number }) {
   const workspace = mkdtempSync(join(tmpdir(), 'canness-export-'))
   const generation = 'gen-deadbeef'
   const spec = parseSpec({
@@ -18,6 +19,7 @@ function exportFixture(target_platform = { chip: 'Ascend910B2' } as Record<strin
     input_specs: [{ name: 'input', shape: ['16'], dtype: 'float32' }],
     output_specs: [{ name: 'output', shape: ['16'], dtype: 'float32' }],
     target_platform, performance_target: { metric: 'kernel_time', target_us: 50 },
+    ...(attrs ? { attrs } : {}),
   })
   writeOperator(workspace, generation, { kernel: KERNEL, host: '', api: '', plugin: '' })
   buildTestPackage(workspace, generation, spec)
@@ -48,10 +50,38 @@ test('rejects an incompatible export target for a pinned generation', () => {
     .toThrow(/dav-3510.*dav-2201/)
 })
 
+test('automatic export requires concrete same-shape inputs and outputs', () => {
+  const { spec } = exportFixture()
+  expect(automaticExportCompatibility(spec)).toEqual({ exportable: true })
+  spec.output_specs[0]!.shape = ['1']
+  expect(automaticExportCompatibility(spec)).toMatchObject({ exportable: false, exportReason: expect.stringMatching(/same-shape/) })
+  spec.input_specs[0]!.shape = spec.output_specs[0]!.shape = ['B']
+  expect(automaticExportCompatibility(spec)).toMatchObject({ exportable: false, exportReason: expect.stringMatching(/input.*axis 0.*B/) })
+})
+
 const bash = process.platform === 'win32'
   ? resolve(spawnSync('git', ['--exec-path'], { encoding: 'utf8' }).stdout?.trim() ?? '', '../../..', 'bin/bash.exe')
   : 'bash'
 const bashAvailable = spawnSync(bash, ['-c', '[[ ${BASH_VERSINFO[0]} -ge 4 ]]']).status === 0
+
+test.skipIf(!bashAvailable)('the contract build reports the flags passed to bisheng before its executable path', () => {
+  const { workspace, generation } = exportFixture({ chip: 'Ascend910B' })
+  const pkg = join(workspace, 'packages', generation)
+  writeFileSync(join(pkg, 'fake-bisheng'), '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> compiler.log\n', { mode: 0o755 })
+  const result = spawnSync(bash, ['build.sh'], {
+    cwd: pkg, encoding: 'utf8', env: { ...process.env, CANNESS_BISHENG: './fake-bisheng' },
+  })
+  expect(result.status, result.stderr).toBe(0)
+  const flags = '-x cce -std=c++17 --cce-soc-version=Ascend910B2 --cce-soc-core-type=VecCore'
+  const stdout = result.stdout.trim().split(/\r?\n/)
+  expect(stdout).toContain('CANNESS_BUILD dialect=legacy')
+  expect(stdout).toContain('CANNESS_BUILD soc=Ascend910B2')
+  expect(stdout).toContain('CANNESS_BUILD npu_arch=dav-2201')
+  expect(stdout).toContain(`CANNESS_BUILD flags=${flags}`)
+  expect(stdout.at(-1)).toMatch(/\/canness_run$/)
+  const calls = readFileSync(join(pkg, 'compiler.log'), 'utf8').split(/\r?\n/)
+  expect(calls.find(call => call.includes('-c op_kernel/kernel.cpp'))).toContain(flags)
+})
 
 function runBuild(soc: string, compilerMode: string, mode: 'pinned' | 'portable' = 'pinned') {
   const { workspace, generation, spec } = exportFixture({ chip: 'Ascend910B2', mode })
@@ -89,12 +119,16 @@ test.skipIf(!bashAvailable).each(['ascend910b', 'ascend910_93'])('builds %s usin
 })
 
 test.skipIf(!bashAvailable)('probes compiler support before using legacy 910B flags', () => {
-  const { status, stdout, stderr, calls } = runBuild('ascend910b', 'legacy')
+  const { status, stdout, stderr, calls, sourceDir } = runBuild('ascend910b', 'legacy')
   expect(status, stderr).toBe(0)
   expect(stdout).toMatch(/dialect=legacy.*Ascend910B2/)
   expect(calls.filter(call => call.includes('csrc/op_kernel/kernel.cpp'))).toEqual([
     expect.stringContaining('-x cce -std=c++17 -fPIC --cce-soc-version=Ascend910B2 --cce-soc-core-type=VecCore'),
   ])
+  const env = readFileSync(join(sourceDir, 'dist', 'build-env.txt'), 'utf8')
+  expect(env).toMatch(/^soc=Ascend910B2$/m)
+  expect(env).toMatch(/^npu_arch=dav-2201$/m)
+  expect(env).toMatch(/^dialect=legacy$/m)
 })
 
 test.skipIf(!bashAvailable)('does not retry a kernel source error with a different compiler dialect', () => {
@@ -253,6 +287,30 @@ test('the exported launcher uploads the tiling block only when the attributes ch
   // The launch itself stays unconditional: caching must not skip the kernel.
   expect(launch.indexOf('canness_kernel<<<')).toBeGreaterThan(copy)
 })
+
+const hostCompiler = process.env.CXX || 'g++'
+const hostCompilerAvailable = spawnSync(hostCompiler, ['--version']).status === 0
+
+test.skipIf(!hostCompilerAvailable)('only reuses a successfully uploaded tiling image and protects queued reads', () => {
+  const { workspace, generation, spec } = exportFixture(undefined, { mode: 1 })
+  const { sourceDir } = exportSubmission(workspace, generation, spec, 'exp')
+  const csrc = join(sourceDir, 'csrc')
+  const launch = readFileSync(join(csrc, 'launch.cpp'), 'utf8')
+  // Replace device syntax alone. The fixture models ACL errors and queued reads
+  // while compiling and exercising the generated host code as written.
+  const lowered = launch.replace('__global__ [aicore] ', '').replace(/canness_kernel<<<.*?>>>/, 'canness_kernel')
+  writeFileSync(join(csrc, 'launch-under-test.cpp'), lowered)
+  mkdirSync(join(csrc, 'acl'))
+  writeFileSync(join(csrc, 'acl', 'acl.h'), '#pragma once\n')
+  const fixture = fileURLToPath(new URL('./fixtures/cannbench-tiling-cache.cpp', import.meta.url))
+  const binary = join(sourceDir, 'tiling-test.exe')
+  const compiled = spawnSync(hostCompiler, ['-std=c++17', '-pthread', '-I', csrc, fixture, '-o', binary], { encoding: 'utf8' })
+  expect(compiled.status, compiled.error?.message ?? compiled.stderr).toBe(0)
+  for (const scenario of ['sync-failure', 'copy-failure', 'partial-copy', 'concurrent-uploads']) {
+    const checked = spawnSync(binary, [scenario], { encoding: 'utf8', timeout: 5000 })
+    expect.soft(checked.status, `${scenario}: ${checked.error?.message ?? checked.stderr}`).toBe(0)
+  }
+}, 15000)
 
 test('the tiling cache key survives across calls', () => {
   const { workspace, generation, spec } = exportFixture()
