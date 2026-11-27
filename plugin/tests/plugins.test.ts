@@ -7,7 +7,7 @@ import * as knowledge from '../src/knowledge.ts'
 import * as generator from '../src/generator.ts'
 import * as evalPlugin from '../src/eval.ts'
 import * as loop from '../src/loop.ts'
-import { emptyState, type PolicyConfig } from '../src/policy.ts'
+import { emptyState, enhancementBlock, shouldSteer, stopReason, type PolicyConfig } from '../src/policy.ts'
 import { buildTestPackage, packageHash, writeOperator } from '../src/package-files.ts'
 import { sha256 } from '../src/provenance.ts'
 import { parseSpec } from '../src/spec.ts'
@@ -22,6 +22,7 @@ function evalConfig(workspace: string, overrides: Record<string, unknown> = {}) 
     workspace,
     host: vol('npu'), port: vol(22), username: vol('canness'),
     privateKeyPath: vol(''), passwordEnv: vol('CANNNESS_SSH_PASSWORD'),
+    allowUnpinnedSsh: vol(true),
     inbox: vol('/in'), outbox: vol('/out'), timeoutSec: vol(0), pollIntervalMs: vol(1),
     maxIterations: vol(10), maxCompileRetries: vol(3), negativeStreakLimit: vol(3), convergenceThreshold: vol(0.05),
     ...overrides,
@@ -89,6 +90,27 @@ test('registers the eval tools by name and the two loop listeners', () => {
   // The eval tool set may grow (fetch_remote_file); assert membership, not an exact array.
   expect(ev.toolsRegistered.map(tool => tool.name)).toEqual(expect.arrayContaining(['run_evaluation', 'fetch_remote_file']))
   expect(lp.listeners.map(item => item.event)).toEqual(['agent/pre-step', 'agent/turn-stopping'])
+})
+
+test('direct SSH requires a trusted pin unless the user explicitly allows unpinned SSH', async () => {
+  const pkg = readyPackage()
+  const ctx = fakeCtx()
+  let fingerprint = ''
+  const dialed: Array<string | undefined> = []
+  const remote = new MemoryRemote()
+  remote.execHandler = () => ({ code: 0, stdout: '{"ready":true}', stderr: '' })
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, {
+    privateKeyPath: vol(keyFile(pkg.workspace)), allowUnpinnedSsh: vol(false),
+    hostFingerprint: { get: () => fingerprint },
+  }), async opts => { dialed.push(opts.hostFingerprint); return remote })
+  const check = ctx.toolsRegistered.find(tool => tool.name === 'preflight_evaluation')!
+  await expect(check.execute({ remote: true })).resolves.toMatchObject({
+    remote: { ssh: 'unavailable', summary: expect.stringContaining('hostFingerprint') },
+  })
+  expect(dialed).toEqual([])
+  fingerprint = 'SHA256:' + 'A'.repeat(43)
+  await expect(check.execute({ remote: true })).resolves.toMatchObject({ remote: { ssh: 'connected' } })
+  expect(dialed).toEqual([fingerprint])
 })
 
 test('submit_spec rejects the first missing field and writes no state', async () => {
@@ -380,6 +402,148 @@ test('run_evaluation returns workspace, packageDir and resultsPath', async () =>
   const fetch = ctx.toolsRegistered.find(tool => tool.name === 'fetch_remote_file')!
   const downloaded = await fetch.execute({ remotePath: value.resultsPath }) as { path: string }
   expect(JSON.parse(readFileSync(downloaded.path, 'utf8'))).toMatchObject({ generationId: pkg.generationId, status: 'pass' })
+})
+
+test('an evaluation that finishes after a new generation still records its own result', async () => {
+  const pkg = readyPackage()
+  const currentFile = join(pkg.workspace, '.canness', 'state.json')
+  const newGeneration = 'gen-98765432'
+  const remote = new MemoryRemote()
+  remote.execHandler = () => {
+    saveState(currentFile, { ...emptyState(), generationId: newGeneration })
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  remote.appearOnRead(evaluationResultPath(pkg.generationId), Buffer.from(JSON.stringify({
+    ...failReport('perf_fail'), generationId: pkg.generationId,
+  })), 1)
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }), async () => remote)
+  const result = await ctx.toolsRegistered[0]!.execute({}) as { resultsPath: string }
+  expect(loadState(currentFile)).toMatchObject({ generationId: newGeneration, lastReport: null, pendingSteer: false, validIterations: 0 })
+  const archived = join(pkg.workspace, '.canness', 'generations', pkg.generationId, 'state.json')
+  expect(loadState(archived)).toMatchObject({
+    generationId: pkg.generationId, lastReport: { status: 'perf_fail' }, lastResultsPath: result.resultsPath, validIterations: 1,
+  })
+})
+
+test('device unavailability allows a same-package retry without spending an iteration', async () => {
+  const pkg = readyPackage()
+  const stateFile = join(pkg.workspace, '.canness', 'state.json')
+  const remote = new MemoryRemote()
+  let attempts = 0
+  remote.execHandler = command => {
+    const outbox = command.match(/--outbox '([^']+)'/u)?.[1]
+    if (!outbox) return { code: 0, stdout: '', stderr: '' }
+    attempts++
+    const report = {
+      ...failReport(attempts === 1 ? 'error' : 'pass'), generationId: pkg.generationId,
+      ...(attempts === 1 ? { runRecord: {
+        timestamp: '2026-11-27T00:00:00Z', host: 'test', toolchain: 'test', durationMs: 1,
+        params: { failureKind: 'device_unavailable' },
+      } } : {}),
+    }
+    remote.files.set(`${outbox}/${pkg.generationId}/results.json`, Buffer.from(JSON.stringify(report)))
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }), async () => remote)
+  const run = ctx.toolsRegistered[0]!
+  expect(await run.execute({})).toMatchObject({ status: 'error', pendingStage: 'run_evaluation' })
+  expect(loadState(stateFile).validIterations).toBe(0)
+  expect(await run.execute({})).toMatchObject({ status: 'pass' })
+  expect(loadState(stateFile).validIterations).toBe(1)
+  expect(attempts).toBe(2)
+})
+
+test('required submission does not stop on a kernel pass until the export is validated', async () => {
+  const pkg = readyPackage()
+  const stateFile = join(pkg.workspace, '.canness', 'state.json')
+  const remote = new MemoryRemote()
+  remote.appearOnRead(evaluationResultPath(pkg.generationId), Buffer.from(JSON.stringify({
+    ...failReport('pass'), generationId: pkg.generationId,
+    correctness: { ok: true, maxRelativeError: 0 }, performance: { kernelTimeUs: 1, targetUs: 2 },
+  })), 1)
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }), async () => remote)
+  const run = ctx.toolsRegistered[0]!
+  expect(await run.execute({ require_submission: true })).toMatchObject({ status: 'pass', submission: { status: 'not_exported' } })
+  const state = loadState(stateFile)
+  const policy = { maxIterations: 10, maxCompileRetries: 3, negativeStreakLimit: 3, convergenceThreshold: 0.05 }
+  expect(shouldSteer(state, policy)).toBe(true)
+  expect(stopReason(state, policy)).toBeNull()
+  expect(enhancementBlock(state, policy)).toContain('not_exported')
+
+  const source = join(pkg.workspace, 'exported')
+  mkdirSync(source)
+  const build = '#!/bin/bash\n'
+  writeFileSync(join(source, 'build.sh'), build)
+  writeFileSync(join(source, 'provenance.json'), JSON.stringify({
+    generationId: pkg.generationId, packageHash: packageHash(join(pkg.workspace, 'packages', pkg.generationId)),
+    files: { 'build.sh': sha256(build) },
+  }))
+  let status = 'failed'
+  remote.execHandler = () => ({
+    code: 0, stderr: '', stdout: `CANNESS_SUBMISSION_REPORT {"status":"${status}","reason":"wheel verdict"}\n`,
+  })
+  const args = { submission: { source_dir: 'exported' } }
+  expect(await run.execute(args)).toMatchObject({ duplicate: true, submission: { status: 'failed' } })
+  expect(enhancementBlock(loadState(stateFile), policy)).toContain('wheel verdict')
+  status = 'validated'
+  expect(await run.execute(args)).toMatchObject({ duplicate: true, submission: { status: 'validated' } })
+  expect(stopReason(loadState(stateFile), policy)).toBe('targetMet')
+  expect(await run.execute({})).toMatchObject({ duplicate: true, submission: { status: 'validated' } })
+  expect(stopReason(loadState(stateFile), policy)).toBe('targetMet')
+  const latestExport = join(pkg.workspace, 'submissions', `${pkg.generationId}-new`, 'source')
+  mkdirSync(latestExport, { recursive: true })
+  const revisedBuild = build + '# changed export\n'
+  writeFileSync(join(latestExport, 'build.sh'), revisedBuild)
+  writeFileSync(join(latestExport, 'provenance.json'), JSON.stringify({
+    generationId: pkg.generationId, packageHash: packageHash(join(pkg.workspace, 'packages', pkg.generationId)),
+    files: { 'build.sh': sha256(revisedBuild) },
+  }))
+  status = 'failed'
+  expect(await run.execute({})).toMatchObject({ duplicate: true, submission: { status: 'failed', auto: true } })
+  expect(stopReason(loadState(stateFile), policy)).toBeNull()
+  expect(loadState(stateFile).validIterations).toBe(1)
+})
+
+test('a completed kernel report is durable while submission validation is still running', async () => {
+  const pkg = readyPackage()
+  const stateFile = join(pkg.workspace, '.canness', 'state.json')
+  const source = join(pkg.workspace, 'exported')
+  mkdirSync(source)
+  writeFileSync(join(source, 'build.sh'), '#!/bin/bash\n')
+  writeFileSync(join(source, 'provenance.json'), JSON.stringify({
+    generationId: pkg.generationId, packageHash: packageHash(join(pkg.workspace, 'packages', pkg.generationId)),
+    files: { 'build.sh': sha256('#!/bin/bash\n') },
+  }))
+  const started = Promise.withResolvers<void>()
+  const finish = Promise.withResolvers<void>()
+  const remote = new MemoryRemote()
+  remote.execHandler = async command => {
+    if (command.includes('validate_submission.py')) {
+      started.resolve()
+      await finish.promise
+      return { code: 0, stdout: 'CANNESS_SUBMISSION_REPORT {"status":"validated"}\n', stderr: '' }
+    }
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  remote.appearOnRead(evaluationResultPath(pkg.generationId), Buffer.from(JSON.stringify({
+    ...failReport('pass'), generationId: pkg.generationId,
+    correctness: { ok: true, maxRelativeError: 0 }, performance: { kernelTimeUs: 1, targetUs: 2 },
+  })), 1)
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }), async () => remote)
+  const run = ctx.toolsRegistered[0]!.execute({ require_submission: true, submission: { source_dir: 'exported' } })
+  await started.promise
+  try {
+    expect(loadState(stateFile)).toMatchObject({
+      lastReport: { status: 'pass' }, validIterations: 1, pendingStage: null, lastSubmission: { status: 'pending' },
+    })
+  } finally {
+    finish.resolve()
+    await run
+  }
 })
 
 test('an explicitly requested submission check attaches to the matching evaluation without spending another iteration', async () => {
@@ -729,6 +893,44 @@ test('pre-step appends a retry only when an evaluation owes one and this session
     lastReport: failReport('compile_fail'),
   })
   expect((await pre.fn(owner, enter)).messages).toHaveLength(0)
+})
+
+test('a live evaluation budget change also governs the loop without remounting', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'canness-policy-'))
+  let maximum = 10
+  const services = new Map<string, unknown>()
+  const ctx = {
+    ...fakeCtx(),
+    provide(name: string, value: unknown) { services.set(name, value) },
+    get(name: string) { return services.get(name) },
+  }
+  evalPlugin.apply(ctx as never, evalConfig(workspace, { maxIterations: { get: () => maximum } }))
+  loop.apply(ctx as never, { workspace, ...policy })
+  const pre = ctx.listeners.find(item => item.event === 'agent/pre-step')!
+  const enter = async () => ({ kind: 'enter', messages: [] })
+  const owner = { agent: { session: { id: 'session-a' } } }
+  const state = join(workspace, '.canness', 'state.json')
+  const pending = { ...emptyState(), ownerSessionId: 'session-a', pendingSteer: true, validIterations: 1, lastReport: failReport('perf_fail') }
+  saveState(state, pending)
+  expect((await pre.fn(owner, enter)).messages).toHaveLength(1)
+  saveState(state, pending)
+  maximum = 1
+  expect((await pre.fn(owner, enter)).messages).toHaveLength(0)
+})
+
+test.each(['8.0.1', '9.2.1'])('toolkit %s derives a narrow read root from a nested setEnv', async version => {
+  const pkg = readyPackage()
+  const remote = new MemoryRemote()
+  const toolkit = `/opt/vendor/cann-${version}`
+  const header = `${toolkit}/compiler/include/kernel.h`
+  remote.files.set(header, Buffer.from('header'))
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, {
+    privateKeyPath: vol(keyFile(pkg.workspace)), setEnv: vol(`${toolkit}/runtime/env/set_env.sh`), readRoots: vol([]),
+  }), async () => remote)
+  const fetch = ctx.toolsRegistered.find(tool => tool.name === 'fetch_remote_file')!
+  await expect(fetch.execute({ remotePath: header })).resolves.toMatchObject({ bytes: 6 })
+  await expect(fetch.execute({ remotePath: '/opt/vendor/another-install/secret' })).rejects.toThrow(/allowed/)
 })
 
 test('turn-stopping steers once per owed retry, and only for the owning session', async () => {

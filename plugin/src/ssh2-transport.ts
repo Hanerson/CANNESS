@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { Client, type SFTPWrapper } from 'ssh2'
@@ -22,6 +22,8 @@ export interface SftpOptions {
   username: string
   privateKey?: string
   password?: string
+  /** OpenSSH SHA256 fingerprint of the expected remote host key. */
+  hostFingerprint?: string
 }
 
 export type Dial = (opts: SftpOptions) => Promise<SftpLike>
@@ -254,17 +256,22 @@ export function shellFromClient(client: ShellClient): RemoteShell {
           }
           let stdout = ''
           let stderr = ''
-          let code = 0
+          let code: number | undefined
+          let signal: string | undefined
           let settled = false
-          const finish = () => {
+          const finish = (closeCode?: number | null) => {
             if (settled) return
             settled = true
-            resolve({ code, stdout, stderr })
+            const exitCode = code ?? (signal === undefined && typeof closeCode === 'number' ? closeCode : undefined)
+            const diagnostic = signal ? `SSH command terminated by ${signal}` : 'SSH channel closed without an exit status'
+            resolve({ code: exitCode ?? 1, stdout, stderr: exitCode === undefined
+              ? [stderr.trimEnd(), diagnostic].filter(Boolean).join('\n') : stderr })
           }
           stream.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8') })
           stream.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8') })
-          stream.on('exit', (exitCode: number | null) => {
+          stream.on('exit', (exitCode: number | null, exitSignal?: string) => {
             if (typeof exitCode === 'number') code = exitCode
+            else signal = exitSignal
           })
           stream.on('close', finish)
           stream.on('error', (streamError: Error) => {
@@ -306,13 +313,20 @@ function sftpLike(sftp: SFTPWrapper, end: () => void): SftpLike {
   }
 }
 
-function connectConfig(opts: SftpOptions): { host: string; port: number; username: string; privateKey?: string; password?: string } {
+function connectConfig(opts: SftpOptions) {
+  const fingerprint = opts.hostFingerprint?.trim()
+  if (fingerprint && !/^SHA256:[A-Za-z0-9+/]{43}$/u.test(fingerprint)) {
+    throw new Error('hostFingerprint must be an OpenSSH SHA256 fingerprint')
+  }
   return {
     host: opts.host,
     port: opts.port,
     username: opts.username,
     ...(opts.privateKey !== undefined ? { privateKey: opts.privateKey } : {}),
     ...(opts.password !== undefined ? { password: opts.password } : {}),
+    ...(fingerprint ? {
+      hostVerifier: (key: Buffer) => `SHA256:${createHash('sha256').update(key).digest('base64').replace(/=+$/u, '')}` === fingerprint,
+    } : {}),
   }
 }
 

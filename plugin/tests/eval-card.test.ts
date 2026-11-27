@@ -73,6 +73,19 @@ test('saving writes section fields through mutate and the password through crede
   card.dispose()
 })
 
+test('saving a target updates the device, lock, CANN environment and trusted SSH key', async () => {
+  const scope = fakeScope(section)
+  const card = new EvalCardController(fakeCtx({}).ctx, scope.scope)
+  const face = card.inject()
+  const values = { device: '0', deviceLock: '/var/lock/npu0', setEnv: '/opt/cann/set_env.sh',
+    hostFingerprint: 'SHA256:' + 'A'.repeat(43), targetApproval: 'canness-' + '1'.repeat(24) }
+  for (const [name, value] of Object.entries(values)) face.edit(name, value)
+  face.save()
+  await settled(() => scope.opsApplied.length === 5)
+  expect(scope.opsApplied).toEqual(expect.arrayContaining(Object.entries(values).map(([name, value]) => ({ op: 'set', path: [name], value }))))
+  card.dispose()
+})
+
 test('a blank password draft writes nothing and keeps the section mutation alone', async () => {
   const scope = fakeScope(section)
   const remote = fakeCtx({ configuredRef: 'CANNNESS_SSH_PASSWORD' })

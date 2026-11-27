@@ -18,6 +18,8 @@ const config: PolicyConfig = {
 test('runnerCommand forwards a configured set_env path safely', () => {
   const command = runnerCommand({ runnerPath: '/tmp/runner.py', inbox: '/in', outbox: '/out', generationId: 'gen-1', timeoutSec: 10, setEnv: '/home/developer/Ascend/cann-9.0.0/set env.sh' })
   expect(command).toContain("--set-env '/home/developer/Ascend/cann-9.0.0/set env.sh'")
+  expect(command).toContain('timeout --kill-after=10s 20s')
+  expect(command).toContain('--budget-sec 10')
 })
 
 function pack(): string {
@@ -30,6 +32,36 @@ function attemptPath(root: string, generationId: string, token: string): string 
   return `${root}/${generationId}/attempt-${token}/${generationId}`
 }
 
+test.each([
+  ['complete', 'pass'],
+  ['missing', 'timeout'],
+  ['malformed', 'timeout'],
+  ['wrong generation', 'timeout'],
+] as const)('outer timeout keeps only a complete report from this attempt (%s)', async (kind, status) => {
+  const remote = new MemoryRemote()
+  const generationId = 'gen-0123abcd'
+  const token = 'deadline'
+  const path = `${attemptPath('/out', generationId, token)}/results.json`
+  remote.execHandler = () => {
+    if (kind !== 'missing') {
+      const body = kind === 'malformed' ? '{' : JSON.stringify({
+        generationId: kind === 'wrong generation' ? 'gen-elsewhere' : generationId,
+        status: 'pass', compile: { ok: true, log: '' }, correctness: { ok: true, maxRelativeError: 0 },
+        performance: { kernelTimeUs: 1, targetUs: 2 }, analysis: null, summary: 'target met',
+      })
+      remote.files.set(path, Buffer.from(body))
+    }
+    return { code: 124, stdout: '', stderr: '' }
+  }
+  const outcome = await runEvaluation({
+    files: remote, localPackageDir: pack(), generationId, inbox: '/in', outbox: '/out',
+    timeoutMs: 1000, intervalMs: 10, state: emptyState(), config, token: () => token,
+  })
+  expect(outcome.report.status).toBe(status)
+  expect(outcome.resultWritten).toBe(kind === 'complete')
+  expect(outcome.resultsPath).toBe(kind === 'complete' ? path : undefined)
+})
+
 test('a changed package is rejected before any remote upload', async () => {
   const dir = pack()
   writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ packageHash: packageHash(dir) }))
@@ -41,6 +73,21 @@ test('a changed package is rejected before any remote upload', async () => {
     state: emptyState(), config,
   })).rejects.toThrow('package changed after build_test_package')
   expect(remote.files.size).toBe(0)
+})
+
+test('retention uses the formal attempt scope after a completed report', async () => {
+  const remote = new MemoryRemote()
+  const generationId = 'gen-0123abcd'
+  const token = '01111111-2222-4333-8444-555555555555'
+  remote.files.set(`${attemptPath('/out', generationId, token)}/results.json`, Buffer.from(JSON.stringify({
+    generationId, status: 'pass', compile: { ok: true, log: '' }, correctness: { ok: true },
+    performance: { kernelTimeUs: 1, targetUs: 2 }, summary: 'ok',
+  })))
+  await runEvaluation({
+    files: remote, localPackageDir: pack(), generationId, inbox: '/in', outbox: '/out',
+    timeoutMs: 1000, intervalMs: 10, state: emptyState(), config, token: () => token, retainAttempts: 8,
+  })
+  expect(remote.execCalls.at(-1)).toContain(` - eval --inbox '/in' --outbox '/out' --generation '${generationId}' --current 'attempt-${token}' --keep 8`)
 })
 
 test('runEvaluation accepts a package repaired after build_test_package (CAN-103)', async () => {

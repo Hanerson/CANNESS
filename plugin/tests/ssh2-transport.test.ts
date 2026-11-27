@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -39,7 +40,7 @@ function fakeClient(start: (cb: (err: Error | undefined, sftp: { unlink: (path: 
   const handlers = new Map<string, Function>()
   const client = {
     ends: 0,
-    connectConfig: undefined as { host?: string; port?: number; username?: string; privateKey?: string; password?: string } | undefined,
+    connectConfig: undefined as { host?: string; port?: number; username?: string; privateKey?: string; password?: string; hostVerifier?: (key: Buffer) => boolean } | undefined,
     on(event: string, fn: Function) {
       handlers.set(event, fn)
       return client
@@ -58,6 +59,20 @@ function fakeClient(start: (cb: (err: Error | undefined, sftp: { unlink: (path: 
   }
   return client
 }
+
+test('SSH verifies the configured OpenSSH fingerprint for exec and SFTP', async () => {
+  const trusted = Buffer.from('trusted-key')
+  const fingerprint = 'SHA256:' + createHash('sha256').update(trusted).digest('base64').replace(/=+$/u, '')
+  const opts = { ...dialOpts, hostFingerprint: fingerprint }
+  const exec = fakeClient(() => {})
+  const sftp = fakeClient(cb => { cb(undefined, { unlink() {} }) })
+  await (await openExecRemote(exec as unknown as RemoteClient, opts)).close()
+  await (await openSftp(sftp, opts)).end()
+  for (const client of [exec, sftp]) {
+    expect(client.connectConfig?.hostVerifier?.(trusted)).toBe(true)
+    expect(client.connectConfig?.hostVerifier?.(Buffer.from('different-key'))).toBe(false)
+  }
+})
 
 test('removeFile treats NO_SUCH_FILE and ENOENT as success and close ends the client', async () => {
   const client = fakeClient(cb => {
@@ -144,14 +159,22 @@ test('exec collects stdout, stderr and a non-zero exit code', async () => {
   await expect(pending).resolves.toEqual({ code: 2, stdout: 'building\n', stderr: 'error: missing toolchain\n' })
 })
 
-test('exec defaults to exit code 0 and surfaces channel errors', async () => {
+test.each([undefined, 'TERM'])('exec reports an unknown exit status as a failure (%s)', async signal => {
   const channel = fakeChannel()
   const shell = shellFromClient(fakeShellClient(channel))
   const pending = shell.exec('true')
   channel.emit('data', Buffer.from('ok\n'))
+  if (signal) channel.emit('exit', null, signal)
   channel.emit('close')
-  await expect(pending).resolves.toEqual({ code: 0, stdout: 'ok\n', stderr: '' })
+  await expect(pending).resolves.toMatchObject({ code: 1, stdout: 'ok\n', stderr: expect.stringContaining(signal ?? 'exit status') })
+})
 
+test('exec preserves an explicit success and surfaces channel errors', async () => {
+  const channel = fakeChannel()
+  const pending = shellFromClient(fakeShellClient(channel)).exec('true')
+  channel.emit('exit', 0)
+  channel.emit('close')
+  await expect(pending).resolves.toMatchObject({ code: 0 })
   const refused = shellFromClient({
     exec(_command, callback) { callback(new Error('exec refused'), undefined as never) },
   })

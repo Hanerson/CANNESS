@@ -18,6 +18,7 @@ function fixture() {
   const tools: any[] = []
   const vol = (value: unknown) => ({ get: () => value })
   const cfg: any = { workspace, host: vol('test'), port: vol(22), username: vol('test'), privateKeyPath: vol(join(workspace, 'key')),
+    allowUnpinnedSsh: vol(true),
     passwordEnv: vol('PW'), inbox: vol('/in'), outbox: vol('/out'), timeoutSec: vol(1), pollIntervalMs: vol(1),
     maxIterations: vol(10), maxCompileRetries: vol(3), negativeStreakLimit: vol(3), convergenceThreshold: vol(0.05) }
   const remote = new MemoryRemote()

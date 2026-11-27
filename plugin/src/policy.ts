@@ -19,6 +19,10 @@ export interface PolicyConfig {
   maxSteerPerReport?: number
 }
 
+export function policyServiceName(workspace?: string): string {
+  return `canness:policy:${workspace?.trim() ?? ''}`
+}
+
 /** How many recent kernel times the stall detector keeps. */
 const RECENT_LIMIT = 6
 
@@ -78,6 +82,8 @@ export interface TaskState {
   lastBlocked?: { reason: string; at: string; session: string | null; blockedBy?: string; tool?: string; budget?: import('./report.js').JsonValue } | null
   /** A built package whose remote evaluation can resume without regenerating. */
   pendingStage?: 'run_evaluation' | null
+  requireSubmission?: boolean
+  lastSubmission?: { status: string; reason?: string; sourceDir?: string; sourceHash?: string } | null
   lastReport: EvalReport | null
 }
 
@@ -123,6 +129,11 @@ export function ownsSession(state: TaskState, sessionId: string | undefined): bo
   return owner != null && owner.length > 0 && owner === sessionId
 }
 
+export function infrastructureFailure(report: EvalReport): boolean {
+  const failureKind = report.runRecord?.params.failureKind
+  return report.status === 'error' && (failureKind === 'device_unavailable' || failureKind === 'infrastructure')
+}
+
 export function applyReport(state: TaskState, report: EvalReport): TaskState {
   const next: TaskState = { ...state, lastReport: report }
   if (report.status === 'compile_fail') {
@@ -133,6 +144,7 @@ export function applyReport(state: TaskState, report: EvalReport): TaskState {
     next.timeouts += 1
     return next
   }
+  if (infrastructureFailure(report)) return next
   next.validIterations += 1
   const us = report.performance.kernelTimeUs
   // Repeated measurements are observations, not new optimization candidates.
@@ -237,12 +249,15 @@ export function stopReason(state: TaskState, config: PolicyConfig): StopReason |
     && report.performance.kernelTimeUs != null
     && report.performance.targetUs != null
     && report.performance.kernelTimeUs <= report.performance.targetUs
+    && (!state.requireSubmission || state.lastSubmission?.status === 'validated')
   ) return 'targetMet'
   return null
 }
 
 export function shouldSteer(state: TaskState, config: PolicyConfig): boolean {
-  return state.lastReport != null && state.lastReport.status !== 'pass' && stopReason(state, config) === null
+  const needsSubmission = state.requireSubmission && state.lastSubmission?.status !== 'validated'
+  return state.lastReport != null && (state.lastReport.status !== 'pass' || needsSubmission === true)
+    && stopReason(state, config) === null
 }
 
 /** Explicit remeasurement may override a heuristic, never a resource ceiling. */
@@ -264,7 +279,7 @@ const NOISE = [
 
 /** A line worth keeping when the build succeeded: a real diagnostic or a marker. */
 function isSignal(line: string): boolean {
-  return /error|错误|failed|FAILED|undefined reference|warning:/u.test(line)
+  return /error|错误|failed|undefined reference|warning:|vector core exception|aivec error|aicore exception|GM address accessed by scalar exceeds/iu.test(line)
 }
 
 /**
@@ -319,6 +334,9 @@ export function enhancementBlock(state: TaskState, config: PolicyConfig = {
   return [
     `上次评测 ${report.status}（${report.generationId}）。`,
     `摘要：${report.summary}`,
+    ...(state.lastSubmission && state.requireSubmission
+      ? [`提交验收：${state.lastSubmission.status}${state.lastSubmission.reason ? ` · ${state.lastSubmission.reason}` : ''}`]
+      : []),
     `编译日志：${condenseCompileLog(report.compile.log, report.compile.ok)}`,
     `maxRelativeError：${String(report.correctness.maxRelativeError)}`,
     `kernel_time_us：${String(report.performance.kernelTimeUs)}，目标 ${String(report.performance.targetUs)}`
@@ -327,9 +345,11 @@ export function enhancementBlock(state: TaskState, config: PolicyConfig = {
     ...(trend === null ? [] : [trend]),
     ...(state.targetRelaxedUs == null ? [] : [`注意：目标已从 ${String(state.targetRelaxedUs)}us 放宽，放宽后的通过不代表达标。`]),
     `有效迭代 ${String(state.validIterations)}（上限 ${String(config.maxIterations)}），编译重试 ${String(state.compileRetries)}，超时 ${String(state.timeouts)}，变差连续 ${String(state.negativeStreak)}。`,
-    far
+    infrastructureFailure(report)
+      ? '远端设备或运行环境暂不可用。环境恢复后，使用同一个包重试 run_evaluation。'
+      : far
       ? '距离目标超过一倍时，小步调参通常无效：优先考虑换算法或换数据切分；若判断不可达，请停止调参并说明理由（不要通过放宽目标来“通过”）。'
-      : '请修改四层代码后再次调用 build_test_package 和 run_evaluation。',
+      : '请修改算子后再次调用 build_test_package 和 run_evaluation。',
     ...(report.status === 'compile_fail'
       ? [`编译契约：kernel 入口必须是 extern "C" __global__ __aicore__ void canness_kernel(<输入…>, <输出…>, GM_ADDR tiling)，不要带 workspace 参数；签名不对会链接失败。`]
       : []),

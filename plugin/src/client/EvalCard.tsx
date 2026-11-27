@@ -417,6 +417,16 @@ export function EvalCard(props: EvalCardProps) {
         <details style={S.disclosure}>
           <summary style={{ ...T.meta, ...S.summary }}>{t('advanced')}</summary>
           <div style={S.disclosureBody}>
+            {valueField('canness-host-fingerprint', t('hostFingerprint'), t('hostFingerprintHint'), state.hostFingerprint, disabled, t,
+              text => { props.edit('hostFingerprint', text) }, () => { props.resetField('hostFingerprint') })}
+            {valueField('canness-target-approval', t('targetApproval'), t('targetApprovalHint'), state.targetApproval, disabled, t,
+              text => { props.edit('targetApproval', text) }, () => { props.resetField('targetApproval') })}
+            {valueField('canness-device', t('device'), t('deviceHint'), state.device, disabled, t,
+              text => { props.edit('device', text) }, () => { props.resetField('device') })}
+            {valueField('canness-device-lock', t('deviceLock'), t('deviceLockHint'), state.deviceLock, disabled, t,
+              text => { props.edit('deviceLock', text) }, () => { props.resetField('deviceLock') })}
+            {valueField('canness-set-env', t('setEnv'), t('setEnvHint'), state.setEnv, disabled, t,
+              text => { props.edit('setEnv', text) }, () => { props.resetField('setEnv') })}
             {valueField('canness-timeout', t('timeoutSec'), t('timeoutSecHint'), state.timeoutSec, disabled, t,
               text => { props.edit('timeoutSec', text) }, () => { props.resetField('timeoutSec') }, true)}
             {valueField('canness-poll', t('pollIntervalMs'), t('pollIntervalMsHint'), state.pollIntervalMs, disabled, t,

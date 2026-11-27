@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { enhancementBlock, ownsSession, shouldSteer, type PolicyConfig } from './policy.js'
+import { enhancementBlock, ownsSession, policyServiceName, shouldSteer, type PolicyConfig } from './policy.js'
 import { loadState, saveState } from './state-file.js'
 import { resolveWorkspace, statePath } from './workspace.js'
 
@@ -50,6 +50,10 @@ function sessionOf(payload: unknown): string | undefined {
 
 export function apply(ctx: Context, config: Config, now: () => number = Date.now): void {
   let warnedUnclaimed = false
+  const activePolicy = (): PolicyConfig => {
+    const snapshot = ctx.get?.(policyServiceName(config.workspace)) as (() => PolicyConfig) | undefined
+    return snapshot?.() ?? config
+  }
 
   /**
    * Both listeners share this guard. Driving a session requires three things at
@@ -60,7 +64,7 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
    * @param payload - the event payload, which carries the agent.
    * @returns the state to steer with, or undefined to stay quiet.
    */
-  const steerable = (payload: unknown, path: string): ReturnType<typeof loadState> | undefined => {
+  const steerable = (payload: unknown, path: string, policy: PolicyConfig): ReturnType<typeof loadState> | undefined => {
     const state = loadState(path)
     const session = sessionOf(payload)
     if (session !== undefined && !state.ownerSessionId && state.lastReport !== null && !warnedUnclaimed) {
@@ -69,7 +73,7 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
     }
     if (!ownsSession(state, session)) return undefined
     if (state.pendingSteer !== true) return undefined
-    if (!shouldSteer(state, config)) return undefined
+    if (!shouldSteer(state, policy)) return undefined
     if ((state.steerCount ?? 0) >= (config.maxSteerPerReport ?? 3)) return undefined
     const previous = state.lastSteerAt ?? 0
     if (previous > 0 && now() - previous < (config.minSteerIntervalMs ?? 30_000)) return undefined
@@ -89,9 +93,10 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
     const decision = await next()
     if (decision.kind !== 'enter') return decision
     const path = statePath(resolveWorkspace(config.workspace, payload))
-    const state = steerable(payload, path)
+    const policy = activePolicy()
+    const state = steerable(payload, path, policy)
     if (state === undefined) return decision
-    const text = enhancementBlock(state, config)
+    const text = enhancementBlock(state, { ...policy, maxSteerPerReport: config.maxSteerPerReport })
     const already = decision.messages.some(message =>
       message.content.some(block => block.type === 'text' && block.text === text),
     )
@@ -109,13 +114,14 @@ export function apply(ctx: Context, config: Config, now: () => number = Date.now
 
   ctx.on('agent/turn-stopping', (payload) => {
     const path = statePath(resolveWorkspace(config.workspace, payload))
-    const state = steerable(payload, path)
+    const policy = activePolicy()
+    const state = steerable(payload, path, policy)
     if (state === undefined) return
     const agent = (payload as { agent?: { steer(message: unknown): void } }).agent
     if (agent === undefined || typeof agent.steer !== 'function') return
     // Consume before steering: a steer starts a turn, and that turn must not
     // find the same pending retry waiting for it.
     consume(path, state)
-    agent.steer(notice(enhancementBlock(state, config)))
+    agent.steer(notice(enhancementBlock(state, { ...policy, maxSteerPerReport: config.maxSteerPerReport })))
   })
 }

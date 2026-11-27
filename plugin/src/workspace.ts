@@ -25,3 +25,12 @@ export function resolveWorkspace(configured: string | undefined, context?: unkno
 export function statePath(workspace: string): string {
   return join(workspace, '.canness', 'state.json')
 }
+
+export interface TargetApprovalSnapshot {
+  approval: string
+  endpoint: string
+}
+
+export function targetApprovalServiceName(workspace?: string): string {
+  return `canness:target-approval:${workspace?.trim() ?? ''}`
+}

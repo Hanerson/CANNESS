@@ -27,7 +27,7 @@ export type TargetPlatform = {
   cann_version?: string
   arch_family?: ArchFamily
   mode?: 'pinned' | 'portable'
-  confirmation?: { confirmed: boolean; detectedSoc: string | null }
+  confirmation?: { confirmed: boolean; detectedSoc: string | null; approvalId?: string }
 }
 
 export type ResolvedTarget = {

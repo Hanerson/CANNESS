@@ -28,8 +28,8 @@ export function carrySources(workspace: string, previous: string, next: string):
   }
   return carried
 }
-export function missingLayers(workspace: string, generationId: string): string[] {
-  return Object.values(LAYER_FILES).filter(file => !existsSync(join(workspace, 'operators', generationId, file)))
+export function hasKernelSource(workspace: string, generationId: string): boolean {
+  return existsSync(join(workspace, 'operators', generationId, LAYER_FILES.kernel))
 }
 export function writePartialOperator(workspace: string, generationId: string, files: Partial<Record<LayerName, string>>, origins: Partial<Record<LayerName, Origin>>): string {
   const root = join(workspace, 'operators', generationId)

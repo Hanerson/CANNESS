@@ -6,7 +6,7 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { credentialRef, isCredentialRefName } from '@deepseek-ai/dsh-credentials'
 import { preflightToolchain, runEvaluation } from './eval-run.js'
-import { loadState, saveState } from './state-file.js'
+import { loadState, saveGenerationState, saveState } from './state-file.js'
 import { registerProbeCommand, type TcpDial } from './probe.js'
 import { connectRemote, type SftpOptions } from './ssh2-transport.js'
 import { packageHash } from './package-files.js'
@@ -15,10 +15,10 @@ import { DEFAULT_TOKEN_REF } from './cannlab/constants.js'
 import { createTokenStore } from './cannlab/tokens.js'
 import type { RemoteHost } from './remote.js'
 import { stoppedReport, type EvalReport, type JsonValue } from './report.js'
-import { canForceEvaluation, stopReason, targetGap, type PolicyConfig, type StopReason, type TaskState } from './policy.js'
-import { resolveWorkspace, statePath } from './workspace.js'
+import { canForceEvaluation, infrastructureFailure, policyServiceName, stopReason, targetGap, type PolicyConfig, type StopReason, type TaskState } from './policy.js'
+import { resolveWorkspace, statePath, targetApprovalServiceName, type TargetApprovalSnapshot } from './workspace.js'
 import { checkGolden, checkKernel } from './local-validation.js'
-import { unverifiedSubmissionStages, validateSubmission } from './submission-validation.js'
+import { submissionSourceHash, unverifiedSubmissionStages, validateSubmission } from './submission-validation.js'
 import { assertTaskOwnership, claimTaskOwnership } from './task-ownership.js'
 import { runIntrinsicProbe } from './intrinsic-probe.js'
 import { parseProbeConclusion, recordProbeConclusion } from './probe-knowledge.js'
@@ -41,6 +41,9 @@ export interface Config {
   port: Volatile<number>
   username: Volatile<string>
   privateKeyPath: Volatile<string>
+  hostFingerprint?: Volatile<string>
+  allowUnpinnedSsh?: Volatile<boolean>
+  targetApproval?: Volatile<string>
   passwordEnv: Volatile<string>
   inbox: Volatile<string>
   outbox: Volatile<string>
@@ -53,6 +56,7 @@ export interface Config {
   deviceLock?: Volatile<string>
   /** Explicit additional read-only remote roots. Empty by default. */
   readRoots?: Volatile<string[]>
+  retainAttempts?: Volatile<number>
   maxIterations: Volatile<number>
   maxCompileRetries: Volatile<number>
   negativeStreakLimit: Volatile<number>
@@ -71,6 +75,9 @@ export const Config = z.object({
   port: z.number().required().volatile(),
   username: z.string().required().volatile(),
   privateKeyPath: z.string().required().volatile(),
+  hostFingerprint: z.string().default('').volatile(),
+  allowUnpinnedSsh: z.boolean().default(false).volatile(),
+  targetApproval: z.string().default('').volatile(),
   passwordEnv: z.string().role('credential-ref').default('CANNNESS_SSH_PASSWORD').volatile(),
   inbox: z.string().required().volatile(),
   outbox: z.string().required().volatile(),
@@ -84,6 +91,7 @@ export const Config = z.object({
   // (CAN-108). The root is not '/' and every read still normalises and rejects
   // symlink escapes, so this only widens reads inside the CANN installation.
   readRoots: z.array(z.string()).default(['/usr/local/Ascend']).volatile(),
+  retainAttempts: z.number().default(8).volatile(),
   maxIterations: z.number().required().volatile(),
   maxCompileRetries: z.number().required().volatile(),
   negativeStreakLimit: z.number().required().volatile(),
@@ -133,6 +141,8 @@ function snapshot(config: Config) {
     port: config.port.get(),
     username: config.username.get(),
     privateKeyPath: config.privateKeyPath.get(),
+    hostFingerprint: config.hostFingerprint?.get?.().trim() ?? '',
+    allowUnpinnedSsh: config.allowUnpinnedSsh?.get?.() === true,
     passwordEnv: config.passwordEnv.get(),
     inbox: config.inbox.get(),
     outbox: config.outbox.get(),
@@ -142,6 +152,7 @@ function snapshot(config: Config) {
     device: config.device?.get?.() ?? '',
     deviceLock: config.deviceLock?.get?.() ?? '',
     readRoots: [...(config.readRoots?.get?.() ?? []), ...toolkitRoots(config.setEnv?.get?.() ?? '')],
+    retainAttempts: config.retainAttempts?.get?.(),
   }
 }
 
@@ -216,7 +227,11 @@ async function openEvaluationRemote(
     return { summary: `ssh credentials could not be read for ${endpoint}: ${errorMessage(error)}. Check Settings → CANNESS.` }
   }
   if (auth.privateKey === undefined && auth.password === undefined) return { summary: 'ssh credentials missing' }
-  if (tunnel.matches(cfg.host, cfg.port)) {
+  const managedTunnel = tunnel.matches(cfg.host, cfg.port)
+  if (!managedTunnel && !cfg.hostFingerprint && !cfg.allowUnpinnedSsh) {
+    return { summary: `SSH endpoint ${endpoint} needs a trusted hostFingerprint. Set it in Settings → CANNESS before connecting.` }
+  }
+  if (managedTunnel) {
     const health = await tunnel.health().catch(() => 'down' as const)
     if (health === 'down') {
       return { summary: `CANNLab tunnel ${endpoint} is down. ${await hint() ?? 'Reconnect from Settings → CANNESS.'}` }
@@ -224,7 +239,8 @@ async function openEvaluationRemote(
     if (health === 'up') await tunnel.renew().catch(() => false)
   }
   try {
-    return { files: await connect({ host: cfg.host, port: cfg.port, username: cfg.username, ...auth }) }
+    return { files: await connect({ host: cfg.host, port: cfg.port, username: cfg.username, ...auth,
+      ...(cfg.hostFingerprint ? { hostFingerprint: cfg.hostFingerprint } : {}) }) }
   } catch (error) {
     const detail = errorMessage(error)
     const diagnosed = await hint()
@@ -314,25 +330,17 @@ function localTargetFor(workspace: string, remotePath: string, localPath: string
   return target
 }
 
-/**
- * Remote reads are confined to the configured outbox and the current
- * generation's inbox. Anything else (keys, /etc, a sibling generation) is
- * rejected before the transport sees it.
- */
-/**
- * Directories a configured set_env file makes readable: the toolkit root it
- * belongs to (``/usr/local/Ascend/cann-9.2.1`` -> ``/usr/local/Ascend``).
- * Lets a non-standard installation be read without extra configuration.
- */
+/** Derive the nearest versioned toolkit root, or the script's directory. */
 function toolkitRoots(setEnv: string): string[] {
   if (!setEnv.startsWith('/') || setEnv.endsWith('/')) return []
-  const parts = setEnv.split('/').filter(Boolean)
+  const parts = posix.normalize(setEnv).split('/').filter(Boolean)
   if (parts.length < 3) return []
   parts.pop()
-  if (parts[parts.length - 1] === 'cann-9.2.1') parts.pop()
-  return ['/' + parts.join('/')]
+  const versioned = parts.findLastIndex(part => /^cann-\d+(?:\.\d+)+(?:[-._][a-z0-9._-]+)?$/iu.test(part))
+  return ['/' + parts.slice(0, versioned === -1 ? parts.length : versioned + 1).join('/')]
 }
 
+/** Remote reads are restricted to the outbox, known generation inboxes and read roots. */
 export function remoteTargetAllowed(
   remotePath: string,
   outbox: string,
@@ -496,6 +504,11 @@ export function apply(
   dial?: TcpDial,
   tunnel: TunnelProbe = defaultTunnelProbe,
 ): void {
+  ctx.provide?.(policyServiceName(config.workspace), () => policyOf(config))
+  ctx.provide?.(targetApprovalServiceName(config.workspace), (): TargetApprovalSnapshot => ({
+    approval: config.targetApproval?.get?.().trim() ?? '',
+    endpoint: `${config.host.get()}:${config.port.get()}`,
+  }))
   if (dial === undefined) registerProbeCommand(ctx)
   else registerProbeCommand(ctx, dial)
   async function validateExportedSubmission(prepared: ReturnType<typeof prepareSubmission>, cfg: ReturnType<typeof snapshot>): Promise<JsonValue> {
@@ -506,7 +519,7 @@ export function apply(
     try {
       return await validateSubmission(connection.files, {
         ...prepared, remoteRoot: cfg.inbox, setEnv: cfg.setEnv, timeoutSec: cfg.timeoutSec,
-        device: cfg.device, deviceLock: cfg.deviceLock || undefined,
+        device: cfg.device, deviceLock: cfg.deviceLock || undefined, retainAttempts: cfg.retainAttempts,
       })
     } finally { await connection.files.close().catch(() => {}) }
   }
@@ -525,6 +538,7 @@ export function apply(
       'A placeholder golden.h (write_package_file) returns accuracy_fail with "golden not implemented", never pass.',
       'An unchanged package reuses its previous measurement with duplicate:true; use force:true to remeasure.',
       'Optionally attach validation for an export of the same package after kernel correctness passes.',
+      'Set require_submission:true when the task requires a validated export. Supply submission.test_script, and cases_file for a case suite when available.',
       'The result always carries workspace, packageDir and resultsPath, plus status / compile.log /',
       'correctness.maxRelativeError / performance.kernelTimeUs / analysis / summary.',
       'Connection and transport failures leave pendingStage:run_evaluation. Restore the connection and retry the same package.',
@@ -535,6 +549,7 @@ export function apply(
       golden_fixtures: { type: 'string', description: 'Optional workspace-relative reference vector JSON. A failing local golden check prevents remote execution without spending budget.' },
       kernel_dtypes: { type: 'array', items: { type: 'string' }, description: 'Optional dtype variants for limited local host-stub kernel syntax lint before SSH. Does not validate target API support.' },
       submission: { type: 'object', additionalProperties: false, properties: submissionParameters },
+      require_submission: { type: 'boolean', description: 'Require a validated submission to reach the target. Retained for this generation until explicitly changed.' },
     },
     output: {
       schema: {
@@ -671,7 +686,8 @@ export function apply(
       const force = (_args as { force?: boolean } | null)?.force === true
       const compileOnly = (_args as { compile_only?: boolean } | null)?.compile_only === true
       const submission = (_args as { submission?: SubmissionArgs } | null)?.submission
-      if (compileOnly && submission) throw new Error('submission validation requires an accuracy evaluation')
+      const requestedSubmission = (_args as { require_submission?: boolean } | null)?.require_submission
+      if (compileOnly && (submission || requestedSubmission === true)) throw new Error('submission validation requires an accuracy evaluation')
       const cfg = snapshot(config)
       const stateFile = statePath(workspace)
       let state = loadState(stateFile)
@@ -698,6 +714,8 @@ export function apply(
         state = claimTaskOwnership(stateFile, 'run_evaluation', exec)
         budget.windowStartedAt = state.budgetWindowStartedAt ?? null
       }
+      const requireSubmission = !compileOnly && (requestedSubmission ?? state.requireSubmission ?? false)
+      if (!compileOnly) state = { ...state, requireSubmission }
       const fail = (report: EvalReport): RunEvaluationValue =>
         withPaths(rejected(report), workspace, state.generationId, cfg.outbox, state.pendingStage ?? null)
       if (state.generationId === null && cfg.host === '') return fail(unavailableReport(null, 'ssh host is empty'))
@@ -724,11 +742,22 @@ export function apply(
         }
       }
       const attachSubmission = async (report: RunEvaluationValue): Promise<RunEvaluationValue> => {
-        if (!prepared) return report
+        if (!prepared) return requireSubmission
+          ? { ...report, submission: { status: 'not_exported', reason: 'Export this generation and rerun validation.' } }
+          : report
         const validation = report.correctness.ok
-          ? await validateExportedSubmission(prepared, cfg)
+          ? await validateExportedSubmission(prepared, cfg).catch(error => ({ status: 'failed', reason: errorMessage(error) }))
           : { status: 'not_run', reason: 'kernel correctness did not pass' }
         return { ...report, submission: prepared.auto ? { ...(validation as Record<string, unknown>), auto: true } : validation }
+      }
+      const submissionState = ({ submission }: RunEvaluationValue): TaskState['lastSubmission'] => {
+        if (submission === null || typeof submission !== 'object' || Array.isArray(submission) || typeof submission.status !== 'string') return null
+        const sourceDir = prepared?.sourceDir ?? state.lastSubmission?.sourceDir
+        return {
+          status: submission.status,
+          ...(typeof submission.reason === 'string' ? { reason: submission.reason } : {}),
+          ...(sourceDir && typeof submission.sourceHash === 'string' ? { sourceDir, sourceHash: submission.sourceHash } : {}),
+        }
       }
       const kernelDtypes = (_args as { kernel_dtypes?: string[] } | null)?.kernel_dtypes
       if (kernelDtypes) {
@@ -745,14 +774,38 @@ export function apply(
         }
       }
       if (state.lastEvaluatedHash === currentHash && state.lastReport !== null && state.pendingStage == null && !force && !compileOnly) {
-        saveState(stateFile, { ...state, pendingSteer: false })
-        return attachSubmission(withPaths(observed({
+        const measured = withPaths(observed({
           ...state.lastReport,
           duplicate: true,
           summary: `duplicate package: same content as the last evaluation; previous result: ${state.lastReport.summary}`,
         }), workspace, state.generationId, cfg.outbox, null, state.lastResultsPath === undefined
           ? (state.lastReport.status === 'timeout' ? null : posix.join(cfg.outbox, state.generationId, 'results.json'))
-          : state.lastResultsPath, cfg.inbox))
+          : state.lastResultsPath, cfg.inbox)
+        const priorSubmission = state.lastSubmission
+        let reusedHash: string | undefined
+        if (requireSubmission && submission === undefined && priorSubmission?.status === 'validated'
+          && priorSubmission.sourceDir && priorSubmission.sourceHash
+          && (!prepared || prepared.sourceDir === priorSubmission.sourceDir)) {
+          try {
+            const sourceDir = workspaceInput(workspace, priorSubmission.sourceDir, 'cached submission')
+            if (submissionSourceHash(sourceDir) === priorSubmission.sourceHash) reusedHash = priorSubmission.sourceHash
+          } catch {
+            // The old export moved or changed. Validate the current export instead.
+          }
+        }
+        const result = reusedHash
+          ? { ...measured, submission: { status: 'validated', sourceHash: reusedHash, duplicate: true } }
+          : await attachSubmission(measured)
+        const latest = loadState(stateFile)
+        if (latest.generationId === state.generationId && latest.packageHash === state.packageHash) {
+          const lastSubmission = submissionState(result)
+          const pendingSteer = requireSubmission && lastSubmission?.status !== 'validated'
+            && (latest.pendingSteer === true || lastSubmission?.status !== latest.lastSubmission?.status)
+          const updated = { ...latest, requireSubmission, lastSubmission, pendingSteer }
+          if (requireSubmission) saveGenerationState(stateFile, updated)
+          saveState(stateFile, updated)
+        }
+        return result
       }
       const reason = stopReason(state, policyOf(config))
       const forcedAfterStop = force && canForceEvaluation(state, policyOf(config))
@@ -764,7 +817,7 @@ export function apply(
           forcedRunsAfterStop: state.forcedRunsAfterStop ?? 0, packageHash: currentHash },
         }), workspace, state.generationId, cfg.outbox, null)
       }
-      if (!compileOnly && (state.pendingStage == null || state.pendingSteer)) {
+      if (!compileOnly && (state.pendingStage == null || state.pendingSteer || requestedSubmission !== undefined)) {
         saveState(stateFile, { ...state, pendingStage: 'run_evaluation', pendingSteer: false })
       }
       const pending = (summary: string): RunEvaluationValue => withPaths(
@@ -784,6 +837,7 @@ export function apply(
         setEnv: cfg.setEnv,
         device: cfg.device,
         deviceLock: cfg.deviceLock,
+        retainAttempts: cfg.retainAttempts,
         state: { ...state, packageHash: currentHash },
         force,
         compileOnly,
@@ -797,25 +851,35 @@ export function apply(
       if (force && report.runRecord !== undefined) report.runRecord.params.forced = true
       if (compileOnly) return { ...withPaths(report, workspace, state.generationId, cfg.outbox, null, resultsPath, cfg.inbox),
         compileOnly: true }
-      const latest = loadState(stateFile)
-      if (latest.generationId === state.generationId && latest.packageHash === state.packageHash) {
-        saveState(stateFile, {
-          ...next,
-          // This is a cache of the package just evaluated, not an authorization
-          // source (CAN-104). Keep it aligned with what was measured.
-          packageHash: currentHash,
-          forcedRunsAfterStop: (state.forcedRunsAfterStop ?? 0) + (forcedAfterStop ? 1 : 0),
-          pendingStage: null,
-          lastEvaluatedHash: currentHash,
-          lastResultsPath: resultsPath,
-          ownerSessionId: owner ?? state.ownerSessionId ?? null,
-          // One retry is owed for this report, and only for it.
-          pendingSteer: !forcedAfterStop,
-          steerCount: 0,
-          lastSteerAt: 0,
-        })
+      const pendingStage = infrastructureFailure(report) ? 'run_evaluation' : null
+      const saved: TaskState = {
+        ...next,
+        packageHash: currentHash,
+        forcedRunsAfterStop: (state.forcedRunsAfterStop ?? 0) + (forcedAfterStop ? 1 : 0),
+        pendingStage,
+        lastEvaluatedHash: pendingStage ? state.lastEvaluatedHash : currentHash,
+        lastResultsPath: resultsPath,
+        ownerSessionId: owner ?? state.ownerSessionId ?? null,
+        lastSubmission: null,
+        pendingSteer: !forcedAfterStop,
+        steerCount: 0,
+        lastSteerAt: 0,
       }
-      return attachSubmission(withPaths(observed(report), workspace, state.generationId, cfg.outbox, null, resultsPath, cfg.inbox))
+      let expectedHash = state.packageHash
+      const persist = (snapshot: TaskState) => {
+        saveGenerationState(stateFile, snapshot)
+        const latest = loadState(stateFile)
+        if (latest.generationId === state.generationId && latest.packageHash === expectedHash) {
+          saveState(stateFile, snapshot)
+          expectedHash = snapshot.packageHash
+        }
+      }
+      if (prepared && report.correctness.ok) {
+        persist({ ...saved, lastSubmission: { status: 'pending' }, pendingSteer: false })
+      }
+      const result = await attachSubmission(withPaths(observed(report), workspace, state.generationId, cfg.outbox, pendingStage, resultsPath, cfg.inbox))
+      persist({ ...saved, lastSubmission: submissionState(result) })
+      return result
     }),
   }))
   ctx.tools.register(defineTool({

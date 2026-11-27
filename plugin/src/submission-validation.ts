@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { runnerScriptFile } from './eval-run.js'
 import { shellQuote, type RemoteHost } from './remote.js'
 import type { JsonValue } from './report.js'
+import { retainCompletedAttempts } from './retention.js'
 
 export interface SubmissionValidationInput {
   sourceDir: string
@@ -17,12 +18,13 @@ export interface SubmissionValidationInput {
   caseTimeoutSec?: number
   device?: string
   deviceLock?: string
+  retainAttempts?: number
 }
 
 export function unverifiedSubmissionStages(): JsonValue {
   return { build: { status: 'unverified' }, install: { status: 'unverified' }, call: { status: 'unverified' }, accuracy: { status: 'unverified' } }
 }
-function checkSources(root: string): void {
+export function submissionSourceHash(root: string): string {
   const actual = new Set<string>()
   const walk = (dir: string, prefix = '') => {
     if (lstatSync(dir).isSymbolicLink()) throw new Error('submission symlinks are not allowed')
@@ -35,12 +37,14 @@ function checkSources(root: string): void {
     }
   }
   walk(root)
-  const declared = JSON.parse(readFileSync(join(root, 'provenance.json'), 'utf8')).files as Record<string, string>
+  const provenance = readFileSync(join(root, 'provenance.json'), 'utf8')
+  const declared = JSON.parse(provenance).files as Record<string, string>
   if (!declared || typeof declared !== 'object' || Array.isArray(declared)) throw new Error('invalid provenance.files')
   for (const [name, hash] of Object.entries(declared)) {
     if (!actual.delete(name) || !/^[a-f0-9]{64}$/i.test(hash) || createHash('sha256').update(readFileSync(join(root, name))).digest('hex') !== hash.toLowerCase()) throw new Error(`submission provenance mismatch: ${name}`)
   }
   if (actual.size) throw new Error('submission contains unhashed files')
+  return createHash('sha256').update(provenance).digest('hex')
 }
 export async function validateSubmission(files: RemoteHost, input: SubmissionValidationInput): Promise<JsonValue> {
   const timeout = Math.max(1, Math.min(3600, Math.round(input.timeoutSec ?? 600)))
@@ -48,7 +52,7 @@ export async function validateSubmission(files: RemoteHost, input: SubmissionVal
   const failure = (reason: string): JsonValue => ({ status: 'failed', correctness: 'unverified', stages: unverifiedSubmissionStages(), remoteDir, reason })
   const temp = mkdtempSync(join(tmpdir(), 'canness-submission-validation-'))
   try {
-    checkSources(input.sourceDir)
+    const sourceHash = submissionSourceHash(input.sourceDir)
     if (input.device && !/^\d+$/.test(input.device)) throw new Error('device ID must be a nonnegative integer')
     if (input.casesFile) {
       if (!input.testScript) throw new Error('cases_file requires a test_script')
@@ -84,7 +88,10 @@ export async function validateSubmission(files: RemoteHost, input: SubmissionVal
     }
     const report = JSON.parse(line.slice('CANNESS_SUBMISSION_REPORT '.length))
     if (result.code !== 0 && report.status !== 'failed') return failure(`runner exited ${result.code}`)
-    return { ...report, remoteDir }
+    await retainCompletedAttempts(files, 'validation', {
+      inbox: input.remoteRoot, current: posix.basename(remoteDir),
+    }, input.retainAttempts)
+    return { ...report, remoteDir, sourceHash }
   } catch (error) { return failure(error instanceof Error ? error.message : String(error)) }
   finally { rmSync(temp, { recursive: true, force: true }) }
 }

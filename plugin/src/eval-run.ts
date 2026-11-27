@@ -6,6 +6,7 @@ import { malformedReport, parseReport, stoppedReport, timeoutReport, type EvalRe
 import { applyReport, canForceEvaluation, stopReason, type PolicyConfig, type TaskState } from './policy.js'
 import { firstLines, shellQuote, waitForRemoteFile, type RemoteHost } from './remote.js'
 import { packageHash, requireFreshBuild } from './package-files.js'
+import { retainCompletedAttempts } from './retention.js'
 
 /** Where `runner.py` sits relative to the built module (`lib/eval-run.js`). */
 const RUNNER_FROM_LIB = '../../remote/runner.py'
@@ -24,6 +25,7 @@ export interface RunInput {
   setEnv?: string
   device?: string
   deviceLock?: string
+  retainAttempts?: number
   force?: boolean
   compileOnly?: boolean
   accuracyOnly?: boolean
@@ -63,10 +65,12 @@ export function runnerCommand(input: {
   compileOnly?: boolean
   accuracyOnly?: boolean
 }): string {
-  const timeout = `if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout --kill-after=10s ${Math.max(1, Math.round(input.timeoutSec))}s"; else TIMEOUT=""; fi; `
+  const budgetSec = Math.max(1, Math.round(input.timeoutSec))
+  // Give the runner time to terminate its subprocess and publish its report.
+  const timeout = `if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout --kill-after=10s ${budgetSec + 10}s"; else TIMEOUT=""; fi; `
   return `${findPython}${timeout}$TIMEOUT "$PY" ${shellQuote(input.runnerPath)}`
     + ` --inbox ${shellQuote(input.inbox)} --outbox ${shellQuote(input.outbox)}`
-    + ` --generation ${shellQuote(input.generationId)} --once`
+    + ` --generation ${shellQuote(input.generationId)} --once --budget-sec ${budgetSec}`
     + (input.setEnv ? ` --set-env ${shellQuote(input.setEnv)}` : '')
     + deviceFlags(input)
     + (input.compileOnly ? ' --compile-only' : '')
@@ -149,6 +153,7 @@ export async function runEvaluation(input: RunInput): Promise<{
   const inbox = input.compileOnly ? input.inbox : posix.join(input.inbox, attempt)
   const outbox = input.compileOnly ? input.outbox : posix.join(input.outbox, attempt)
   const resultPath = posix.join(outbox, generation, 'results.json')
+  let complete = false
 
   await input.files.uploadDir(input.localPackageDir, posix.join(inbox, generation))
   try {
@@ -166,6 +171,20 @@ export async function runEvaluation(input: RunInput): Promise<{
       accuracyOnly: input.accuracyOnly,
     }))
     if (started.code === 124) {
+      try {
+        const written = await input.files.readFile(resultPath)
+        if (written !== null) {
+          const raw = JSON.parse(Buffer.from(written).toString('utf8'))
+          const report = parseReport(raw)
+          if (report.generationId === generation && raw.status === report.status && typeof raw.summary === 'string'
+            && typeof raw.compile?.ok === 'boolean' && typeof raw.correctness?.ok === 'boolean' && raw.performance != null) {
+            complete = true
+            return { report, state: fold(report), resultWritten: true, resultsPath: resultPath }
+          }
+        }
+      } catch {
+        // A missing, unreadable or incomplete report leaves the timeout authoritative.
+      }
       const report = timeoutReport(input.generationId, Math.round(input.timeoutMs / 1000))
       return { report, state: fold(report), resultWritten: false }
     }
@@ -182,6 +201,7 @@ export async function runEvaluation(input: RunInput): Promise<{
       sleep: input.sleep,
     })
     const report = parseReport(JSON.parse(Buffer.from(body).toString('utf8')))
+    complete = report.generationId === generation
     return { report, state: fold(report), resultWritten: true, resultsPath: resultPath }
   } catch (error) {
     const report = error instanceof Error && error.message === 'timeout'
@@ -192,5 +212,8 @@ export async function runEvaluation(input: RunInput): Promise<{
     // Best-effort: a stale temp script is harmless, a failed cleanup is not a
     // reason to lose the report above.
     await input.files.removeFile(runnerPath).catch(() => {})
+    if (complete && !diagnostic) await retainCompletedAttempts(input.files, 'eval', {
+      inbox: input.inbox, outbox: input.outbox, generation, current: `attempt-${token}`,
+    }, input.retainAttempts)
   }
 }

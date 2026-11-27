@@ -15,6 +15,9 @@ export type CannessSettingsLocaleKey =
   | 'privateKeyPath' | 'privateKeyPathHint'
   | 'host' | 'hostHint' | 'port' | 'portHint' | 'username' | 'usernameHint'
   | 'inbox' | 'inboxHint' | 'outbox' | 'outboxHint'
+  | 'hostFingerprint' | 'hostFingerprintHint' | 'device' | 'deviceHint'
+  | 'targetApproval' | 'targetApprovalHint'
+  | 'deviceLock' | 'deviceLockHint' | 'setEnv' | 'setEnvHint'
   | 'advanced'
   | 'timeoutSec' | 'timeoutSecHint' | 'pollIntervalMs' | 'pollIntervalMsHint'
   | 'maxIterations' | 'maxIterationsHint' | 'maxCompileRetries' | 'maxCompileRetriesHint'
@@ -71,6 +74,16 @@ export const zh: Record<CannessSettingsLocaleKey, string> = {
   inboxHint: '远端接收测试包的目录。',
   outbox: '结果目录（outbox）',
   outboxHint: '远端写回 results.json 的目录。',
+  hostFingerprint: 'SSH 主机密钥指纹',
+  hostFingerprintHint: '直连或手工转发需要经独立核验的 OpenSSH SHA256 指纹。',
+  targetApproval: '目标硬件确认',
+  targetApprovalHint: '核对规格声明与探测硬件后，填入 submit_spec 返回的确认编号。',
+  device: 'NPU 设备号',
+  deviceHint: '远端设备编号。留空使用远端默认设备。',
+  deviceLock: '设备锁路径',
+  deviceLockHint: '远端用于协调同卡任务的锁文件。留空使用默认路径。',
+  setEnv: 'CANN 环境脚本',
+  setEnvHint: '远端 set_env.sh 的绝对路径。留空自动查找。',
   advanced: '高级设置',
   timeoutSec: '等待结果超时（秒）',
   timeoutSecHint: '上传测试包后等待 results.json 的最长时间。',
@@ -159,6 +172,16 @@ export const en: Record<CannessSettingsLocaleKey, string> = {
   inboxHint: 'Remote directory that receives test packages.',
   outbox: 'Outbox directory',
   outboxHint: 'Remote directory where results.json is written back.',
+  hostFingerprint: 'SSH host key fingerprint',
+  hostFingerprintHint: 'Enter an independently verified OpenSSH SHA256 fingerprint.',
+  targetApproval: 'Target approval',
+  targetApprovalHint: 'Review the declared and detected hardware, then enter the approval ID from submit_spec.',
+  device: 'NPU device',
+  deviceHint: 'Remote device number. Leave blank to use the server default.',
+  deviceLock: 'Device lock path',
+  deviceLockHint: 'Remote lock file shared by runs on the same device.',
+  setEnv: 'CANN environment script',
+  setEnvHint: 'Absolute remote path to set_env.sh. Leave blank for automatic discovery.',
   advanced: 'Advanced',
   timeoutSec: 'Result wait timeout (s)',
   timeoutSecHint: 'How long to wait for results.json after uploading a package.',

@@ -1,20 +1,20 @@
-import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { carrySources, missingLayers, sameSourceContract, writePartialOperator } from './generator-sources.js'
+import { carrySources, hasKernelSource, sameSourceContract, writePartialOperator } from './generator-sources.js'
 import { newGenerationId } from './ids.js'
-import { buildTestPackage, checkKernelEntry, contractFingerprint, KERNEL_ENTRY, packageHash, repairPackage } from './package-files.js'
-import { parseProvenance } from './provenance.js'
+import { buildTestPackage, checkKernelEntry, contractFingerprint, KERNEL_ENTRY, LAYER_FILES, packageHash, repairPackage } from './package-files.js'
+import { parseProvenance, verifyOrigin } from './provenance.js'
 import { emptyState } from './policy.js'
 import { compareTargetPlatform, parseSpec } from './spec.js'
-import { saveState } from './state-file.js'
+import { saveState, writeStateJson } from './state-file.js'
 import { assertTaskOwnership, claimTaskOwnership, taskSessionId } from './task-ownership.js'
-import { exportSubmission } from './submission.js'
-import { resolveWorkspace, statePath } from './workspace.js'
+import { automaticExportCompatibility, exportSubmission } from './submission.js'
+import { resolveWorkspace, statePath, targetApprovalServiceName, type TargetApprovalSnapshot } from './workspace.js'
 
 export const name = 'canness-generator'
 export const inject = ['tools']
@@ -37,15 +37,16 @@ export function apply(ctx: Context, config: Config): void {
       'Resubmitting for the same operator keeps the iteration budget: counters, the best time, and the',
       'stall window carry over, so a new generation is a new artifact rather than a fresh allowance.',
       'Pass reset: true to start the budget over deliberately. Compatible source layers, golden.h and provenance carry forward independently of budget reset.',
+      'needsLayers indicates whether the generation still needs its kernel source for the default build.',
       'A target_us larger than the previous spec\'s is recorded and reported as a relaxed target.',
       'Declare 910B, A3 (ascend910_93), or 950 hardware in target_platform. Pass detected_soc from remote preflight to compare it with the declaration.',
-      'On a mismatch or a portable declaration, relay the comparison to the user and resubmit with confirm_target only after they confirm their intended hardware.',
+      'On a mismatch or a portable declaration, show the user the comparison and approvalId. The user saves this ID as Target approval in CANNESS settings before the agent resubmits with confirm_target.',
     ].join(' '),
     parameters: {
       spec: { type: 'json', required: true, description: 'Operator spec JSON from design doc 02 section 3.1' },
       reset: { type: 'boolean', description: 'Restart the iteration budget instead of carrying it over.' },
       detected_soc: { type: 'string', description: 'Detected SoC returned by remote preflight, used only as a suggestion.' },
-      confirm_target: { type: 'boolean', description: 'The user has confirmed the declared target or portable intent after reviewing the hardware comparison.' },
+      confirm_target: { type: 'boolean', description: 'Retry a previously reviewed target after the user has saved its approval ID in CANNESS settings.' },
     },
     output: {
       schema: {
@@ -58,8 +59,11 @@ export function apply(ctx: Context, config: Config): void {
           carriedOver: { type: 'boolean' },
           carriedLayers: { type: 'boolean' },
           needsLayers: { type: 'boolean' },
+          exportable: { type: 'boolean' },
+          exportReason: { type: 'string' },
           relaxedTargetFromUs: { oneOf: [{ type: 'number' }, { type: 'null' }] },
           requiresConfirmation: { type: 'boolean' },
+          approvalId: { type: 'string' },
           declared: { type: 'json' },
           detected: { type: 'json' },
           detectedSoc: { type: 'json' },
@@ -77,13 +81,32 @@ export function apply(ctx: Context, config: Config): void {
       const previousPlatform = prior.spec?.operator_name === spec.operator_name ? prior.spec.target_platform : undefined
       const { confirmation, ...previousDeclaration } = previousPlatform ?? {}
       const sameDeclaration = isDeepStrictEqual(previousDeclaration, spec.target_platform)
-      const detectedSoc = args.detected_soc ?? (sameDeclaration ? confirmation?.detectedSoc ?? undefined : undefined)
-      if (sameDeclaration && confirmation?.detectedSoc === (detectedSoc ?? null)) spec.target_platform.confirmation = confirmation
+      const approvalSnapshot = ctx.get?.(targetApprovalServiceName(config.workspace)) as (() => TargetApprovalSnapshot) | undefined
+      const settings = approvalSnapshot?.()
+      const approvalScope = [workspace, taskSessionId(exec), settings?.endpoint, spec.operator_name, spec.target_platform]
+      const scopeHash = createHash('sha256').update(JSON.stringify(approvalScope)).digest('hex')
+      const reviewPath = join(dirname(path), 'target-review', `${scopeHash}.json`)
+      const review = existsSync(reviewPath) ? JSON.parse(readFileSync(reviewPath, 'utf8')) as { detectedSoc?: string | null } : null
+      // A previously observed mismatch remains pending when the caller omits the
+      // probe or supplies a matching model-reported suggestion in a retry.
+      const newMismatch = args.detected_soc !== undefined
+        && compareTargetPlatform(spec.target_platform, args.detected_soc).requiresConfirmation
+      const detectedSoc = newMismatch ? args.detected_soc
+        : review?.detectedSoc ?? args.detected_soc ?? (sameDeclaration ? confirmation?.detectedSoc ?? undefined : undefined)
       const target = compareTargetPlatform(spec.target_platform, detectedSoc)
       if (!target.declared && spec.target_platform.mode !== 'portable') throw new Error(`Declare target_platform hardware. ${target.hint}`)
-      if (target.requiresConfirmation && args.confirm_target !== true) return target
-      if (args.confirm_target === true || (args.detected_soc !== undefined && !spec.target_platform.confirmation)) {
-        spec.target_platform.confirmation = { confirmed: args.confirm_target === true, detectedSoc: target.detectedSoc }
+      if (target.requiresConfirmation) {
+        const approvalInput = [scopeHash, target.detected?.soc ?? target.detectedSoc]
+        const approvalId = 'canness-' + createHash('sha256').update(JSON.stringify(approvalInput)).digest('hex').slice(0, 24)
+        const carriedApproval = sameDeclaration && confirmation?.confirmed === true && confirmation.approvalId === approvalId
+        if (settings?.approval !== approvalId || (!carriedApproval && args.confirm_target !== true)) {
+          writeStateJson(reviewPath, { detectedSoc: target.detectedSoc })
+          return { ...target, approvalId, hint: `${target.hint} Save this approval ID in Settings → CANNESS → Target approval before retrying.` }
+        }
+        writeStateJson(reviewPath, { detectedSoc: target.detectedSoc })
+        spec.target_platform.confirmation = { confirmed: true, detectedSoc: target.detectedSoc, approvalId }
+      } else if (detectedSoc !== undefined) {
+        spec.target_platform.confirmation = { confirmed: false, detectedSoc: target.detectedSoc }
       }
       const generationId = newGenerationId(randomUUID())
       // The budget is per operator, not per generation id: resubmitting the same
@@ -96,7 +119,7 @@ export function apply(ctx: Context, config: Config): void {
       const carriedLayers = prior.generationId !== null && prior.spec !== null
         && sameSourceContract(prior.spec, spec)
         ? carrySources(workspace, prior.generationId, generationId) : false
-      const needsLayers = missingLayers(workspace, generationId).length > 0
+      const needsLayers = !hasKernelSource(workspace, generationId)
       const priorTarget = prior.spec?.performance_target.target_us
       const relaxedTargetFromUs = carriedOver && priorTarget !== undefined
         && spec.performance_target.target_us > priorTarget
@@ -126,6 +149,7 @@ export function apply(ctx: Context, config: Config): void {
         lastBlocked: prior.lastBlocked ?? null,
         generationId,
         spec,
+        requireSubmission: prior.spec?.operator_name === spec.operator_name && prior.requireSubmission === true,
         targetRelaxedUs: relaxedTargetFromUs,
         // A fresh generation owes nothing until it has been evaluated, and it
         // keeps the owner recorded above so the loop still knows whose task it
@@ -140,6 +164,7 @@ export function apply(ctx: Context, config: Config): void {
         carriedOver,
         carriedLayers,
         needsLayers,
+        ...automaticExportCompatibility(spec),
         relaxedTargetFromUs,
       }
     },
@@ -158,7 +183,7 @@ export function apply(ctx: Context, config: Config): void {
       host: { type: 'string', description: 'op_host/host.cpp body' },
       api: { type: 'string', description: 'op_api/api.cpp body' },
       plugin: { type: 'string', description: 'op_plugin/plugin.py body' },
-      provenance: { type: 'json', description: 'Per-layer source declaration keyed by kernel, host, api or plugin. Entries have kind generated, adapted_from or copied_from, and an optional source and sha256.' },
+      provenance: { type: 'json', description: 'Per-layer source declaration keyed by kernel, host, api or plugin. Entries have kind generated, adapted_from or copied_from. Use source to name the reference and optionally supply sha256 and sourceFile to verify the digest against a workspace-relative file.' },
     },
     output: {
       schema: {
@@ -179,22 +204,27 @@ export function apply(ctx: Context, config: Config): void {
         const entry = checkKernelEntry(args.kernel)
         if (!entry.ok) throw new Error(`write_operator: ${entry.reason}`)
       }
-      const operatorDir = writePartialOperator(workspace, state.generationId, {
-        kernel: args.kernel, host: args.host, api: args.api, plugin: args.plugin,
-      }, parseProvenance(args.provenance))
+      const files = { kernel: args.kernel, host: args.host, api: args.api, plugin: args.plugin }
+      const origins = parseProvenance(args.provenance)
+      for (const layer of Object.keys(files) as (keyof typeof files)[]) {
+        const origin = origins[layer]
+        if (files[layer] !== undefined && origin) origins[layer] = verifyOrigin(workspace, layer, origin)
+      }
+      const operatorDir = writePartialOperator(workspace, state.generationId, files, origins)
       return { operatorDir }
     },
   }))
   ctx.tools.register(defineTool({
     name: 'build_test_package',
     description: [
-      'Assemble the current generation into a build-contract-v1 package: the four operator layers plus',
-      'build.sh, run_once.sh, main.cpp, golden.h, the canness_tiling headers, config.json and manifest.json.',
+      'Assemble the kernel and any supplied host, API or plugin sources into a build-contract-v1 package',
+      'with build.sh, run_once.sh, main.cpp, golden.h, the canness_tiling headers, config.json and manifest.json.',
+      'The default build compiles the kernel and the generic main.cpp driver. Host, API and plugin sources are optional records in documentedOnlyLayers.',
       'main.cpp/build.sh/run_once.sh/canness_tiling.h are rendered by the plugin and are operator-independent;',
       'the accuracy reference comes from golden.h (the model-owned extension point).',
       `The kernel entry must be void ${KERNEL_ENTRY}(<inputs>, <outputs>, GM_ADDR tiling); this tool refuses to`,
       'package a kernel that does not define it.',
-      'manifest.json.files lists what actually landed on disk; manifest.json.layers lists the four layers.',
+      'manifest.json.files lists the package contents and manifest.json.layers lists the operator sources included.',
       'Integer outputs use exact comparison; index-check mode calls golden::verify_index with the actual integer.',
       'For shape and attrs, use GoldenCtx and CANNESS_GOLDEN_WITH_CONTEXT in golden.h.',
     ].join(' '),
@@ -227,9 +257,8 @@ export function apply(ctx: Context, config: Config): void {
       const path = statePath(workspace)
       const state = claimTaskOwnership(path, 'build_test_package', exec)
       if (state.generationId == null || state.spec == null) throw new Error('submit_spec first')
-      const missing = missingLayers(workspace, state.generationId)
-      if (missing.length > 0) {
-        throw new Error(`build_test_package: generation ${state.generationId} is missing ${missing.join(', ')}; call write_operator for this generation first`)
+      if (!hasKernelSource(workspace, state.generationId)) {
+        throw new Error(`build_test_package: generation ${state.generationId} is missing ${LAYER_FILES.kernel}; call write_operator for this generation first`)
       }
       const packageDir = buildTestPackage(workspace, state.generationId, state.spec)
       const hash = packageHash(packageDir)

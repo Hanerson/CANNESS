@@ -33,6 +33,11 @@ export interface EvalSettings {
   port?: number
   username?: string
   privateKeyPath?: string
+  hostFingerprint?: string
+  targetApproval?: string
+  device?: string
+  deviceLock?: string
+  setEnv?: string
   passwordEnv?: string
   inbox?: string
   outbox?: string
@@ -122,6 +127,11 @@ export interface EvalCardState extends SettingsFormShell {
   port: SettingsFieldState
   username: SettingsFieldState
   privateKeyPath: SettingsFieldState
+  hostFingerprint: SettingsFieldState
+  targetApproval: SettingsFieldState
+  device: SettingsFieldState
+  deviceLock: SettingsFieldState
+  setEnv: SettingsFieldState
   inbox: SettingsFieldState
   outbox: SettingsFieldState
   timeoutSec: SettingsFieldState
@@ -219,6 +229,11 @@ export class EvalCardController {
       settingsNumberField('port'),
       settingsTextField('username'),
       settingsTextField('privateKeyPath'),
+      settingsTextField('hostFingerprint'),
+      settingsTextField('targetApproval'),
+      settingsTextField('device'),
+      settingsTextField('deviceLock'),
+      settingsTextField('setEnv'),
       settingsTextField('inbox'),
       settingsTextField('outbox'),
       settingsNumberField('timeoutSec'),
@@ -283,6 +298,11 @@ export class EvalCardController {
       port: this.form.field('port'),
       username: this.form.field('username'),
       privateKeyPath: this.form.field('privateKeyPath'),
+      hostFingerprint: this.form.field('hostFingerprint'),
+      targetApproval: this.form.field('targetApproval'),
+      device: this.form.field('device'),
+      deviceLock: this.form.field('deviceLock'),
+      setEnv: this.form.field('setEnv'),
       inbox: this.form.field('inbox'),
       outbox: this.form.field('outbox'),
       timeoutSec: this.form.field('timeoutSec'),
