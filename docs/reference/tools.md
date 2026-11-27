@@ -69,6 +69,9 @@ kernel 入口固定为 `extern "C" __global__ __aicore__ void canness_kernel(...
 - `test_script` 是完整的 Python 源码。它需要调用安装后的 `cann_bench` 公开接口、在需要时同步设备、和独立参考比对，并输出一条 `CANNESS_VALIDATION {"ok":true,"mere":0.0,"mare":0.0}`。`mere` 和 `mare` 可省略。
 - 传入工作区中的官方 `cases_file` 时，CSV 必须有 `case_id` 列。验证工具为每个受支持的用例启动独立进程。比较脚本从 `json.loads(os.environ["CANNESS_CASE_JSON"])` 读取当前行，包含 `input_shape`、`dtype`、`attrs`、`value_range` 等字段。报告列出各例结果、跳过的组合和覆盖数。
 - 在 `run_evaluation({ submission: { source_dir, test_script?, cases_file? } })` 中传入同一 generation 和包哈希的导出目录，可在 kernel 精度通过后把验收结果附到 `submission`。验收阶段不额外计入性能预算，也可单独重跑。
+  - `run_evaluation` 默认就做这件事：不传 `submission` 时，它自动挑出同一 generation、同一包哈希的最新导出，跑一次构建 + 安装 + 公开接口调用，结果附到 `submission` 并带 `auto: true`。`compile_only` 不触发验收。
+- 导出前会按 CANNBENCH 评分规则自检：`aclrtmemcpy-budget`（每个 API 名的 host 拷贝不超过一次且位于属性缓存之后）、`aclrtmemcpy-ordering`（拷贝前需 `aclrtSynchronizeDevice`）、`tiling-lifetime`（wrapper 不得在 callable 内分配 tiling）、`utf8`（源文件必须是合法 UTF-8）。违反时导出直接失败，并给出规则 id 以便回溯知识库条目。
+- 导出前还会用 `ast.parse` 校验 wrapper：必须恰好一个模块级同步函数、参数与声明的公开签名一致；无解释器时退化为结构检查并在结果里标注 `wrapperCheck.mode = "syntax-only"`。
 
 ### 独立 NPU 探针
 

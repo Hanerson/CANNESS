@@ -368,7 +368,40 @@ function workspaceInput(workspace: string, path: string, label: string): string 
   return absolute
 }
 
-function prepareSubmission(workspace: string, args: SubmissionArgs) {
+
+type PreparedSubmission = {
+  sourceDir: string
+  testScript?: string
+  casesFile?: string
+  caseTimeoutSec?: number
+  /** True when run_evaluation discovered the export instead of being given one. */
+  auto?: boolean
+}
+
+/** Newest export of exactly this package, used when no submission is passed. */
+function autoSubmission(workspace: string, generationId: string, hash: string): PreparedSubmission | undefined {
+  const root = join(workspace, 'submissions')
+  if (!existsSync(root)) return undefined
+  const matches = readdirSync(root, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && entry.name.startsWith(`${generationId}-`))
+    .map(entry => ({ source: join(root, entry.name, 'source'), mtime: statSync(join(root, entry.name)).mtimeMs }))
+    .filter(candidate => existsSync(join(candidate.source, 'provenance.json')))
+    .sort((left, right) => right.mtime - left.mtime)
+  for (const candidate of matches) {
+    try {
+      const provenance = JSON.parse(readFileSync(join(candidate.source, 'provenance.json'), 'utf8')) as
+        { generationId?: string; packageHash?: string }
+      if (provenance.generationId === generationId && provenance.packageHash === hash) {
+        return { sourceDir: candidate.source, auto: true }
+      }
+    } catch {
+      continue
+    }
+  }
+  return undefined
+}
+
+function prepareSubmission(workspace: string, args: SubmissionArgs): PreparedSubmission {
   if (args.cases_file && !args.test_script?.trim()) throw new Error('cases_file requires a test_script')
   return {
     sourceDir: workspaceInput(workspace, args.source_dir, 'source_dir'),
@@ -660,7 +693,11 @@ export function apply(
       // result, so a stale hash must not block it (CAN-104). The full gate still
       // applies to evaluations that consume budget.
       const currentHash = compileOnly ? packageHash(localPackageDir) : checkPackageHash(localPackageDir, state)
-      const prepared = submission && prepareSubmission(workspace, submission)
+      // Without an explicit request, validate the newest export of this exact
+      // package: export-only bugs (launcher, wrapper, build.sh) used to surface
+      // only at the official runner, which is the CAN-021 gap.
+      const explicit = submission && prepareSubmission(workspace, submission)
+      const prepared = explicit ?? (compileOnly ? undefined : autoSubmission(workspace, state.generationId, currentHash))
       if (prepared) {
         const path = workspaceInput(workspace, join(prepared.sourceDir, 'provenance.json'), 'provenance.json')
         const provenance = JSON.parse(readFileSync(path, 'utf8'))
@@ -673,7 +710,7 @@ export function apply(
         const validation = report.correctness.ok
           ? await validateExportedSubmission(prepared, cfg)
           : { status: 'not_run', reason: 'kernel correctness did not pass' }
-        return { ...report, submission: validation }
+        return { ...report, submission: prepared.auto ? { ...(validation as Record<string, unknown>), auto: true } : validation }
       }
       const kernelDtypes = (_args as { kernel_dtypes?: string[] } | null)?.kernel_dtypes
       if (kernelDtypes) {
@@ -943,3 +980,4 @@ export function apply(
     },
   }))
 }
+

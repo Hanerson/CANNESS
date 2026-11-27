@@ -829,3 +829,37 @@ test('automatic prompts obey the interval and per-report cap', () => {
   stopping.fn(payload)
   expect(count).toBe(4)
 })
+
+test('run_evaluation validates the newest export of the evaluated package without being asked', async () => {
+  const pkg = readyPackage()
+  const source = join(pkg.workspace, 'submissions', `${pkg.generationId}-auto01`, 'source')
+  mkdirSync(source, { recursive: true })
+  const body = '#!/bin/bash\n'
+  writeFileSync(join(source, 'build.sh'), body)
+  writeFileSync(join(source, 'provenance.json'), JSON.stringify({
+    generationId: pkg.generationId,
+    packageHash: packageHash(join(pkg.workspace, 'packages', pkg.generationId)),
+    files: { 'build.sh': sha256(body) },
+  }))
+  const remote = new MemoryRemote()
+  let validations = 0
+  remote.execHandler = command => {
+    if (command.includes('validate_submission.py')) {
+      validations++
+      return { code: 0, stdout: 'CANNESS_SUBMISSION_REPORT {"status":"validated","correctness":"user-golden-passed"}\n', stderr: '' }
+    }
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  remote.appearOnRead(evaluationResultPath(pkg.generationId), Buffer.from(JSON.stringify({
+    ...failReport('perf_fail'),
+    compile: { ok: true, log: '' },
+    correctness: { ok: true, maxRelativeError: 0 },
+    performance: { kernelTimeUs: 200, targetUs: 150 },
+  })), 1)
+  const ctx = fakeCtx()
+  evalPlugin.apply(ctx as never, evalConfig(pkg.workspace, { privateKeyPath: vol(keyFile(pkg.workspace)) }), async () => remote)
+  const run = ctx.toolsRegistered[0]!
+  const outcome = await run.execute({}) as { submission?: { status?: string; auto?: boolean } }
+  expect(outcome.submission).toMatchObject({ status: 'validated', auto: true })
+  expect(validations).toBe(1)
+})

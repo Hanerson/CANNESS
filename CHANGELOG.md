@@ -32,6 +32,14 @@
 
 ### 修复
 
+- **导出前按 CANNBENCH 评分规则自检**：`launch.cpp` 的 tiling 上传改为按属性集缓存（每个 case 最多一次
+  `aclrtMemcpy`，避免 `Count > 5` 触发 CPU 回退判定把编译/功能/性能整算子清零），上传前
+  `aclrtSynchronizeDevice()` 排空一次（阻塞式 H2D 只与默认流排序，会让在飞 kernel 读到半写 attrs）；
+  新增 `aclrtmemcpy-budget`、`aclrtmemcpy-ordering`、`tiling-lifetime`、`utf8` 四条导出期规则。
+- **导出前校验 wrapper**：`ast.parse` + 恰好一个模块级同步函数 + 参数与声明签名一致，缺解释器时降级为
+  结构检查并标注；不再把坏编码/坏签名留到 `validate_submission` 才报。
+- `run_evaluation` 默认验收最新导出：精度通过后自动构建 + 安装 + 调用一次并把结果附到 `submission`
+  （`auto: true`），把"评测通过 ≠ 提交物可用"这条缺口默认补上。
 - 过期的 `lib` 现在是构建错误：`export_submission` 与 `run_evaluation` 在 `staleBuild` 时直接拒绝并提示
   `pnpm build`，不再以 `unbound CANNBench template token {{TARGET_SOC}}` 的形式失败。
 - 自定义 wrapper 的 `interface.attrs` 必须是公开签名的参数（或声明在 `support.wrapper_attrs`），
