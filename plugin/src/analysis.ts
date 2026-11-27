@@ -42,6 +42,8 @@ export interface PerformanceAnalysis {
   rooflineUs?: number | null
   baselineUs?: number | null
   notCollected?: string[]
+  /** Directory the profiler CSVs were read from, when the runner reported it. */
+  csvDir?: string
   kernelBudget?: KernelBudget
 }
 
@@ -130,5 +132,6 @@ export function parseAnalysis(raw: unknown): PerformanceAnalysis | null {
     baselineUs: numOrNull(raw.baselineUs),
     ...(Array.isArray(raw.notCollected) ? { notCollected: raw.notCollected.filter((item): item is string => typeof item === 'string') } : {}),
     ...(kernelBudget === undefined ? {} : { kernelBudget }),
+    ...(typeof raw.csvDir === 'string' && raw.csvDir.trim() !== '' ? { csvDir: raw.csvDir.trim() } : {}),
   }
 }

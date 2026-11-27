@@ -733,11 +733,16 @@ def profile_from_csv(outdir: Path, operator_name: str,
         evidence_rows, evidence_mapping = read_csv_rows(path)
         statistic_evidence.extend(row for row in evidence_rows if row_matches(row, evidence_mapping, operator_name))
 
+    # Record where the CSVs actually landed: the profiler output sits either
+    # directly under --output or nested under PROF_<timestamp>/, and the report
+    # is the only place a caller can learn the real path (CAN-109).
+    csv_dir = paths[0].parent if len({path.parent for path in paths}) == 1 else root
     durations, rows, mapping = summary_durations(summary_paths, operator_name)
     if durations:
         excluded = min(warmup, max(0, len(durations) - 1))
         profile = build_profile(durations[excluded:], rows[excluded:], mapping,
                                 operator_name, 'op_summary')
+        profile['csvDir'] = str(csv_dir)
         if excluded:
             profile['summary'] += f' Excluded {excluded} warmup rows.'
         profile['opStatistic'] = statistic_evidence
@@ -746,6 +751,7 @@ def profile_from_csv(outdir: Path, operator_name: str,
     durations, rows, mapping = statistic_durations(statistic_paths, operator_name)
     if durations:
         profile = build_profile(durations, rows, mapping, operator_name, 'op_statistic (Avg Time)')
+        profile['csvDir'] = str(csv_dir)
         profile['opStatistic'] = statistic_evidence
         return profile, ''
 

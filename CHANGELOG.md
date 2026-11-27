@@ -40,6 +40,7 @@
   结构检查并标注；不再把坏编码/坏签名留到 `validate_submission` 才报。
 - `run_evaluation` 默认验收最新导出：精度通过后自动构建 + 安装 + 调用一次并把结果附到 `submission`
   （`auto: true`），把"评测通过 ≠ 提交物可用"这条缺口默认补上。
+- 报告里新增 `analysis.csvDir`：runner 记录 profiler CSV 实际落地的目录（可能嵌在 `PROF_<timestamp>/` 下），`fetch_remote_file` 可直接按它取回，不再靠猜临时路径（CAN-109）。
 - 过期的 `lib` 现在是构建错误：`export_submission` 与 `run_evaluation` 在 `staleBuild` 时直接拒绝并提示
   `pnpm build`，不再以 `unbound CANNBench template token {{TARGET_SOC}}` 的形式失败。
 - 自定义 wrapper 的 `interface.attrs` 必须是公开签名的参数（或声明在 `support.wrapper_attrs`），
