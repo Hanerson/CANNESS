@@ -7,6 +7,7 @@ import { launchGeometry, LAYER_FILES, normalizeEol, packageHash, renderBuildCont
 import { sha256 } from './provenance.js'
 import { declaredTarget, normalizedDtype, resolveSoc, TARGET_OPTIONS, type OperatorSpec } from './spec.js'
 import { describeFindings, lintSubmissionSources } from './submission-rules.js'
+import { checkWrapperSource } from './wrapper-source.js'
 
 const TEMPLATE = fileURLToPath(new URL('../templates/cannbench/', import.meta.url))
 const MAX_ARCHIVE_BYTES = 50_000_000
@@ -307,8 +308,10 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
       ...(spec.support ? { support: spec.support } : {}),
       compiledLayers: manifest.compiledLayers ?? [LAYER_FILES.kernel], documentedOnlyLayers: manifest.documentedOnlyLayers ?? [], files: fileHashes, layers: manifest.provenance ?? null,
     }, null, 2)
-    // Enforce the scorer rules the local evaluation loop cannot see (host copy
-    // budget, tiling lifetime, UTF-8 sources) before anything is written.
+    // Parse the wrapper the way the validator will, and enforce the scorer rules
+    // the local evaluation loop cannot see (host copy budget, tiling lifetime,
+    // UTF-8 sources) before anything is written.
+    const wrapperCheck = checkWrapperSource(wrapper, filename, signature)
     const rules = lintSubmissionSources(files)
     const errors = rules.findings.filter(finding => finding.severity === 'error')
     if (errors.length) throw new Error(`submission rules violated: ${describeFindings(errors)}`)
@@ -324,10 +327,11 @@ export function exportSubmission(workspace: string, generationId: string, spec: 
       : spawnSync('zip', ['-q', archivePath, ...Object.keys(files)], { cwd: sourceDir, encoding: 'utf8' })
     if (archive.status !== 0) throw new Error(`could not create CANNBench zip: ${archive.error?.message ?? archive.stderr.trim()}`)
     if (statSync(archivePath).size > MAX_ARCHIVE_BYTES) throw new Error('CANNBench zip exceeds 50 MB')
-    return { sourceDir, archivePath, packageDir: pkg, callable: filename, signature, targetPlatform, build, rules, validation: { status: 'unverified' as const } }
+    return { sourceDir, archivePath, packageDir: pkg, callable: filename, signature, targetPlatform, build, rules, wrapperCheck, validation: { status: 'unverified' as const } }
   } catch (error) {
     rmSync(staging, { recursive: true, force: true })
     throw error
   }
 }
+
 
