@@ -60,3 +60,14 @@ test('remote reads admit history only when it is a known local generation and co
   expect(remoteTargetAllowed('/opt/Ascend/include/a.h', '/out', '/in', null, ['/opt/Ascend'])).toBe(true)
   expect(remoteTargetAllowed('/opt/Ascend/../secret', '/out', '/in', null, ['/opt/Ascend'])).toBe(false)
 })
+
+test('the CANN toolkit tree is readable by default, without opening the whole host', () => {
+  // CAN-108: the knowledge base asks the agent to read toolkit headers, which
+  // used to be outside every allowed root.
+  expect(remoteTargetAllowed('/usr/local/Ascend/ascend-toolkit/latest/include/kernel_operator.h',
+    '/out', '/in', null, ['/usr/local/Ascend'])).toBe(true)
+  expect(remoteTargetAllowed('/usr/local/Ascend/cann-9.2.1/compiler/ascendc/include/basic_api/impl/a.h',
+    '/out', '/in', null, ['/usr/local/Ascend'])).toBe(true)
+  expect(remoteTargetAllowed('/usr/local/Ascend/../etc/shadow', '/out', '/in', null, ['/usr/local/Ascend'])).toBe(false)
+  expect(remoteTargetAllowed('/etc/shadow', '/out', '/in', null, ['/usr/local/Ascend'])).toBe(false)
+})

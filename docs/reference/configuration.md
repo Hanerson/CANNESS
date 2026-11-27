@@ -15,6 +15,7 @@ bundle 配置以 [cordis.patch.yml](../../plugin/cordis.patch.yml) 与各插件�
 - `timeoutSec` 默认 `1800`，`pollIntervalMs` 默认 `2000`，单位分别为秒和毫秒。
 - `setEnv` 默认空，由 runner 探测 CANN 环境脚本。多套工具链可用显式路径固定版本。
 - `device` 可指定一个远端设备编号，例如 `"7"`。`deviceLock` 可指定同一设备使用的远端共享锁路径。留空时读取远端 `CANNESS_ASCEND_VISIBLE_DEVICES` 和 `CANNESS_DAVINCI_LOCK`，再回退到设备 7 或所选设备对应的 `/tmp/canness/davinci<ID>.lock`。正式评测、提交验收和独立探针使用同一组设置。
+- `readRoots` 默认放行 CANN 安装树 `/usr/local/Ascend`，并从 `setEnv` 推导它所属的工具链根目录，因此知识库让你读 toolkit 头文件、示例或 profiler CSV 时不再需要额外配置；路径仍会规范化并拒绝符号链接逃逸，`/` 永远不放行。
 - `canness-knowledge.workspace` 仅在搜索本地探针记录时使用。若评测插件显式覆盖了工作区，知识库插件也应指向同一目录。
 
 ## 迭代预算与停机

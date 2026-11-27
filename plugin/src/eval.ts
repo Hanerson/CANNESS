@@ -79,7 +79,11 @@ export const Config = z.object({
   setEnv: z.string().default('').volatile(),
   device: z.string().default('').volatile(),
   deviceLock: z.string().default('').volatile(),
-  readRoots: z.array(z.string()).default([]).volatile(),
+  // Headers, examples and profiler CSVs live under the toolkit root; without a
+  // default the knowledge base asks the agent to read files it cannot reach
+  // (CAN-108). The root is not '/' and every read still normalises and rejects
+  // symlink escapes, so this only widens reads inside the CANN installation.
+  readRoots: z.array(z.string()).default(['/usr/local/Ascend']).volatile(),
   maxIterations: z.number().required().volatile(),
   maxCompileRetries: z.number().required().volatile(),
   negativeStreakLimit: z.number().required().volatile(),
@@ -137,7 +141,7 @@ function snapshot(config: Config) {
     setEnv: config.setEnv?.get?.() ?? '',
     device: config.device?.get?.() ?? '',
     deviceLock: config.deviceLock?.get?.() ?? '',
-    readRoots: config.readRoots?.get?.() ?? [],
+    readRoots: [...(config.readRoots?.get?.() ?? []), ...toolkitRoots(config.setEnv?.get?.() ?? '')],
   }
 }
 
@@ -315,6 +319,20 @@ function localTargetFor(workspace: string, remotePath: string, localPath: string
  * generation's inbox. Anything else (keys, /etc, a sibling generation) is
  * rejected before the transport sees it.
  */
+/**
+ * Directories a configured set_env file makes readable: the toolkit root it
+ * belongs to (``/usr/local/Ascend/cann-9.2.1`` -> ``/usr/local/Ascend``).
+ * Lets a non-standard installation be read without extra configuration.
+ */
+function toolkitRoots(setEnv: string): string[] {
+  if (!setEnv.startsWith('/') || setEnv.endsWith('/')) return []
+  const parts = setEnv.split('/').filter(Boolean)
+  if (parts.length < 3) return []
+  parts.pop()
+  if (parts[parts.length - 1] === 'cann-9.2.1') parts.pop()
+  return ['/' + parts.join('/')]
+}
+
 export function remoteTargetAllowed(
   remotePath: string,
   outbox: string,
