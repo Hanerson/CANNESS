@@ -114,6 +114,7 @@ test.skipIf(python === null)('preflight sources the selected environment and rep
   writeFileSync(choose, [
     `export ASCEND_TOOLKIT_HOME="${home}"`,
     'export CANNESS_BISHENG=printf',
+    'export SOC_VERSION=ascend910b1',
     '',
   ].join('\n'))
   const done = spawnSync(python!, [
@@ -122,6 +123,7 @@ test.skipIf(python === null)('preflight sources the selected environment and rep
   expect(done.status, done.stderr).toBe(0)
   expect(JSON.parse(done.stdout), done.stdout).toMatchObject({
     ready: true, toolchain: 'CANN 9.0.0', setEnv: choose, compiler: 'printf', msprof: 'true',
+    cannVersion: '9.0.0', toolkitHome: home, compilerVersion: null, socVersionEnv: 'ascend910b1',
   })
 }, 20_000)
 
@@ -253,6 +255,21 @@ test.skipIf(python === null)('a multi-row op_summary is averaged, not first-row 
   expect(report.performance.kernelTimeUs).toBe(20)
   expect(report.analysis.summary).toContain('over 3 rows')
   expect(report.analysis.summary).toContain('op_summary')
+})
+
+test.skipIf(python === null)('unrelated profiling rows never become a kernel measurement', () => {
+  const csv = [
+    'Op Name,Op Type,Task Duration(us)',
+    'GeluSetup,Prepare,10',
+    'Copy,Transfer,50',
+  ].join('\n')
+  const { root, inbox, outbox } = packageAt()
+  const done = runRunner(root, inbox, outbox, fakeMsprof(root, csv))
+  expect(done.status, done.stderr).toBe(0)
+  const report = results(outbox)
+  expect(report).toMatchObject({ status: 'error', performance: { kernelTimeUs: null } })
+  expect(report.summary).toContain('GeluSetup')
+  expect(report.summary).toContain('Copy')
 })
 
 test.skipIf(python === null)('warmup rows are excluded from the measured average', () => {

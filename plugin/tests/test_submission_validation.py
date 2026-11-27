@@ -40,6 +40,16 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(report['correctness'], 'unverified')
             self.assertIn('hash mismatch', report['reason'])
 
+    def test_cli_publishes_the_completed_report_for_retention(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = {'status': 'failed', 'reason': 'test failed', 'steps': []}
+            with patch.object(sys, 'argv', ['validate_submission.py', '--root', str(root)]), \
+                    patch.object(module, 'validate', return_value=report), patch('builtins.print') as output:
+                self.assertEqual(module.main(), 1)
+            self.assertEqual(json.loads((root / 'validation-result.json').read_text(encoding='utf-8')), report)
+            output.assert_called_once_with('CANNESS_SUBMISSION_REPORT ' + json.dumps(report))
+
     def test_build_install_and_explicit_golden_marker(self):
         for marker, expected in [(None, 'installed'), ('CANNESS_VALIDATION {"ok":true,"cases":4}', 'validated'), ('import succeeded', 'failed'), ('CANNESS_VALIDATION {"ok":true}\n' + 'noise\n' * 5000 + 'CANNESS_VALIDATION {"ok":true}', 'failed'), ('CANNESS_VALIDATION {"ok":true}\n' + 'noise\n' * 5000, 'validated')]:
             with self.subTest(marker=marker), tempfile.TemporaryDirectory() as tmp:
@@ -125,6 +135,45 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(processes[0][0]['input_shape'], [[2, 4]])
             self.assertNotEqual(processes[0][1], processes[1][1])
             self.assertIn('ASCEND_VISIBLE_DEVICES=3', processes[1][2])
+
+    def test_oversized_validation_output_keeps_device_fault_in_the_bounded_prefix(self):
+        for within_limit in (True, False):
+            with self.subTest(within_limit=within_limit), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source, env = self.fixture(root)
+                marker = b'aicore exception\n'
+
+                class Process:
+                    pid = 123
+                    returncode = 0
+
+                    def __init__(self, args, **kwargs):
+                        if 'build.sh' in ' '.join(args):
+                            (source / 'dist').mkdir()
+                            (source / 'dist' / 'operator.whl').write_bytes(b'wheel')
+                        if '--run-installed' in args:
+                            output = kwargs['stdout']
+                            if within_limit:
+                                output.write(marker)
+                                output.truncate(module.MAX_OUTPUT_BYTES + 1)
+                            else:
+                                output.seek(module.MAX_OUTPUT_BYTES)
+                                output.write(marker)
+                            output.flush()
+
+                    def wait(self, **kwargs):
+                        return self.returncode
+
+                with patch.object(module.subprocess, 'Popen', Process), \
+                        patch.object(module.os, 'killpg', create=True), \
+                        patch.object(module.signal, 'SIGKILL', 9, create=True):
+                    report = module.validate(root, 30, str(env), 'test.py', lock='')
+                self.assertEqual(report['status'], 'blocked' if within_limit else 'failed')
+                self.assertIn('8 MiB limit', report['reason'])
+                self.assertEqual(report['steps'][-1]['output'], '')
+                if within_limit:
+                    self.assertEqual(report['failureKind'], 'device_fault')
+                    self.assertIn('aicore exception', report['reason'])
 
     @unittest.skipIf(sys.platform == 'win32', 'flock is used on the remote Linux host')
     def test_contended_device_lock_is_bounded_and_does_not_execute_comparator(self):

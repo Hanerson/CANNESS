@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import math
@@ -63,6 +64,12 @@ TILING_REPORT_LIMIT = 16 * 1024
 MAX_LAUNCH_BLOCKS = 128
 MAX_SAFE_INTEGER = (1 << 53) - 1
 CSV_DIR = 'mindstudio_profiler_output'
+KERNEL_ENTRY = 'canness_kernel'
+DEVICE_UNAVAILABLE = re.compile(r'no visible (?:npu )?devices?|\b(?:npu )?device (?:is )?busy\b|no npu devices? (?:found|available)', re.I)
+RUN_FAILURE_SIGNAL = re.compile(
+    r'CANNESS_ERROR|vector core exception|aivec error|aicore exception|GM address accessed by scalar exceeds|'
+    + DEVICE_UNAVAILABLE.pattern, re.I,
+)
 # The published Ascend 910 memory hierarchy lists GM->UB at 1.2 TB/s.
 # This is for the original 910, not 910B. Unknown chips stay null until an
 # authoritative chip-specific bandwidth is available.
@@ -200,30 +207,25 @@ def tensor_bytes(manifest: dict) -> int | None:
     return total
 
 
-def toolchain_version(toolkit_home: str | None = None, compiler: str | None = None,
-                      env_prefix: str = '', bash_exe: str = 'bash') -> str:
-    home = toolkit_home or os.environ.get('ASCEND_TOOLKIT_HOME') or '/usr/local/Ascend/ascend-toolkit/latest'
-    version_cfg = Path(home) / 'version.cfg'
+def read_version_file(path: Path) -> str | None:
     try:
-        if version_cfg.is_file():
-            for line in version_cfg.read_text(encoding='utf-8', errors='replace').splitlines():
-                if '=' in line:
-                    name, value = line.split('=', 1)
-                    if name.strip().lower() in ('version', 'cann_version'):
-                        return f'CANN {value.strip()}'
+        for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+            name, _, value = line.partition('=')
+            if name.strip().lower() in ('version', 'cann_version') and value.strip():
+                return value.strip()
     except OSError:
         pass
-    for exe in (compiler,) if compiler else ('bisheng', 'ccec'):
-        if not compiler and shutil.which(exe) is None:
-            continue
-        try:
-            done = run_command([bash_path(exe), '--version'], env_prefix, 15, bash_exe=bash_exe)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        line = first_line(done.stdout) or first_line(done.stderr)
-        if line:
-            return line
-    return 'CANN (version unknown)'
+    return None
+
+
+def compiler_version(compiler: str, env_prefix: str, bash_exe: str,
+                     deadline: float | None = None) -> str | None:
+    argv = [bash_path(compiler), '--version']
+    try:
+        done = run_command(argv, env_prefix, remaining_timeout(argv, 15, deadline), bash_exe=bash_exe)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (first_line(done.stdout) or first_line(done.stderr) or None) if done.returncode == 0 else None
 
 
 def bash_path(value) -> str:
@@ -296,10 +298,19 @@ def resolve_device_settings(device: str | None = None, lock: str | None = None) 
     return device, lock
 
 
+def remaining_timeout(argv: list[str], timeout: float, deadline: float | None) -> float:
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(argv, 0)
+    return min(timeout, remaining)
+
+
 def run_command(
     argv: list[str],
     env_prefix: str,
-    timeout: int,
+    timeout: float,
     cwd: Path | None = None,
     lock: str = '',
     bash_exe: str = 'bash',
@@ -319,34 +330,44 @@ def run_command(
     )
 
 
-def inspect_environment(args: argparse.Namespace) -> dict:
+def inspect_environment(args: argparse.Namespace, deadline: float | None = None) -> dict:
     """Inspect the environment selected for evaluation without running the package."""
     selected, searched = discover_set_env(args.set_env)
     issues = []
     if args.set_env and not Path(args.set_env).expanduser().is_file():
         issues.append(f'configured set_env.sh does not exist: {args.set_env}')
+    prefix = shell_env_prefix(selected, args.device)
     try:
-        command = (shell_env_prefix(selected, args.device)
-                   + 'printf "%s\\n%s\\n%s\\n" "$ASCEND_TOOLKIT_HOME" '
-                     '"$(command -v "${CANNESS_BISHENG:-bisheng}")" "$(command -v "$1")"')
+        command = (prefix + 'printf "%s\\n%s\\n%s\\n%s\\n" '
+                   '"${ASCEND_TOOLKIT_HOME:-${ASCEND_HOME_PATH:-}}" '
+                   '"$(command -v "${CANNESS_BISHENG:-bisheng}")" "$(command -v "$1")" "${SOC_VERSION:-}"')
+        argv = [args.bash, '-c', command, 'canness', args.msprof]
         inspected = subprocess.run(
-            [args.bash, '-c', command, 'canness', args.msprof],
-            capture_output=True, encoding='utf-8', errors='replace', timeout=10,
+            argv, capture_output=True, encoding='utf-8', errors='replace',
+            timeout=remaining_timeout(argv, 10, deadline),
         )
         if inspected.returncode != 0:
             raise ValueError(first_line(inspected.stderr) or f'exit {inspected.returncode}')
-        toolkit, compiler, profiler = inspected.stdout.splitlines()[-3:]
+        toolkit, compiler, profiler, soc_env = inspected.stdout.splitlines()[-4:]
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-        toolkit, compiler, profiler = '', '', ''
+        toolkit, compiler, profiler, soc_env = '', '', '', ''
         issues.append(f'CANN inspection failed: {error}')
     if not compiler:
         issues.append('bisheng is missing from the selected environment')
     if not profiler:
         issues.append('msprof is missing from the selected environment')
+    home = local_path(toolkit) if toolkit else None
+    legacy_version = read_version_file(home / 'version.cfg') if home else None
+    cann_version = (read_version_file(home / 'compiler' / 'version.info') or legacy_version) if home else None
+    banner = compiler_version(compiler, prefix, args.bash, deadline) if compiler else None
     return {
         'ready': not issues,
-        'toolchain': toolchain_version(str(local_path(toolkit)) if toolkit else None, compiler,
-                                       shell_env_prefix(selected, args.device), args.bash),
+        'toolchain': (f'CANN {legacy_version}' if legacy_version else
+                      banner or (f'CANN {cann_version}' if cann_version else 'CANN (version unknown)')),
+        'cannVersion': cann_version,
+        'compilerVersion': banner,
+        'toolkitHome': toolkit or None,
+        'socVersionEnv': soc_env or None,
         'setEnv': selected,
         'searchedEnv': searched,
         'compiler': compiler or None,
@@ -357,9 +378,17 @@ def inspect_environment(args: argparse.Namespace) -> dict:
 
 def preflight(args: argparse.Namespace) -> int:
     facts = inspect_environment(args)
-    facts['detectedSoc'] = detect_soc(args, facts['setEnv'])
+    detected_soc = detect_soc(args, facts['setEnv'])
+    facts['detectedSoc'] = detected_soc
+    soc_env = facts['socVersionEnv']
+    if soc_env and detected_soc and normalized_soc(soc_env) != normalized_soc(detected_soc):
+        facts['issues'].append(f'SOC_VERSION={soc_env} differs from npu-smi chip {detected_soc}')
     print(json.dumps(facts))
     return 0
+
+
+def normalized_soc(name: str) -> str:
+    return re.sub(r'^ascend\s*', '', name.strip().lower())
 
 
 def detect_soc(args: argparse.Namespace, set_env: str | None) -> str | None:
@@ -526,12 +555,8 @@ def row_value(row: dict, mapping: dict, key: str):
     return None if column is None else row.get(column)
 
 
-def row_matches(row: dict, mapping: dict, operator_name: str) -> bool:
-    for key in ('opName', 'opType'):
-        value = row_value(row, mapping, key)
-        if isinstance(value, str) and (value == operator_name or value.startswith(operator_name)):
-            return True
-    return False
+def row_matches(row: dict, mapping: dict, operator_names: set[str]) -> bool:
+    return any(row_value(row, mapping, key) in operator_names for key in ('opName', 'opType'))
 
 
 def read_csv_rows(path: Path) -> tuple[list[dict], dict[str, str]]:
@@ -545,24 +570,18 @@ def read_csv_rows(path: Path) -> tuple[list[dict], dict[str, str]]:
         return [], {}
 
 
-def summary_durations(paths: list[Path], operator_name: str) -> tuple[list[float], list[dict], dict[str, str]]:
-    """Per-run rows: every Task Duration(us) of the operator (or all rows)."""
-    parsed: list[tuple[list[dict], dict[str, str], list[dict]]] = []
-    for path in paths:
-        file_rows, candidate = read_csv_rows(path)
-        if 'duration' not in candidate or not file_rows:
-            continue
-        matched = [row for row in file_rows if row_matches(row, candidate, operator_name)]
-        parsed.append((file_rows, candidate, matched))
-    # If the operator appears anywhere, never average another operator's rows
-    # just because one CSV did not contain a match.
-    any_match = any(matched for _rows, _mapping, matched in parsed)
+def summary_durations(parsed: list[tuple[list[dict], dict[str, str]]],
+                      operator_names: set[str]) -> tuple[list[float], list[dict], dict[str, str]]:
+    """Per-run rows: every positive Task Duration(us) of a matching operator."""
     durations: list[float] = []
     rows: list[dict] = []
     mapping: dict[str, str] = {}
-    for file_rows, candidate, matched in parsed:
-        use = matched if any_match else file_rows
-        for row in use:
+    for file_rows, candidate in parsed:
+        if 'duration' not in candidate:
+            continue
+        for row in file_rows:
+            if not row_matches(row, candidate, operator_names):
+                continue
             value = number(row_value(row, candidate, 'duration'))
             if value is not None and value > 0:
                 durations.append(value)
@@ -572,11 +591,13 @@ def summary_durations(paths: list[Path], operator_name: str) -> tuple[list[float
     return durations, rows, mapping
 
 
-def statistic_durations(paths: list[Path], operator_name: str) -> tuple[list[float], list[dict], dict[str, str]]:
+def statistic_durations(parsed: list[tuple[list[dict], dict[str, str]]],
+                        operator_names: set[str]) -> tuple[list[float], list[dict], dict[str, str]]:
     """Aggregate rows: only the Avg column, never Min/Max, never summed."""
-    parsed: list[tuple[list[dict], dict[str, str], list[dict], str]] = []
-    for path in paths:
-        file_rows, candidate = read_csv_rows(path)
+    durations: list[float] = []
+    rows: list[dict] = []
+    mapping: dict[str, str] = {}
+    for file_rows, candidate in parsed:
         if not file_rows:
             continue
         normalized = {normalized_header(name): name for name in file_rows[0] if name}
@@ -584,17 +605,11 @@ def statistic_durations(paths: list[Path], operator_name: str) -> tuple[list[flo
         column = average_column or candidate.get('duration')
         if column is None:
             continue
-        matched = [row for row in file_rows if row_matches(row, candidate, operator_name)]
-        parsed.append((file_rows, candidate, matched, column))
-    any_match = any(matched for _rows, _mapping, matched, _column in parsed)
-    durations: list[float] = []
-    rows: list[dict] = []
-    mapping: dict[str, str] = {}
-    for file_rows, candidate, matched, column in parsed:
-        use = matched if any_match else file_rows
-        for row in use:
+        for row in file_rows:
+            if not row_matches(row, candidate, operator_names):
+                continue
             value = number(row.get(column))
-            if value is not None:
+            if value is not None and value > 0:
                 durations.append(value)
                 rows.append(row)
         if durations and not mapping:
@@ -709,9 +724,9 @@ def profile_from_csv(outdir: Path, operator_name: str,
                      warmup: int = 0) -> tuple[dict | None, str]:
     """Return (profile, error).
 
-    ``kernelTimeUs`` is the arithmetic mean of every ``Task Duration(us)`` row
-    in ``op_summary``. Only when no summary rows exist is the ``Avg`` column of
-    ``op_statistic`` used; mixing both families would count the same run twice.
+    ``kernelTimeUs`` is the arithmetic mean of matching ``Task Duration(us)``
+    rows in ``op_summary``. Use the ``Avg`` column of matching ``op_statistic``
+    rows only if the summary has no usable matches.
 
     The msprof export layout is version dependent: newer toolchains put
     ``mindstudio_profiler_output/`` directly under ``--output``, while CANN 9.0.0
@@ -725,19 +740,17 @@ def profile_from_csv(outdir: Path, operator_name: str,
         paths = sorted(outdir.rglob('*.csv'))
     if not paths:
         return None, f'no CSV under {outdir} (no {CSV_DIR}/ and no *.csv anywhere below it)'
-    summary_paths = [path for path in paths if 'op_summary' in path.name.lower()]
-    statistic_paths = [path for path in paths if 'op_statistic' in path.name.lower()]
-
-    statistic_evidence = []
-    for path in statistic_paths:
-        evidence_rows, evidence_mapping = read_csv_rows(path)
-        statistic_evidence.extend(row for row in evidence_rows if row_matches(row, evidence_mapping, operator_name))
+    summary_rows = [read_csv_rows(path) for path in paths if 'op_summary' in path.name.lower()]
+    statistic_rows = [read_csv_rows(path) for path in paths if 'op_statistic' in path.name.lower()]
+    operator_names = {operator_name, KERNEL_ENTRY} - {''}
+    statistic_evidence = [row for rows, mapping in statistic_rows for row in rows
+                          if row_matches(row, mapping, operator_names)]
 
     # Record where the CSVs actually landed: the profiler output sits either
     # directly under --output or nested under PROF_<timestamp>/, and the report
     # is the only place a caller can learn the real path (CAN-109).
     csv_dir = paths[0].parent if len({path.parent for path in paths}) == 1 else root
-    durations, rows, mapping = summary_durations(summary_paths, operator_name)
+    durations, rows, mapping = summary_durations(summary_rows, operator_names)
     if durations:
         excluded = min(warmup, max(0, len(durations) - 1))
         profile = build_profile(durations[excluded:], rows[excluded:], mapping,
@@ -748,7 +761,7 @@ def profile_from_csv(outdir: Path, operator_name: str,
         profile['opStatistic'] = statistic_evidence
         return profile, ''
 
-    durations, rows, mapping = statistic_durations(statistic_paths, operator_name)
+    durations, rows, mapping = statistic_durations(statistic_rows, operator_names)
     if durations:
         profile = build_profile(durations, rows, mapping, operator_name, 'op_statistic (Avg Time)')
         profile['csvDir'] = str(csv_dir)
@@ -756,7 +769,10 @@ def profile_from_csv(outdir: Path, operator_name: str,
         return profile, ''
 
     searched = ', '.join(path.name for path in paths)
-    return None, f'no Task Duration rows in {CSV_DIR}/ (searched {root}: {searched})'
+    observed = sorted({value for rows, mapping in summary_rows + statistic_rows for row in rows
+                       for key in ('opName', 'opType') if (value := row_value(row, mapping, key))})
+    return None, (f'no Task Duration rows matching {", ".join(sorted(operator_names))} in {CSV_DIR}/; '
+                  f'Op Name/Op Type seen: {", ".join(observed) or "none"} (searched {root}: {searched})')
 
 
 def profile_executable(
@@ -766,6 +782,7 @@ def profile_executable(
     env_prefix: str,
     operator_name: str,
     runs: int,
+    deadline: float | None = None,
 ) -> tuple[dict | None, str, str]:
     """Run msprof once over N application iterations and parse its CSV."""
     outdir = package / f'.msprof-{uuid.uuid4().hex}'
@@ -773,10 +790,8 @@ def profile_executable(
     msprof = args.msprof or shutil.which('msprof') or 'msprof'
     argv = [bash_path(msprof), f'--application={bash_path(executable)} {runs}',
             f'--output={bash_path(outdir)}', '--aic-metrics=PipeUtilization']
-    try:
-        done = run_command(argv, env_prefix, args.msprof_timeout, cwd=package, lock=args.lock, bash_exe=args.bash)
-    except subprocess.TimeoutExpired:
-        return None, 'msprof timed out', f'msprof timed out after {args.msprof_timeout}s'
+    done = run_command(argv, env_prefix, remaining_timeout(argv, args.msprof_timeout, deadline),
+                       cwd=package, lock=args.lock, bash_exe=args.bash)
     log = truncate((done.stdout or '') + (done.stderr or ''))
     if done.returncode != 0:
         return None, f'msprof exited {done.returncode}: {first_line(done.stderr or done.stdout)}', log
@@ -809,8 +824,22 @@ def make_report(
     }
 
 
+def build_evidence(script: Path, declared) -> dict:
+    try:
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()
+    except OSError:
+        return {'source': 'unknown', 'scriptSha256': None}
+    baseline = declared.get('defaultSha256') if isinstance(declared, dict) else None
+    source = 'unknown'
+    if isinstance(baseline, str) and re.fullmatch(r'[0-9a-f]{64}', baseline):
+        source = 'template' if digest == baseline else 'override'
+    return {'source': source, 'scriptSha256': digest}
+
+
 def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     started = time.time()
+    budget_sec = getattr(args, 'budget_sec', None)
+    deadline = time.monotonic() + budget_sec if budget_sec is not None else None
     manifest_path = package / 'manifest.json'
     manifest: dict = {}
     config: dict = {}
@@ -844,7 +873,7 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         params['metricBasis'] = 'msprof-task-duration-us'
     params['phase'] = 'compile-only' if compile_only else 'accuracy-only' if accuracy_only else 'evaluation'
     params['phaseTimingsMs'] = {'buildMs': None, 'accuracyMs': None, 'profileMs': None}
-    args.environment_facts = inspect_environment(args)
+    args.environment_facts = inspect_environment(args, deadline)
     selected_env, searched_env = discover_set_env(args.set_env)
     params['setEnv'] = selected_env
 
@@ -868,9 +897,10 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     selfcheck_log = ''
     selfcheck = package / '.contract-selfcheck' / 'build.sh'
     if selfcheck.is_file():
+        argv = [args.bash, bash_path(selfcheck)]
         try:
-            checked = run_command([args.bash, bash_path(selfcheck)], env_prefix,
-                                  args.build_timeout, cwd=selfcheck.parent, bash_exe=args.bash)
+            checked = run_command(argv, env_prefix, remaining_timeout(argv, args.build_timeout, deadline),
+                                  cwd=selfcheck.parent, bash_exe=args.bash)
         except subprocess.TimeoutExpired:
             selfcheck_result = {'ok': False, 'summary': 'contract self-check timed out (template issue)'}
             selfcheck_log = selfcheck_result['summary'] + '\n'
@@ -881,14 +911,22 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
                 selfcheck_log = f"{selfcheck_result['summary']}:\n{diagnostic}\n"
     params['contractSelfCheck'] = selfcheck_result
     selfcheck_suffix = '' if selfcheck_result['ok'] else '; ' + selfcheck_result['summary']
+    params['build'] = build_evidence(build, manifest.get('buildScript'))
+    argv = [args.bash, bash_path(build)]
     try:
-        built = run_command([args.bash, bash_path(build)], env_prefix, args.build_timeout, cwd=package, bash_exe=args.bash)
-    except subprocess.TimeoutExpired:
-        report = make_report(generation, target, status='compile_fail',
-                             summary=f'build.sh timed out after {args.build_timeout}s{selfcheck_suffix}')
+        built = run_command(argv, env_prefix, remaining_timeout(argv, args.build_timeout, deadline),
+                            cwd=package, bash_exe=args.bash)
+    except subprocess.TimeoutExpired as error:
+        status = 'timeout' if deadline is not None and time.monotonic() >= deadline else 'compile_fail'
+        report = make_report(generation, target, status=status,
+                             summary=f'build.sh timed out after {error.timeout:g}s{selfcheck_suffix}')
         report['runRecord'] = record(started, params, args)
         return report
     params['phaseTimingsMs']['buildMs'] = (time.perf_counter() - phase_started) * 1000
+    for line in (built.stdout or '').splitlines():
+        match = re.fullmatch(r'CANNESS_BUILD (dialect|soc|npu_arch|flags)=(.*)', line)
+        if match:
+            params['build'][match[1]] = match[2]
     compile_log = truncate(env_warning + selfcheck_log + (built.stdout or '') + (built.stderr or ''))
     if built.returncode != 0:
         report = make_report(
@@ -920,18 +958,26 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         return report
 
     phase_started = time.perf_counter()
+    argv = [args.bash, bash_path(run_once)]
     try:
-        correctness_run = run_command([args.bash, bash_path(run_once)], env_prefix, args.run_timeout,
+        correctness_run = run_command(argv, env_prefix, remaining_timeout(argv, args.run_timeout, deadline),
                                       cwd=package, lock=args.lock, bash_exe=args.bash)
-    except subprocess.TimeoutExpired:
-        report = make_report(generation, target, status='error', compile_ok=True, compile_log=compile_log,
-                             summary=f'run_once.sh timed out after {args.run_timeout}s')
+    except subprocess.TimeoutExpired as error:
+        params['phaseTimingsMs']['accuracyMs'] = (time.perf_counter() - phase_started) * 1000
+        report = make_report(generation, target, status='timeout', compile_ok=True, compile_log=compile_log,
+                             summary=f'run_once.sh timed out after {error.timeout:g}s')
         report['runRecord'] = record(started, params, args)
         return report
     params['phaseTimingsMs']['accuracyMs'] = (time.perf_counter() - phase_started) * 1000
-    correctness_log = truncate((correctness_run.stdout or '') + (correctness_run.stderr or ''))
+    correctness_output = (correctness_run.stdout or '') + (correctness_run.stderr or '')
+    correctness_log = truncate(correctness_output)
     result = parse_canness_result(correctness_run.stdout or '')
     if correctness_run.returncode != 0:
+        if DEVICE_UNAVAILABLE.search(correctness_output):
+            params['failureKind'] = 'device_unavailable'
+        signal = next((line for line in correctness_output.splitlines() if RUN_FAILURE_SIGNAL.search(line)), '')
+        if signal and signal not in correctness_log:
+            correctness_log += '\n' + signal[:2000]
         report = make_report(generation, target, status='error', compile_ok=True,
                              compile_log=f'{compile_log}\n{correctness_log}'.strip(),
                              summary=f'run_once.sh exited {correctness_run.returncode}')
@@ -1015,7 +1061,16 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
         params['wallTimeBasis'] = 'measured-launch-wall-time'
 
     phase_started = time.perf_counter()
-    profile, perf_error, msprof_log = profile_executable(executable, package, args, env_prefix, str(operator_name), runs)
+    try:
+        profile, perf_error, msprof_log = profile_executable(
+            executable, package, args, env_prefix, str(operator_name), runs, deadline)
+    except subprocess.TimeoutExpired as error:
+        params['phaseTimingsMs']['profileMs'] = (time.perf_counter() - phase_started) * 1000
+        report = make_report(generation, target, status='timeout', compile_ok=True, correctness_ok=True,
+                             compile_log=f'{compile_log}\n{correctness_log}'.strip(),
+                             max_relative_error=max_rel_err, summary=f'msprof timed out after {error.timeout:g}s')
+        report['runRecord'] = record(started, params, args)
+        return report
     params['phaseTimingsMs']['profileMs'] = (time.perf_counter() - phase_started) * 1000
 
     if profile is None:
@@ -1036,7 +1091,8 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
     byte_count = tensor_bytes(manifest)
     achieved_bw = (byte_count / (kernel_time_us * 1000)
                    if byte_count is not None and kernel_time_us > 0 else None)
-    peak_bw = PEAK_BW_GBPS.get(str(manifest.get('chip', '')))
+    chip = str(manifest.get('chip') or '')
+    peak_bw = PEAK_BW_GBPS.get(chip)
     roofline_us = byte_count / (peak_bw * 1000) if byte_count is not None and peak_bw else None
     analysis = {
         'source': 'msprof',
@@ -1050,6 +1106,8 @@ def evaluate(package: Path, generation: str, args: argparse.Namespace) -> dict:
                         + (['rooflineUs'] if roofline_us is None else [])
                         + (['achievedBandwidthGBps'] if achieved_bw is None else []),
     }
+    if peak_bw is None:
+        analysis['summary'] += f' Roofline unavailable because peak bandwidth is not configured for {chip or "the unspecified chip"}.'
     if 'kernelBudget' in params:
         budget = params['kernelBudget']
         analysis['kernelBudget'] = budget
@@ -1145,7 +1203,7 @@ def main() -> int:
     parser.add_argument('--outbox')
     parser.add_argument('--generation', default='', help='only this generation (default: every pending manifest)')
     parser.add_argument('--once', action='store_true', help='scan once and exit (the default)')
-    parser.add_argument('--loop', action='store_true', help='keep scanning until killed')
+    parser.add_argument('--loop', action='store_true', help='manual batch mode: keep scanning until killed; the plugin uses --once')
     parser.add_argument('--interval', type=int, default=2000, help='loop interval in milliseconds')
     parser.add_argument('--runs', type=int, default=DEFAULT_RUNS, help='msprof application iterations')
     parser.add_argument('--device', help='ASCEND_VISIBLE_DEVICES (default: environment or 7)')
@@ -1158,11 +1216,14 @@ def main() -> int:
     parser.add_argument('--build-timeout', type=int, default=1800)
     parser.add_argument('--run-timeout', type=int, default=600)
     parser.add_argument('--msprof-timeout', type=int, default=1800)
+    parser.add_argument('--budget-sec', type=float, help='total time budget for a single evaluation')
     phases = parser.add_mutually_exclusive_group()
     phases.add_argument('--compile-only', action='store_true', help='build only; skip accuracy and profiling')
     phases.add_argument('--accuracy-only', action='store_true', help='build and check accuracy; skip profiling')
     parser.add_argument('--preflight', action='store_true', help='check the remote CANN toolchain without evaluating')
     args = parser.parse_args()
+    if args.budget_sec is not None and (not math.isfinite(args.budget_sec) or args.budget_sec <= 0):
+        parser.error('--budget-sec must be a finite positive number')
     args.device, args.lock = resolve_device_settings(args.device, args.lock)
     if args.preflight:
         return preflight(args)

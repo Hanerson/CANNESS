@@ -22,6 +22,7 @@ import time
 
 
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+OUTPUT_LIMIT_ERROR = 'command output exceeds 8 MiB limit'
 MAX_CASES_BYTES = 1024 * 1024
 DEVICE_ERRORS = {
     'device_fault': re.compile(rb'vector core exception|aivec error|aicore exception|GM address accessed by scalar exceeds', re.I),
@@ -39,12 +40,22 @@ class DeviceUnavailable(RuntimeError):
 
 
 def read_command_output(output, evidence=None):
-    size = os.fstat(output.fileno()).st_size
-    if size > MAX_OUTPUT_BYTES:
-        raise ValueError('command output exceeds 8 MiB limit')
     output.seek(0)
+    size = os.fstat(output.fileno()).st_size
+    oversized = size > MAX_OUTPUT_BYTES
+    if oversized and evidence is None:
+        raise ValueError(OUTPUT_LIMIT_ERROR)
     markers = []
-    for line in output:
+    remaining = min(size, MAX_OUTPUT_BYTES)
+    while remaining and (line := output.readline(remaining)):
+        remaining -= len(line)
+        if evidence is not None:
+            for kind, pattern in DEVICE_ERRORS.items():
+                match = pattern.search(line)
+                if match:
+                    evidence.setdefault(kind, match.group().decode())
+        if oversized:
+            continue
         if line.startswith(b'CANNESS_VALIDATION '):
             markers.append(line[len(b'CANNESS_VALIDATION '):].decode(errors='replace').strip())
         if evidence is not None:
@@ -54,10 +65,8 @@ def read_command_output(output, evidence=None):
                 evidence['called'] = True
             if line.startswith(b'CANNESS_UNSUPPORTED_CALL '):
                 evidence['unsupported'] = line[len(b'CANNESS_UNSUPPORTED_CALL '):].decode(errors='replace').strip()
-            for kind, pattern in DEVICE_ERRORS.items():
-                match = pattern.search(line)
-                if match:
-                    evidence.setdefault(kind, match.group().decode())
+    if oversized:
+        raise ValueError(OUTPUT_LIMIT_ERROR)
     output.seek(max(0, size - 16000))
     return output.read(16000).decode(errors='replace'), markers
 
@@ -325,7 +334,10 @@ def validate(root, timeout_sec, set_env=None, test_script=None, *, cases_file=No
             return case_result(case, 'passed', evidence, result), result
         for kind in DEVICE_ERRORS:
             if evidence.get(kind):
-                return case_result(case, 'blocked', evidence, result, evidence[kind], kind), result
+                reason = evidence[kind]
+                if step.get('error') == OUTPUT_LIMIT_ERROR:
+                    reason = f'{reason} ({OUTPUT_LIMIT_ERROR})'
+                return case_result(case, 'blocked', evidence, result, reason, kind), result
         if evidence.get('unsupported') and not evidence.get('called'):
             return case_result(case, 'unsupported', evidence, result, evidence['unsupported']), result
         if not evidence.get('installed'):
@@ -452,9 +464,28 @@ def main():
     parser.add_argument('--lock')
     args = parser.parse_args()
     case_timeout = max(1, min(3600, args.case_timeout_sec)) if args.case_timeout_sec is not None else None
-    report = validate(Path(args.root).resolve(), max(1, min(3600, args.timeout_sec)), args.set_env, args.test_script,
+    root = Path(args.root).resolve()
+    report = validate(root, max(1, min(3600, args.timeout_sec)), args.set_env, args.test_script,
                       cases_file=args.cases_file, case_timeout_sec=case_timeout, device=args.device_id, lock=args.lock)
-    print('CANNESS_SUBMISSION_REPORT ' + json.dumps(report, allow_nan=False))
+    encoded = json.dumps(report, allow_nan=False)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=root,
+                                         prefix='.validation-result-', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(root / 'validation-result.json')
+    except OSError as error:
+        print(f'Could not save validation-result.json: {error}', file=sys.stderr)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    print('CANNESS_SUBMISSION_REPORT ' + encoded)
     return 0 if report['status'] != 'failed' else 1
 
 
